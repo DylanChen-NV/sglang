@@ -185,6 +185,7 @@ ATTENTION_BACKEND_CHOICES = [
     "fa3",
     "fa4",
     "flashinfer",
+    "nvfp4_sm120",
     "flashmla",
     "trtllm_mla",
     "cutedsl_mla",

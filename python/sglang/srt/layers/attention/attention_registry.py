@@ -65,6 +65,20 @@ def create_flashinfer_backend(runner):
         return FlashInferMLAAttnBackend(runner)
 
 
+@register_attention_backend("nvfp4_sm120")
+def create_nvfp4_sm120_backend(runner):
+    if runner.use_mla_backend:
+        raise ValueError("nvfp4_sm120 supports only non-MLA Qwen3.5 models.")
+    from sglang.srt.layers.attention.nvfp4_sm120_backend import (
+        NVFP4SM120AttnBackend,
+    )
+
+    return NVFP4SM120AttnBackend(
+        runner,
+        init_new_workspace=runner.init_new_workspace,
+    )
+
+
 @register_attention_backend("trtllm_mla")
 def create_trtllm_mla_backend(runner):
     if not runner.use_mla_backend:
@@ -349,7 +363,12 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         if hybrid_gdn_config(runner.model_config) is not None:
             if is_blackwell():
                 if is_sm120_supported():
-                    allowed = {"triton", "trtllm_mha", "flashinfer"}
+                    allowed = {
+                        "triton",
+                        "trtllm_mha",
+                        "flashinfer",
+                        "nvfp4_sm120",
+                    }
                 else:
                     allowed = {"triton", "trtllm_mha", "fa4"}
                 attn_be = runner.server_args.attention_backend
