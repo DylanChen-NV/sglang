@@ -26,6 +26,7 @@ ops, and the speculative-decoding / forward spans -- share one primitive.
 """
 
 import logging
+import os
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial, wraps
 from typing import Optional
@@ -34,6 +35,7 @@ import torch
 
 from sglang.srt.environ import envs
 
+_K26_PHASE_NVTX = os.getenv("K26_ENABLE_PHASE_NVTX", "0") == "1"
 logger = logging.getLogger(__name__)
 
 _SCHEDULER_NVTX = envs.SGLANG_ENABLE_NVTX_SCHEDULER.get()
@@ -112,6 +114,33 @@ def profile_method(
 
     return decorator
 
+
+def scheduler_phase_nvtx_method(func):
+    """Annotate each scheduler forward with a dynamic prefill/decode phase."""
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not _K26_PHASE_NVTX:
+            return func(*args, **kwargs)
+
+        batch = args[1] if len(args) > 1 else kwargs["batch"]
+        mode = batch.forward_mode
+        if mode.is_prefill():
+            phase = "prefill"
+        elif mode.is_decode():
+            phase = "decode"
+        elif mode.is_idle():
+            phase = "idle"
+        else:
+            phase = mode.name.lower()
+
+        torch.cuda.nvtx.range_push(f"k26.phase.{phase}")
+        try:
+            return func(*args, **kwargs)
+        finally:
+            torch.cuda.nvtx.range_pop()
+
+    return wrapper
 
 # Pre-bound per-subsystem helpers: torch spans always (under a profiler), nvtx
 # ranges only when that subsystem's gate is on.
