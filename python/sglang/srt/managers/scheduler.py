@@ -4248,12 +4248,15 @@ class Scheduler(
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
-    def flush_cache(self, empty_cache: bool = True):
+    def flush_cache(self, empty_cache: bool = True, reset_connector: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
         if self.is_fully_idle():
             self.cur_batch_for_debug = None
             self.last_batch = None
-            self.tree_cache.reset()
+            if reset_connector:
+                self.tree_cache.reset()
+            else:
+                self.tree_cache.reset_local()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
             self.grammar_manager.clear()
@@ -4582,8 +4585,15 @@ class Scheduler(
         raise NotImplementedError()
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
-        assert recv_req.mode in ("in_place", "retract")
+        assert recv_req.mode in ("abort", "in_place", "retract")
         self._engine_paused = True
+
+        if recv_req.mode == "abort":
+            if recv_req.checkpoint_aborted_kv:
+                self.tree_cache.wait_for_pending_stores(
+                    timeout=recv_req.checkpoint_timeout_s
+                )
+            return
 
         if recv_req.mode == "in_place":
             # In-place pause: just set the flag and return immediately.
