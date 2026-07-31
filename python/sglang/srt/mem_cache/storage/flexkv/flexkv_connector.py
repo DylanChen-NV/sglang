@@ -192,6 +192,8 @@ class FlexKVConnector:
             intra_client_id=self.rank_info.intra_client_id,
             device_id=self.rank_info.local_rank,
         )
+        self._kv_caches = kv_caches
+        self._indexer_buffers = indexer_buffers
         self._register_with_retry(kv_caches, indexer_buffers)
 
         # 8. Layerwise transfer plumbing.
@@ -760,13 +762,14 @@ class FlexKVConnector:
         kv_caches: List[torch.Tensor],
         indexer_buffers: Optional[List[torch.Tensor]] = None,
         max_retries: int = 360,
+        resume: bool = False,
     ) -> None:
         """Retry GPU registration. On node_rank>0, the
         TransferManagerOnRemote may not be ready immediately; retry up
         to ~6 minutes."""
         for attempt in range(max_retries):
             try:
-                self._register_to_server(kv_caches, indexer_buffers)
+                self._register_to_server(kv_caches, indexer_buffers, resume=resume)
                 return
             except Exception as exc:  # noqa: BLE001
                 if attempt == max_retries - 1:
@@ -785,6 +788,8 @@ class FlexKVConnector:
         self,
         kv_caches: List[torch.Tensor],
         indexer_buffers: Optional[List[torch.Tensor]] = None,
+        *,
+        resume: bool = False,
     ) -> None:
         assert len(kv_caches) > 0
         assert (
@@ -826,8 +831,27 @@ class FlexKVConnector:
             kv_layout=gpu_layout,
             indexer_buffers=indexer_buffers,
             indexer_layout=indexer_layout,
+            resume=resume,
         )
         logger.info("[FlexKV] Registered KV caches to server %s", self._label)
+
+    def before_device_sleep(self) -> None:
+        released = self.tp_client.suspend_gpu_mappings()
+        logger.info(
+            "[FlexKV] Suspended GPU mappings before device sleep %s: released=%d",
+            self._label,
+            released,
+        )
+
+    def after_device_wake(self) -> None:
+        self._register_with_retry(
+            self._kv_caches,
+            self._indexer_buffers,
+            resume=True,
+        )
+        logger.info(
+            "[FlexKV] Restored GPU mappings after device wake %s", self._label
+        )
 
     def _send_pp_put_meta(self, fkv_task_id: int, unmatched_mask) -> None:
         if not self._sync_ctx.is_pp_active:
