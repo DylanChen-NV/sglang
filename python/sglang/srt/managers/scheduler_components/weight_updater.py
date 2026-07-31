@@ -236,8 +236,15 @@ class SchedulerWeightUpdaterManager:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
                         queue.release_memory_occupation()
+            before_device_sleep = getattr(
+                getattr(self.scheduler, "tree_cache", None),
+                "before_device_sleep",
+                None,
+            )
+            if before_device_sleep is not None:
+                before_device_sleep()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
-            self.flush_cache()
+            self.flush_cache(reset_connector=recv_req.reset_connector)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("release_memory_occupation")
@@ -278,6 +285,13 @@ class SchedulerWeightUpdaterManager:
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
+            after_device_wake = getattr(
+                getattr(self.scheduler, "tree_cache", None),
+                "after_device_wake",
+                None,
+            )
+            if after_device_wake is not None:
+                after_device_wake()
             scheduler = self.scheduler
             if scheduler is not None:
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:

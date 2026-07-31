@@ -167,19 +167,29 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         last_batch.filter_batch.assert_not_called()
         scheduler.running_batch.merge_batch.assert_not_called()
 
-    def test_abort_mode_rejected_at_scheduler(self):
-        """abort mode must be rejected by the scheduler-side assert."""
+    def test_abort_mode_without_checkpoint_does_not_wait(self):
+        """A normal abort must preserve the existing fire-and-forget behavior."""
         scheduler = self._new_scheduler()
 
-        with self.assertRaises(AssertionError):
-            scheduler.pause_generation(PauseGenerationReqInput(mode="abort"))
+        scheduler.pause_generation(PauseGenerationReqInput(mode="abort"))
 
-    def test_default_mode_rejected_at_scheduler(self):
-        """bare PauseGenerationReqInput defaults to abort and must be rejected."""
+        self.assertTrue(scheduler._engine_paused)
+        scheduler.tree_cache.wait_for_pending_stores.assert_not_called()
+
+    def test_abort_mode_with_checkpoint_waits_for_store(self):
+        """Dynamic deactivate waits until external KV no longer reads local KV."""
         scheduler = self._new_scheduler()
 
-        with self.assertRaises(AssertionError):
-            scheduler.pause_generation(PauseGenerationReqInput())
+        scheduler.pause_generation(
+            PauseGenerationReqInput(
+                mode="abort", checkpoint_aborted_kv=True, checkpoint_timeout_s=12.5
+            )
+        )
+
+        self.assertTrue(scheduler._engine_paused)
+        scheduler.tree_cache.wait_for_pending_stores.assert_called_once_with(
+            timeout=12.5
+        )
 
     def test_retract_clears_last_batch_state(self):
         """retract mode should clear last_batch and cur_batch_for_debug."""

@@ -274,6 +274,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def reset(self):
         pass
 
+    def reset_local(self) -> None:
+        """Reset device-local cache state without invalidating external storage."""
+        self.reset()
+
+    def wait_for_pending_stores(self, timeout: float) -> None:
+        """Wait for external stores that still reference device-local KV."""
+
     @abstractmethod
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         pass

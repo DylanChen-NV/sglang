@@ -1715,6 +1715,8 @@ class PauseGenerationReqInput(BaseReq, kw_only=True):
     """
 
     mode: Literal["abort", "retract", "in_place"] = "abort"
+    checkpoint_aborted_kv: bool = False
+    checkpoint_timeout_s: float = 30.0
 
 
 class ContinueGenerationReqInput(BaseReq, kw_only=True):
@@ -1947,6 +1949,7 @@ class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
     # Optional tags to identify the memory region, which is primarily used for RL
     # Currently we only support `weights` and `kv_cache`
     tags: Optional[List[str]] = None
+    reset_connector: bool = True
 
 
 class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):

@@ -28,6 +28,7 @@ from __future__ import annotations
 import enum
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -135,14 +136,25 @@ class FlexKVRadixCache(RadixCache):
     # ------------------------------------------------------------------
 
     def reset(self) -> None:  # type: ignore[override]
+        self.reset_local()
+        if hasattr(self, "flexkv_connector"):
+            self.flexkv_connector.reset()
+
+    def reset_local(self) -> None:
         super().reset()
         if hasattr(self, "_load_markers"):
             self._load_markers.clear()
         if hasattr(self, "_inflight_store_nodes"):
             with self._node_lock:
                 self._inflight_store_nodes.clear()
-        if hasattr(self, "flexkv_connector"):
-            self.flexkv_connector.reset()
+
+    def before_device_sleep(self) -> None:
+        self.wait_for_pending_stores(timeout=30.0)
+        self.store_stream.synchronize()
+        self.flexkv_connector.before_device_sleep()
+
+    def after_device_wake(self) -> None:
+        self.flexkv_connector.after_device_wake()
 
     def shutdown(self) -> None:
         if hasattr(self, "flexkv_connector"):
@@ -481,6 +493,23 @@ class FlexKVRadixCache(RadixCache):
                 node = self._inflight_store_nodes.pop(rid, None)
                 if node is not None:
                     self.dec_lock_ref(node)
+
+    def wait_for_pending_stores(self, timeout: float) -> None:
+        """Keep source KV pinned until every asynchronous FlexKV store finishes."""
+        deadline = time.monotonic() + timeout
+        while True:
+            self._drain_completed_stores()
+            with self._node_lock:
+                pending_rids = list(self._inflight_store_nodes)
+            if not pending_rids:
+                logger.info("[FlexKV] abort KV checkpoint barrier completed")
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "Timed out waiting for FlexKV abort KV stores: "
+                    f"pending_rids={pending_rids}"
+                )
+            time.sleep(0.01)
 
     # ------------------------------------------------------------------
     # Optional pass-throughs used by the scheduler

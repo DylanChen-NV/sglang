@@ -1976,6 +1976,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if not is_locked:
                         break
                     await asyncio.sleep(1.0)
+                if obj.checkpoint_aborted_kv:
+                    # Request cleanup has launched its asynchronous KV stores.
+                    # The scheduler-side barrier waits for them before sleep.
+                    await self._async_dispatch_to_scheduler(obj)
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:
