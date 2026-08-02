@@ -535,6 +535,22 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        from sglang.srt.layers.moe import get_moe_runner_backend
+
+        backend = get_moe_runner_backend()
+        if self.is_mxfp4:
+            if not (backend.is_auto() or backend.is_flashinfer_humming()):
+                raise ValueError(
+                    "W4AFP8 MXFP4 checkpoints require "
+                    "--moe-runner-backend flashinfer_humming (or auto); "
+                    f"got {backend.value!r}."
+                )
+        elif backend.is_flashinfer_humming():
+            raise ValueError(
+                "--moe-runner-backend flashinfer_humming requires an MXFP4 "
+                "W4AFP8 checkpoint; this checkpoint uses "
+                f"moe_weight_format={self.quant_config.moe_weight_format!r}."
+            )
         self.moe_runner_config = moe_runner_config
 
     def apply(

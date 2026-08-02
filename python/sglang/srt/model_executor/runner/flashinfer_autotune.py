@@ -64,10 +64,11 @@ def should_run_flashinfer_autotune(
         "flashinfer_mxfp4",
         "flashinfer_cutedsl",
         "flashinfer_cutlass",
+        "flashinfer_humming",
     ]
-    # The experimental W4AFP8 quant method calls FlashInfer PR #3738's
-    # Humming path directly while the configured MoE backend remains `auto`.
-    moe_needs_autotune = moe_needs_autotune or model_quantization == "w4afp8"
+    moe_needs_autotune = moe_needs_autotune or (
+        backend_str == "auto" and model_quantization == "w4afp8"
+    )
 
     from sglang.srt.layers.quantization.fp4_utils import (
         get_fp4_gemm_runner_backend,

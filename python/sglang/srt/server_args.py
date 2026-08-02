@@ -258,6 +258,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_trtllm_routed",
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
+    "flashinfer_humming",
     "flashinfer_cutedsl",
     "cutlass",
     "aiter",
@@ -5682,6 +5683,16 @@ class ServerArgs:
             ], (
                 f"flashinfer_cutedsl supports moe_a2a_backend='none', 'deepep', or 'flashinfer', "
                 f"got '{view.moe_a2a_backend}'."
+            )
+
+        if view.moe_runner_backend == "flashinfer_humming":
+            assert view.quantization == "w4afp8", (
+                "flashinfer_humming supports only W4AFP8 checkpoints; "
+                f"got quantization={view.quantization!r}."
+            )
+            assert view.moe_a2a_backend == "none", (
+                "flashinfer_humming currently supports only standard dispatch; "
+                f"got moe_a2a_backend={view.moe_a2a_backend!r}."
             )
 
         if view.moe_runner_backend in ["flashinfer_trtllm", "experimental_sgl_trtllm"]:
