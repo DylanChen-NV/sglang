@@ -17,6 +17,7 @@ import contextlib
 import datetime
 import hashlib
 import logging
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -56,6 +57,7 @@ def should_run_flashinfer_autotune(
 
     # TODO smor- support other cases for flashinfer autotune, such as, mamba backend
 
+    model_quantization = mr.model_config.quantization
     moe_needs_autotune = backend_str in [
         "flashinfer_trtllm",
         "flashinfer_trtllm_routed",
@@ -63,12 +65,14 @@ def should_run_flashinfer_autotune(
         "flashinfer_cutedsl",
         "flashinfer_cutlass",
     ]
+    # The experimental W4AFP8 quant method calls FlashInfer PR #3738's
+    # Humming path directly while the configured MoE backend remains `auto`.
+    moe_needs_autotune = moe_needs_autotune or model_quantization == "w4afp8"
 
     from sglang.srt.layers.quantization.fp4_utils import (
         get_fp4_gemm_runner_backend,
     )
 
-    model_quantization = mr.model_config.quantization
     model_uses_fp4 = model_quantization in (
         "modelopt_fp4",
         "modelopt_mixed",
@@ -146,6 +150,11 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
 @contextlib.contextmanager
 def flashinfer_autotune_context(model_runner: ModelRunner, *, skip_logits: bool):
     from flashinfer.autotuner import autotune
+    from flashinfer.jit.core import logger as flashinfer_logger
+
+    flashinfer_logger.setLevel(
+        os.getenv("FLASHINFER_LOGGING_LEVEL", "INFO").upper()
+    )
 
     mr = model_runner
     cache_path = flashinfer_autotune_cache_path(mr)

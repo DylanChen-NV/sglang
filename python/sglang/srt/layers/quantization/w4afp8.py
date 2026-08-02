@@ -40,6 +40,11 @@ MXFP4_PREPROCESS_EXPERT_CHUNK = int(
 )
 if MXFP4_PREPROCESS_EXPERT_CHUNK < 1:
     raise ValueError("SGLANG_MXFP4_PREPROCESS_EXPERT_CHUNK must be positive")
+W4AFP8_TUNE_MAX_NUM_TOKENS = int(
+    os.environ.get("SGLANG_W4AFP8_TUNE_MAX_NUM_TOKENS", "8192")
+)
+if W4AFP8_TUNE_MAX_NUM_TOKENS < 1:
+    raise ValueError("SGLANG_W4AFP8_TUNE_MAX_NUM_TOKENS must be positive")
 _MXFP4_RUNTIME_LOGGED = False
 
 logger = logging.getLogger(__name__)
@@ -696,6 +701,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             ep_size=1,
             ep_rank=0,
             profile_ids=None,
+            tune_max_num_tokens=W4AFP8_TUNE_MAX_NUM_TOKENS,
         )
         return StandardCombineInput(hidden_states=output)
 
