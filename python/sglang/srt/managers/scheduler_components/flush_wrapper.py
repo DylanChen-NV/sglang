@@ -9,7 +9,7 @@ class SchedulerFlushWrapper:
     def __init__(
         self,
         *,
-        flush_cache: Callable[[], bool],
+        flush_cache: Callable[..., bool],
         is_fully_idle: Callable[[], bool],
         send_output: Callable[[FlushCacheReqOutput, FlushCacheReqInput], None],
     ) -> None:
@@ -28,10 +28,14 @@ class SchedulerFlushWrapper:
 
         timeout_s = float(recv_req.timeout_s or 0.0)
         if timeout_s <= 0.0:
-            return FlushCacheReqOutput(success=self._flush_cache())
+            return FlushCacheReqOutput(
+                success=self._flush_cache(reset_connector=recv_req.reset_connector)
+            )
 
         if self._is_fully_idle():
-            return FlushCacheReqOutput(success=self._flush_cache())
+            return FlushCacheReqOutput(
+                success=self._flush_cache(reset_connector=recv_req.reset_connector)
+            )
 
         self._pending = (recv_req, time.monotonic() + timeout_s)
         return None
@@ -43,7 +47,7 @@ class SchedulerFlushWrapper:
         pending_req, deadline = self._pending
 
         if self._is_fully_idle():
-            success = self._flush_cache()
+            success = self._flush_cache(reset_connector=pending_req.reset_connector)
             self._pending = None
             self._send_output(FlushCacheReqOutput(success=success), pending_req)
             return
