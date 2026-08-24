@@ -19,6 +19,7 @@ async def update_weights(
     device_mesh_key: str,
     device_mesh: DeviceMesh,
     load_format: Optional[str] = None,
+    flush_cache: bool = True,
 ):
     """
     Update weights for the inference engine.
@@ -32,6 +33,7 @@ async def update_weights(
         device_mesh_key: The key of the device mesh. Typically "tp" or "infer_tp"
         device_mesh: The device mesh.
         load_format: The format of the weights.
+        flush_cache: Whether to flush the engine cache after this update.
     """
     infer_tp_size = device_mesh[device_mesh_key].mesh.size()[0]
     infer_tp_rank = device_mesh[device_mesh_key].get_local_rank()
@@ -98,6 +100,7 @@ async def update_weights(
                 for _ in range(infer_tp_size)
             ],
             load_format=load_format,
+            flush_cache=flush_cache,
         )
 
         return await engine.update_weights_from_tensor(update_weights_request)
