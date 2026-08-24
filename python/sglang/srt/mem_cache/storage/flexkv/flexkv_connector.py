@@ -45,6 +45,7 @@ from sglang.srt.mem_cache.storage.flexkv.flexkv_comm import (
 )
 
 try:
+    from flexkv.common.config import LayerGroupSpec
     from flexkv.common.request import KVResponseStatus
     from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
     from flexkv.integration.config import FlexKVConfig
@@ -796,7 +797,7 @@ class FlexKVConnector:
             kv_caches[0].ndim == 3
         ), f"Expected 3D KV cache tensor, got shape={kv_caches[0].shape}"
 
-        is_mla = self.model_config.use_mla
+        kv_dim = self.model_config.kv_dim
         num_blocks, num_kv_heads, head_size = kv_caches[0].shape
 
         gpu_layout = KVCacheLayout(
@@ -806,7 +807,8 @@ class FlexKVConnector:
             tokens_per_block=self.page_size,
             num_head=num_kv_heads,
             head_size=head_size,
-            is_mla=is_mla,
+            kv_dim=kv_dim,
+            num_kv_heads=num_kv_heads,
         )
 
         indexer_layout = None
@@ -823,16 +825,41 @@ class FlexKVConnector:
                 tokens_per_block=1,
                 num_head=1,
                 head_size=indexer_tensor.shape[1],
-                is_mla=True,
+                kv_dim=1,
+                num_kv_heads=1,
             )
 
-        self.tp_client.register_to_server(
-            kv_caches=kv_caches,
-            kv_layout=gpu_layout,
-            indexer_buffers=indexer_buffers,
-            indexer_layout=indexer_layout,
-            resume=resume,
-        )
+        if indexer_buffers and indexer_layout is not None:
+            layer_groups = [
+                LayerGroupSpec(
+                    num_layers=self.rank_info.num_layers_per_pp_stage,
+                    num_kv_heads=num_kv_heads,
+                    head_size=head_size,
+                    layer_indices=list(range(self.rank_info.num_layers_per_pp_stage)),
+                    dtype=kv_caches[0].dtype,
+                ),
+                LayerGroupSpec(
+                    num_layers=len(indexer_buffers),
+                    num_kv_heads=1,
+                    head_size=indexer_buffers[0].shape[1],
+                    layer_indices=list(range(len(indexer_buffers))),
+                    dtype=indexer_buffers[0].dtype,
+                ),
+            ]
+            self.tp_client.register_to_server(
+                kv_caches=list(kv_caches) + list(indexer_buffers),
+                kv_layout=gpu_layout,
+                layer_groups=layer_groups,
+                gpu_layouts=[gpu_layout, indexer_layout],
+                handles_per_group=[list(kv_caches), list(indexer_buffers)],
+                resume=resume,
+            )
+        else:
+            self.tp_client.register_to_server(
+                kv_caches=kv_caches,
+                kv_layout=gpu_layout,
+                resume=resume,
+            )
         logger.info("[FlexKV] Registered KV caches to server %s", self._label)
 
     def before_device_sleep(self) -> None:
