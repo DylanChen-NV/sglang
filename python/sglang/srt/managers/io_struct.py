@@ -1625,6 +1625,7 @@ class ClearHiCacheReqOutput(BaseReq, kw_only=True):
 
 class FlushCacheReqInput(BaseReq, kw_only=True):
     timeout_s: Optional[float] = None
+    reset_connector: bool = True
 
 
 class FlushCacheReqOutput(BaseReq, kw_only=True):
