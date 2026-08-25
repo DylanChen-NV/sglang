@@ -169,6 +169,9 @@ class _MoeRunnerBackendPredicates:
     def is_humming(self):
         return self.value == MoeRunnerBackend.HUMMING.value
 
+    def is_lowlatency_mxfp4(self):
+        return self.value == MoeRunnerBackend.LOWLATENCY_MXFP4.value
+
     def is_aiter(self):
         return self.value == MoeRunnerBackend.AITER.value
 
@@ -192,6 +195,7 @@ class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     CUTLASS = "cutlass"
     MARLIN = "marlin"
     HUMMING = "humming"
+    LOWLATENCY_MXFP4 = "lowlatency_mxfp4"
     EXPERIMENTAL_SGL_MARLIN = "experimental_sgl_marlin"
     AITER = "aiter"
     HPC_OPS = "hpc_ops"
