@@ -108,6 +108,7 @@ class MoeRunnerBackend(Enum):
     CUTLASS = "cutlass"
     MARLIN = "marlin"
     HUMMING = "humming"
+    LOWLATENCY_MXFP4 = "lowlatency_mxfp4"
     EXPERIMENTAL_SGL_MARLIN = "experimental_sgl_marlin"
     AITER = "aiter"
     HPC_OPS = "hpc_ops"
@@ -170,6 +171,9 @@ class MoeRunnerBackend(Enum):
 
     def is_humming(self):
         return self == MoeRunnerBackend.HUMMING
+
+    def is_lowlatency_mxfp4(self):
+        return self == MoeRunnerBackend.LOWLATENCY_MXFP4
 
     def is_aiter(self):
         return self == MoeRunnerBackend.AITER
