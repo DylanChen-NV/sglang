@@ -85,6 +85,40 @@ def _moe_permute_prepare_small_with_counts_out(
     )
 
 
+@register_custom_op(
+    op_name="moe_permute_prepare_small_with_schedule_out",
+    mutates_args=[
+        "expert_offsets",
+        "src2dst",
+        "expert_counts",
+        "tile_experts",
+        "tile_n",
+        "num_token_tiles",
+    ],
+)
+def _moe_permute_prepare_small_with_schedule_out(
+    topk_ids: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    src2dst: torch.Tensor,
+    expert_counts: torch.Tensor,
+    tile_experts: torch.Tensor,
+    tile_n: torch.Tensor,
+    num_token_tiles: torch.Tensor,
+    num_experts: int,
+) -> None:
+    module = _jit_moe_permute_prepare_module()
+    module.moe_permute_prepare_small_with_schedule(
+        topk_ids,
+        expert_offsets,
+        src2dst,
+        expert_counts,
+        tile_experts,
+        tile_n,
+        num_token_tiles,
+        num_experts,
+    )
+
+
 def moe_permute_prepare_with_counts(
     topk_ids: torch.Tensor,
     num_experts: int,
@@ -110,6 +144,57 @@ def moe_permute_prepare_with_counts(
         topk_ids, expert_offsets, src2dst, expert_counts, num_experts
     )
     return expert_offsets, src2dst, expert_counts
+
+
+def moe_permute_prepare_with_schedule(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Decode routing that also emits the reusable grouped-GEMM schedule."""
+    if topk_ids.dtype != torch.int32:
+        raise TypeError(f"topk_ids must be int32, got {topk_ids.dtype}")
+    if not topk_ids.is_cuda:
+        raise ValueError("topk_ids must be a CUDA tensor")
+    if num_experts != 256 or topk_ids.numel() > 64 or not topk_ids.is_contiguous():
+        raise ValueError("with_schedule supports contiguous DSV4 decode shapes only")
+
+    expert_offsets = torch.empty(
+        (num_experts + 1,), dtype=torch.int32, device=topk_ids.device
+    )
+    src2dst = torch.empty(
+        (topk_ids.numel(),), dtype=torch.int32, device=topk_ids.device
+    )
+    expert_counts = torch.empty(
+        (num_experts,), dtype=torch.int32, device=topk_ids.device
+    )
+    tile_experts = torch.empty_like(src2dst)
+    tile_n = torch.empty_like(src2dst)
+    num_token_tiles = torch.empty((1,), dtype=torch.int32, device=topk_ids.device)
+    _moe_permute_prepare_small_with_schedule_out(
+        topk_ids,
+        expert_offsets,
+        src2dst,
+        expert_counts,
+        tile_experts,
+        tile_n,
+        num_token_tiles,
+        num_experts,
+    )
+    return (
+        expert_offsets,
+        src2dst,
+        expert_counts,
+        tile_experts,
+        tile_n,
+        num_token_tiles,
+    )
 
 
 def moe_permute_prepare(
