@@ -20,6 +20,59 @@ limitations under the License.
 
 namespace sglang {
 
+constexpr int kSmallRoutingMaxExperts = 256;
+constexpr int kSmallRoutingMaxItems = 64;
+
+// Decode-specialized routing for tiny token counts. One CTA constructs the
+// expert histogram, exclusive offsets, and a deterministic stable src2dst
+// mapping directly from topk_ids. This replaces the generic torch.sort plus
+// moe_permute_prepare sequence while preserving its public outputs.
+__global__ void moe_permute_prepare_small_kernel(
+    const int32_t* __restrict__ topk_ids,
+    int32_t* __restrict__ expert_offsets,
+    int32_t* __restrict__ src2dst,
+    int32_t num_experts,
+    int32_t numel) {
+  __shared__ int32_t scan[kSmallRoutingMaxExperts];
+
+  const int tid = threadIdx.x;
+  int32_t count = 0;
+  if (tid < num_experts) {
+    for (int i = 0; i < numel; ++i) {
+      count += static_cast<int32_t>(topk_ids[i] == tid);
+    }
+  }
+  scan[tid] = count;
+  __syncthreads();
+
+  // Inclusive Hillis-Steele scan over the 256 expert counts.
+  for (int offset = 1; offset < kSmallRoutingMaxExperts; offset <<= 1) {
+    const int32_t addend = tid >= offset ? scan[tid - offset] : 0;
+    __syncthreads();
+    scan[tid] += addend;
+    __syncthreads();
+  }
+
+  if (tid == 0) expert_offsets[0] = 0;
+  if (tid < num_experts) expert_offsets[tid + 1] = scan[tid];
+
+  if (tid < numel) {
+    const int32_t expert = topk_ids[tid];
+    if (expert >= 0 && expert < num_experts) {
+      // Stable local rank makes the mapping deterministic without
+      // materializing reorder_ids. N is at most 64.
+      int32_t local_rank = 0;
+      for (int i = 0; i < tid; ++i) {
+        local_rank += static_cast<int32_t>(topk_ids[i] == expert);
+      }
+      const int32_t expert_begin = expert == 0 ? 0 : scan[expert - 1];
+      src2dst[tid] = expert_begin + local_rank;
+    } else {
+      src2dst[tid] = -1;
+    }
+  }
+}
+
 // Binary search: find first index where data[index] >= target.
 __device__ __forceinline__ int32_t lower_bound(const int32_t* __restrict__ data, int32_t n, int32_t target) {
   int32_t lo = 0, hi = n;
@@ -122,6 +175,37 @@ void moe_permute_prepare(
   TVM_FFI_ICHECK(err == cudaSuccess) << "moe_permute_prepare launch failed: " << cudaGetErrorString(err);
 }
 
+void moe_permute_prepare_small(
+    TensorView topk_ids,
+    TensorView expert_offsets,
+    TensorView src2dst,
+    int64_t num_experts) {
+  CHECK_INPUT_AND_TYPE(topk_ids, dl_int32);
+  CHECK_INPUT_AND_TYPE(expert_offsets, dl_int32);
+  CHECK_INPUT_AND_TYPE(src2dst, dl_int32);
+  CHECK_DEVICE(topk_ids, expert_offsets);
+  CHECK_DEVICE(topk_ids, src2dst);
+  TVM_FFI_ICHECK_EQ(expert_offsets.numel(), num_experts + 1);
+  TVM_FFI_ICHECK_EQ(src2dst.numel(), topk_ids.numel());
+  TVM_FFI_ICHECK_EQ(num_experts, kSmallRoutingMaxExperts);
+  TVM_FFI_ICHECK_LE(topk_ids.numel(), kSmallRoutingMaxItems);
+
+  cudaSetDevice(topk_ids.device().device_id);
+  cudaStream_t stream = get_stream(topk_ids.device());
+  moe_permute_prepare_small_kernel<<<1, kSmallRoutingMaxExperts, 0, stream>>>(
+      static_cast<const int32_t*>(topk_ids.data_ptr()),
+      static_cast<int32_t*>(expert_offsets.data_ptr()),
+      static_cast<int32_t*>(src2dst.data_ptr()),
+      static_cast<int32_t>(num_experts),
+      static_cast<int32_t>(topk_ids.numel()));
+
+  cudaError_t err = cudaGetLastError();
+  TVM_FFI_ICHECK(err == cudaSuccess)
+      << "moe_permute_prepare_small launch failed: "
+      << cudaGetErrorString(err);
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_permute_prepare, moe_permute_prepare);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_permute_prepare_small, moe_permute_prepare_small);
 
 }  // namespace sglang
