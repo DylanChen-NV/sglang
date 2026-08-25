@@ -33,9 +33,11 @@ class Mxfp4LowLatencyMoEMethod:
                 "SGLANG_LOWLATENCY_MXFP4_VARIANT must be one of "
                 f"{sorted(self._VALID_VARIANTS)}, got {self.variant!r}."
             )
-        self.persistent_ctas = int(
-            os.getenv("SGLANG_LOWLATENCY_MXFP4_PERSISTENT_CTAS", "312")
+        persistent_ctas_override = os.getenv(
+            "SGLANG_LOWLATENCY_MXFP4_PERSISTENT_CTAS"
         )
+        self._persistent_ctas_fixed = persistent_ctas_override is not None
+        self.persistent_ctas = int(persistent_ctas_override or "312")
         if self.persistent_ctas <= 0:
             raise ValueError("LowLatency persistent_ctas must be positive.")
 
@@ -335,8 +337,39 @@ class Mxfp4LowLatencyMoEMethod:
         hidden_states = dispatch_output.hidden_states
         topk_ids = topk_output.topk_ids.contiguous().to(torch.int32)
         topk_weights = topk_output.topk_weights
-        if self.variant == "preopt" or topk_ids.numel() > 64:
-            output = self._run_preopt(layer, hidden_states, topk_ids, topk_weights)
-        else:
-            output = self._run_optimized(layer, hidden_states, topk_ids, topk_weights)
+        use_preopt = self.variant == "preopt" or topk_ids.numel() > 64
+
+        def run():
+            if use_preopt:
+                return self._run_preopt(
+                    layer, hidden_states, topk_ids, topk_weights
+                )
+            return self._run_optimized(
+                layer, hidden_states, topk_ids, topk_weights
+            )
+
+        if not self._persistent_ctas_fixed and topk_ids.numel() <= 64:
+            from sglang.srt.layers.quantization.lowlatency_mxfp4_autotune import (
+                select_persistent_ctas,
+            )
+
+            def run_candidate(candidate: int):
+                previous = self.persistent_ctas
+                self.persistent_ctas = candidate
+                try:
+                    return run()
+                finally:
+                    self.persistent_ctas = previous
+
+            self.persistent_ctas = select_persistent_ctas(
+                variant=self.variant,
+                rows=topk_ids.numel(),
+                hidden_size=layer.hidden_size,
+                intermediate_size=layer.intermediate_size_per_partition,
+                default=self.persistent_ctas,
+                run_candidate=run_candidate,
+            )
+            layer._lowlatency_persistent_ctas = self.persistent_ctas
+
+        output = run()
         return StandardCombineInput(hidden_states=output)
