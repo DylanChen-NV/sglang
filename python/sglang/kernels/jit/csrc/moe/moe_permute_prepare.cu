@@ -31,6 +31,9 @@ __global__ void moe_permute_prepare_small_kernel(
     const int32_t* __restrict__ topk_ids,
     int32_t* __restrict__ expert_offsets,
     int32_t* __restrict__ src2dst,
+    int32_t* __restrict__ tile_experts,
+    int32_t* __restrict__ tile_n,
+    int32_t* __restrict__ num_token_tiles,
     int32_t* __restrict__ expert_counts,
     int32_t num_experts,
     int32_t numel) {
@@ -71,6 +74,30 @@ __global__ void moe_permute_prepare_small_kernel(
       src2dst[tid] = expert_begin + local_rank;
     } else {
       src2dst[tid] = -1;
+    }
+  }
+
+  // The FC1 and FC2 grouped GEMMs have identical routed-row tiles. Build the
+  // expert-major token schedule once while routing already owns the histogram.
+  __syncthreads();
+  if (tile_experts != nullptr) {
+    const int32_t tiles = (count + 7) / 8;
+    scan[tid] = tiles;
+    __syncthreads();
+    for (int offset = 1; offset < kSmallRoutingMaxExperts; offset <<= 1) {
+      const int32_t addend = tid >= offset ? scan[tid - offset] : 0;
+      __syncthreads();
+      scan[tid] += addend;
+      __syncthreads();
+    }
+
+    const int32_t tile_begin = tid == 0 ? 0 : scan[tid - 1];
+    for (int tile = 0; tile < tiles; ++tile) {
+      tile_experts[tile_begin + tile] = tid;
+      tile_n[tile_begin + tile] = tile;
+    }
+    if (tid == kSmallRoutingMaxExperts - 1) {
+      *num_token_tiles = scan[tid];
     }
   }
 }
@@ -199,6 +226,9 @@ void moe_permute_prepare_small(
       static_cast<int32_t*>(expert_offsets.data_ptr()),
       static_cast<int32_t*>(src2dst.data_ptr()),
       nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
       static_cast<int32_t>(num_experts),
       static_cast<int32_t>(topk_ids.numel()));
 
@@ -233,6 +263,9 @@ void moe_permute_prepare_small_with_counts(
       static_cast<const int32_t*>(topk_ids.data_ptr()),
       static_cast<int32_t*>(expert_offsets.data_ptr()),
       static_cast<int32_t*>(src2dst.data_ptr()),
+      nullptr,
+      nullptr,
+      nullptr,
       static_cast<int32_t*>(expert_counts.data_ptr()),
       static_cast<int32_t>(num_experts),
       static_cast<int32_t>(topk_ids.numel()));
@@ -243,9 +276,61 @@ void moe_permute_prepare_small_with_counts(
       << cudaGetErrorString(err);
 }
 
+void moe_permute_prepare_small_with_schedule(
+    TensorView topk_ids,
+    TensorView expert_offsets,
+    TensorView src2dst,
+    TensorView expert_counts,
+    TensorView tile_experts,
+    TensorView tile_n,
+    TensorView num_token_tiles,
+    int64_t num_experts) {
+  CHECK_INPUT_AND_TYPE(topk_ids, dl_int32);
+  CHECK_INPUT_AND_TYPE(expert_offsets, dl_int32);
+  CHECK_INPUT_AND_TYPE(src2dst, dl_int32);
+  CHECK_INPUT_AND_TYPE(expert_counts, dl_int32);
+  CHECK_INPUT_AND_TYPE(tile_experts, dl_int32);
+  CHECK_INPUT_AND_TYPE(tile_n, dl_int32);
+  CHECK_INPUT_AND_TYPE(num_token_tiles, dl_int32);
+  CHECK_DEVICE(topk_ids, expert_offsets);
+  CHECK_DEVICE(topk_ids, src2dst);
+  CHECK_DEVICE(topk_ids, expert_counts);
+  CHECK_DEVICE(topk_ids, tile_experts);
+  CHECK_DEVICE(topk_ids, tile_n);
+  CHECK_DEVICE(topk_ids, num_token_tiles);
+  TVM_FFI_ICHECK_EQ(expert_offsets.numel(), num_experts + 1);
+  TVM_FFI_ICHECK_EQ(src2dst.numel(), topk_ids.numel());
+  TVM_FFI_ICHECK_EQ(expert_counts.numel(), num_experts);
+  TVM_FFI_ICHECK_GE(tile_experts.numel(), topk_ids.numel());
+  TVM_FFI_ICHECK_GE(tile_n.numel(), topk_ids.numel());
+  TVM_FFI_ICHECK_GE(num_token_tiles.numel(), 1);
+  TVM_FFI_ICHECK_EQ(num_experts, kSmallRoutingMaxExperts);
+  TVM_FFI_ICHECK_LE(topk_ids.numel(), kSmallRoutingMaxItems);
+
+  cudaSetDevice(topk_ids.device().device_id);
+  cudaStream_t stream = get_stream(topk_ids.device());
+  moe_permute_prepare_small_kernel<<<1, kSmallRoutingMaxExperts, 0, stream>>>(
+      static_cast<const int32_t*>(topk_ids.data_ptr()),
+      static_cast<int32_t*>(expert_offsets.data_ptr()),
+      static_cast<int32_t*>(src2dst.data_ptr()),
+      static_cast<int32_t*>(tile_experts.data_ptr()),
+      static_cast<int32_t*>(tile_n.data_ptr()),
+      static_cast<int32_t*>(num_token_tiles.data_ptr()),
+      static_cast<int32_t*>(expert_counts.data_ptr()),
+      static_cast<int32_t>(num_experts),
+      static_cast<int32_t>(topk_ids.numel()));
+
+  cudaError_t err = cudaGetLastError();
+  TVM_FFI_ICHECK(err == cudaSuccess)
+      << "moe_permute_prepare_small_with_schedule launch failed: "
+      << cudaGetErrorString(err);
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_permute_prepare, moe_permute_prepare);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_permute_prepare_small, moe_permute_prepare_small);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_permute_prepare_small_with_counts,
                               moe_permute_prepare_small_with_counts);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_permute_prepare_small_with_schedule,
+                              moe_permute_prepare_small_with_schedule);
 
 }  // namespace sglang
