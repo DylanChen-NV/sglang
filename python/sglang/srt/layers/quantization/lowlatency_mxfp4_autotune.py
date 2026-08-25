@@ -20,6 +20,12 @@ _DEFAULT_KERNEL_VERSION = "91b5461"
 _PROCESS_CACHE: dict[str, int] = {}
 
 
+def _distributed_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return int(os.getenv("RANK", os.getenv("LOCAL_RANK", "0")))
+
+
 def _cache_path() -> Path:
     configured = os.getenv("SGLANG_LOWLATENCY_MXFP4_AUTOTUNE_CACHE")
     if configured:
@@ -48,6 +54,7 @@ def _key(*, variant: str, rows: int, hidden_size: int, intermediate_size: int):
         "rows": rows,
         "hidden_size": hidden_size,
         "intermediate_size": intermediate_size,
+        "rank": _distributed_rank(),
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
