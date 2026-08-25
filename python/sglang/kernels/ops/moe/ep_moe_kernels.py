@@ -143,6 +143,43 @@ def deepep_post_reorder_triton_kernel(
 
 
 @triton.jit
+def deepep_post_reorder_2d_triton_kernel(
+    down_output_ptr,
+    output_ptr,
+    src2dst_ptr,
+    topk_ids_ptr,
+    topk_weights_ptr,
+    topk,
+    hidden_size,
+    routed_scaling_factor: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    InDtype = down_output_ptr.dtype.element_ty
+
+    src_idx = tl.program_id(0)
+    hidden_block_idx = tl.program_id(1)
+    src2dst_ptr = src2dst_ptr + src_idx * topk
+    topk_ids_ptr = topk_ids_ptr + src_idx * topk
+    topk_weights_ptr = topk_weights_ptr + src_idx * topk
+
+    offset = hidden_block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offset < hidden_size
+    sum_vec = tl.zeros([BLOCK_SIZE], dtype=InDtype)
+    for idx in range(topk):
+        dst_idx = tl.load(src2dst_ptr + idx).to(tl.int64)
+        if dst_idx >= 0:
+            weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
+            if routed_scaling_factor != 1.0:
+                weigh_scale = weigh_scale * routed_scaling_factor
+            load_ptr = down_output_ptr + dst_idx * hidden_size
+            in_data = tl.load(load_ptr + offset, mask=mask)
+            sum_vec += in_data * weigh_scale
+
+    store_ptr = output_ptr + src_idx * hidden_size
+    tl.store(store_ptr + offset, sum_vec, mask=mask)
+
+
+@triton.jit
 def compute_src2dst_triton_kernel(
     reorder_ids, src2dst, num_toks, BLOCK_SIZE: tl.constexpr
 ):
@@ -2058,7 +2095,22 @@ def moe_unpermute(
     assert outputs.dtype == inputs.dtype
     assert outputs.device == inputs.device
 
-    deepep_post_reorder_triton_kernel[(num_tokens,)](
+    use_2d_finalize = (
+        inputs.size(1) == 4096
+        and topk_ids.size(1) == 6
+        and num_tokens in (2, 4, 6, 8, 10)
+    )
+    grid = (
+        (num_tokens, triton.cdiv(inputs.size(1), 512))
+        if use_2d_finalize
+        else (num_tokens,)
+    )
+    kernel = (
+        deepep_post_reorder_2d_triton_kernel
+        if use_2d_finalize
+        else deepep_post_reorder_triton_kernel
+    )
+    kernel[grid](
         inputs,
         outputs,
         src2dst,
