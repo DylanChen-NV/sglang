@@ -393,6 +393,16 @@ class Fp8Config(QuantizationConfig):
 
                 return Mxfp4MarlinMoEMethod(fp8_method, prefix=prefix)
 
+            if (
+                self.is_fp4_experts
+                and get_moe_runner_backend().is_flashinfer_humming()
+            ):
+                from sglang.srt.layers.quantization.mxfp4_flashinfer_humming_moe import (
+                    Mxfp4FlashinferHummingMoEMethod,
+                )
+
+                return Mxfp4FlashinferHummingMoEMethod(fp8_method, prefix=prefix)
+
             if self.is_fp4_experts and get_moe_runner_backend().is_humming():
                 from sglang.srt.layers.quantization.mxfp4_humming_moe import (
                     Mxfp4HummingMoEMethod,
