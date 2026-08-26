@@ -82,6 +82,7 @@ def should_run_flashinfer_autotune(
         "flashinfer_mxfp4",
         "flashinfer_cutedsl",
         "flashinfer_cutlass",
+        "flashinfer_humming",
     ]
 
     from sglang.srt.layers.quantization.fp4_utils import (
