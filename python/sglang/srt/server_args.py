@@ -259,6 +259,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_trtllm_routed",
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
+    "flashinfer_humming",
     "flashinfer_cutedsl",
     "cutlass",
     "aiter",
@@ -6663,6 +6664,12 @@ class ServerArgs:
                 1,
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
+
+        if view.moe_runner_backend == "flashinfer_humming":
+            assert view.moe_a2a_backend == "none", (
+                "flashinfer_humming currently supports only standard dispatch; "
+                f"got moe_a2a_backend={view.moe_a2a_backend!r}."
+            )
 
         if view.moe_runner_backend == "flashinfer_cutedsl":
             # modelopt_mixed with non-NVFP4 MoE layers is rejected at load time.

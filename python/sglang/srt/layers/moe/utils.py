@@ -104,6 +104,7 @@ class MoeRunnerBackend(Enum):
     FLASHINFER_TRTLLM_ROUTED = "flashinfer_trtllm_routed"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
+    FLASHINFER_HUMMING = "flashinfer_humming"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     CUTLASS = "cutlass"
     MARLIN = "marlin"
@@ -153,6 +154,9 @@ class MoeRunnerBackend(Enum):
 
     def is_flashinfer_mxfp4(self):
         return self == MoeRunnerBackend.FLASHINFER_MXFP4
+
+    def is_flashinfer_humming(self):
+        return self == MoeRunnerBackend.FLASHINFER_HUMMING
 
     def is_cutlass(self):
         return self == MoeRunnerBackend.CUTLASS
@@ -284,6 +288,7 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
         get_moe_runner_backend().is_flashinfer_cutedsl()
         or get_moe_runner_backend().is_cutlass()
         or get_moe_runner_backend().is_humming()
+        or get_moe_runner_backend().is_flashinfer_humming()
     ):
         return DispatcherOutputDtype.BF16
 
