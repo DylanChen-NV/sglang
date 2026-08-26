@@ -41,6 +41,12 @@ def handle_moe_kernel_config(server_args: Any):
     run_post_process_pass(server_args, _moe_runner_backend_quant_constraints)
 
     view = resolved_view(server_args)
+    if view.moe_runner_backend == "flashinfer_humming":
+        assert view.moe_a2a_backend == "none", (
+            "flashinfer_humming currently supports only standard dispatch; "
+            f"got moe_a2a_backend={view.moe_a2a_backend!r}."
+        )
+
     if view.moe_runner_backend == "flashinfer_cutlass":
         assert view.quantization in [
             "modelopt_fp4",

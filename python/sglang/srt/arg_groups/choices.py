@@ -145,6 +145,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_trtllm_routed",
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
+    "flashinfer_humming",
     "flashinfer_cutedsl",
     "flashinfer_megamoe",
     "cutlass",
