@@ -52,10 +52,10 @@ class Mxfp4LowLatencyMoEMethod:
     ) -> None:
         if num_experts != 256:
             raise ValueError(f"lowlatency_mxfp4 requires 256 experts, got {num_experts}.")
-        if hidden_size != 4096 or intermediate_size_per_partition != 512:
+        if hidden_size != 4096 or intermediate_size_per_partition not in (512, 1024):
             raise ValueError(
-                "lowlatency_mxfp4 currently supports DSV4 TP4 shapes only: "
-                f"hidden=4096, intermediate=512; got {hidden_size}, "
+                "lowlatency_mxfp4 currently supports DSV4 TP2/TP4 shapes only: "
+                f"hidden=4096, intermediate in (512, 1024); got {hidden_size}, "
                 f"{intermediate_size_per_partition}."
             )
         self._fp8.create_weights(
