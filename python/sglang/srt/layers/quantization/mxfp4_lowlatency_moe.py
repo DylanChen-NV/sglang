@@ -33,9 +33,7 @@ class Mxfp4LowLatencyMoEMethod:
                 "SGLANG_LOWLATENCY_MXFP4_VARIANT must be one of "
                 f"{sorted(self._VALID_VARIANTS)}, got {self.variant!r}."
             )
-        persistent_ctas_override = os.getenv(
-            "SGLANG_LOWLATENCY_MXFP4_PERSISTENT_CTAS"
-        )
+        persistent_ctas_override = os.getenv("SGLANG_LOWLATENCY_MXFP4_PERSISTENT_CTAS")
         self._persistent_ctas_fixed = persistent_ctas_override is not None
         self.persistent_ctas = int(persistent_ctas_override or "312")
         if self.persistent_ctas <= 0:
@@ -50,13 +48,20 @@ class Mxfp4LowLatencyMoEMethod:
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        if num_experts != 256:
-            raise ValueError(f"lowlatency_mxfp4 requires 256 experts, got {num_experts}.")
-        if hidden_size != 4096 or intermediate_size_per_partition not in (512, 1024):
+        if num_experts <= 0:
             raise ValueError(
-                "lowlatency_mxfp4 currently supports DSV4 TP2/TP4 shapes only: "
-                f"hidden=4096, intermediate in (512, 1024); got {hidden_size}, "
-                f"{intermediate_size_per_partition}."
+                f"lowlatency_mxfp4 requires a positive expert count, got {num_experts}."
+            )
+        if (
+            hidden_size <= 0
+            or hidden_size % 64 != 0
+            or intermediate_size_per_partition <= 0
+            or intermediate_size_per_partition % 64 != 0
+        ):
+            raise ValueError(
+                "lowlatency_mxfp4 requires positive hidden and local intermediate "
+                "sizes that are multiples of 64; got "
+                f"hidden={hidden_size}, intermediate={intermediate_size_per_partition}."
             )
         self._fp8.create_weights(
             layer,
@@ -70,9 +75,9 @@ class Mxfp4LowLatencyMoEMethod:
 
     def create_moe_runner(self, layer: Module, moe_runner_config) -> None:
         self.moe_runner_config = moe_runner_config
-        if moe_runner_config.top_k != 6:
+        if moe_runner_config.top_k <= 0:
             raise ValueError(
-                f"lowlatency_mxfp4 requires top_k=6, got {moe_runner_config.top_k}."
+                f"lowlatency_mxfp4 requires a positive top_k, got {moe_runner_config.top_k}."
             )
         log_info_on_rank0(
             logger,
@@ -112,10 +117,14 @@ class Mxfp4LowLatencyMoEMethod:
         self._fp8.process_weights_after_loading(layer)
         if getattr(layer, "_mega_moe_weights_built", False):
             raise RuntimeError("lowlatency_mxfp4 does not support MegaMoE weights.")
-        if layer.num_local_experts != 256 or layer.moe_ep_size != 1:
+        if layer.num_local_experts <= 0:
+            raise ValueError("lowlatency_mxfp4 requires local experts.")
+        if layer.moe_ep_size != 1:
             raise ValueError(
-                "lowlatency_mxfp4 currently requires EP1 with all 256 experts local."
+                "lowlatency_mxfp4 currently requires EP1 with all experts local."
             )
+        # Routing and workspace sizes below are parameterized by the local expert
+        # count. End-to-end validation currently covers num_local_experts=256 only.
 
         total_start = time.perf_counter()
         for stem in ("w13", "w2"):
@@ -157,10 +166,14 @@ class Mxfp4LowLatencyMoEMethod:
         )
 
     @staticmethod
-    def _workspace(rows: int, n: int, k: int, device: torch.device):
+    def _workspace(
+        rows: int, n: int, k: int, num_local_experts: int, device: torch.device
+    ):
         return {
             "q": torch.empty((rows, k), dtype=torch.float8_e4m3fn, device=device),
-            "counts": torch.empty((256,), dtype=torch.int32, device=device),
+            "counts": torch.empty(
+                (num_local_experts,), dtype=torch.int32, device=device
+            ),
             "token_scales": torch.empty((rows, 1), dtype=torch.float32, device=device),
             "tile_experts": torch.empty((rows,), dtype=torch.int32, device=device),
             "tile_n": torch.empty((rows,), dtype=torch.int32, device=device),
@@ -184,8 +197,16 @@ class Mxfp4LowLatencyMoEMethod:
         weight = getattr(layer, f"{stem}_weight")
         weight_offsets = getattr(layer, f"{stem}_weight_exp_offsets")
         residual = getattr(layer, f"{stem}_expert_residual")
-        n = 2 * layer.intermediate_size_per_partition if stem == "w13" else layer.hidden_size
-        k = layer.hidden_size if stem == "w13" else layer.intermediate_size_per_partition
+        n = (
+            2 * layer.intermediate_size_per_partition
+            if stem == "w13"
+            else layer.hidden_size
+        )
+        k = (
+            layer.hidden_size
+            if stem == "w13"
+            else layer.intermediate_size_per_partition
+        )
         if schedule is None:
             return llop.grouped_gemm_out(
                 q,
@@ -233,11 +254,31 @@ class Mxfp4LowLatencyMoEMethod:
         from sglang.kernels.ops.moe.fused_moe_triton_kernels import act_and_mul_triton
 
         rows = topk_ids.numel()
-        fc1 = self._workspace(rows, 2 * layer.intermediate_size_per_partition, layer.hidden_size, hidden_states.device)
-        fc2 = self._workspace(rows, layer.hidden_size, layer.intermediate_size_per_partition, hidden_states.device)
-        compact = torch.empty((rows, layer.hidden_size), dtype=hidden_states.dtype, device=hidden_states.device)
+        fc1 = self._workspace(
+            rows,
+            2 * layer.intermediate_size_per_partition,
+            layer.hidden_size,
+            layer.num_local_experts,
+            hidden_states.device,
+        )
+        fc2 = self._workspace(
+            rows,
+            layer.hidden_size,
+            layer.intermediate_size_per_partition,
+            layer.num_local_experts,
+            hidden_states.device,
+        )
+        compact = torch.empty(
+            (rows, layer.hidden_size),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
         compact, src2dst, offsets = moe_permute(
-            hidden_states, topk_ids, 256, is_ep=False, outputs=compact
+            hidden_states,
+            topk_ids,
+            layer.num_local_experts,
+            is_ep=False,
+            outputs=compact,
         )
         q1, s1 = fc1["q"], fc1["token_scales"]
         sgl_per_token_quant_fp8(compact, q1, s1)
@@ -270,18 +311,36 @@ class Mxfp4LowLatencyMoEMethod:
         from sglang.kernels.ops.moe.fused_activation_quant import fused_swiglu_quant_fp8
         from sglang.kernels.ops.moe.fused_moe_triton_kernels import act_and_mul_triton
         from sglang.kernels.ops.moe.fused_quant_permute import fused_quant_permute_fp8
-        from sglang.kernels.ops.moe.moe_permute_prepare import moe_permute_prepare_with_schedule
+        from sglang.kernels.ops.moe.moe_permute_prepare import (
+            moe_permute_prepare_with_schedule,
+        )
         from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
 
         rows = topk_ids.numel()
-        fc1 = self._workspace(rows, 2 * layer.intermediate_size_per_partition, layer.hidden_size, hidden_states.device)
-        fc2 = self._workspace(rows, layer.hidden_size, layer.intermediate_size_per_partition, hidden_states.device)
+        fc1 = self._workspace(
+            rows,
+            2 * layer.intermediate_size_per_partition,
+            layer.hidden_size,
+            layer.num_local_experts,
+            hidden_states.device,
+        )
+        fc2 = self._workspace(
+            rows,
+            layer.hidden_size,
+            layer.intermediate_size_per_partition,
+            layer.num_local_experts,
+            hidden_states.device,
+        )
         offsets, src2dst, counts, tile_experts, tile_n, num_tiles = (
-            moe_permute_prepare_with_schedule(topk_ids, 256)
+            moe_permute_prepare_with_schedule(topk_ids, layer.num_local_experts)
         )
         schedule = (counts, tile_experts, tile_n, num_tiles)
         q1, s1 = fused_quant_permute_fp8(
-            hidden_states, src2dst, topk_ids.size(1), outputs=fc1["q"], scales=fc1["token_scales"]
+            hidden_states,
+            src2dst,
+            topk_ids.size(1),
+            outputs=fc1["q"],
+            scales=fc1["token_scales"],
         )
         gate_up = self._gemm(layer, "w13", q1, s1, offsets, fc1, schedule)
         if self.variant == "final":
@@ -341,12 +400,8 @@ class Mxfp4LowLatencyMoEMethod:
 
         def run():
             if use_preopt:
-                return self._run_preopt(
-                    layer, hidden_states, topk_ids, topk_weights
-                )
-            return self._run_optimized(
-                layer, hidden_states, topk_ids, topk_weights
-            )
+                return self._run_preopt(layer, hidden_states, topk_ids, topk_weights)
+            return self._run_optimized(layer, hidden_states, topk_ids, topk_weights)
 
         if not self._persistent_ctas_fixed and topk_ids.numel() <= 64:
             from sglang.srt.layers.quantization.lowlatency_mxfp4_autotune import (
