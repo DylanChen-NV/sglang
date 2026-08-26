@@ -19,28 +19,42 @@ class TestMxfp4LowLatencyMoEShapes(unittest.TestCase):
         method._fp8 = _FakeFp8Method()
         return method
 
-    def test_accepts_dsv4_tp2_and_tp4_shapes(self):
-        for intermediate_size in (512, 1024):
+    def test_accepts_kernel_compatible_shapes_and_expert_counts(self):
+        for num_experts, hidden_size, intermediate_size in (
+            (256, 4096, 512),
+            (128, 3072, 768),
+            (64, 2048, 2048),
+        ):
             method = self._method()
             method.create_weights(
                 object(),
-                num_experts=256,
-                hidden_size=4096,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
                 intermediate_size_per_partition=intermediate_size,
                 params_dtype=None,
             )
             self.assertEqual(len(method._fp8.calls), 1)
 
-    def test_rejects_other_intermediate_sizes(self):
-        method = self._method()
-        with self.assertRaisesRegex(ValueError, "TP2/TP4"):
-            method.create_weights(
-                object(),
-                num_experts=256,
-                hidden_size=4096,
-                intermediate_size_per_partition=2048,
-                params_dtype=None,
-            )
+    def test_rejects_nonpositive_or_unaligned_shapes(self):
+        for num_experts, hidden_size, intermediate_size in (
+            (0, 4096, 512),
+            (256, 4100, 512),
+            (256, 4096, 770),
+        ):
+            method = self._method()
+            with self.subTest(
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+            ):
+                with self.assertRaises(ValueError):
+                    method.create_weights(
+                        object(),
+                        num_experts=num_experts,
+                        hidden_size=hidden_size,
+                        intermediate_size_per_partition=intermediate_size,
+                        params_dtype=None,
+                    )
 
 
 if __name__ == "__main__":
