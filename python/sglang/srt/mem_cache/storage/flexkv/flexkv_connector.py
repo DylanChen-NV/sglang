@@ -72,9 +72,10 @@ def _abort_trace(phase: str, **fields) -> None:
     if os.getenv("SGLANG_FLEXKV_ABORT_TRACE", "0") != "1":
         return
     payload = {"phase": phase, "wall_ns": time.time_ns(), **fields}
-    logger.warning(
-        "SGLANG_FLEXKV_ABORT_TRACE %s", json.dumps(payload, sort_keys=True)
-    )
+    print("SGLANG_FLEXKV_ABORT_TRACE " + json.dumps(payload, sort_keys=True), flush=True)
+
+
+_abort_trace("MODULE_LOADED", module=__file__)
 
 
 class FlexKVConnector:
