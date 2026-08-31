@@ -27,6 +27,12 @@ def _flexkv_factory(ctx):
     needs them to fan out lookup/store decisions across the full TP × CP
     × PP topology.
     """
+    if ctx.is_hybrid_ssm:
+        raise ValueError(
+            "FlexKV does not support hybrid SSM/GatedDeltaNet cache state; "
+            "offloading attention KV alone cannot restore a valid prefix."
+        )
+
     from sglang.srt.distributed.parallel_state import (
         get_attn_cp_group,
         get_attn_tp_group,

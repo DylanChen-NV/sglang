@@ -3499,6 +3499,12 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
+        # All model-parallel scheduler ranks enter this control point once per
+        # scheduling iteration. FlexKV completion propagation must happen here,
+        # not from conditional eviction or prefill paths.
+        if get_memory().enable_flexkv:
+            self.tree_cache.check_hicache_events()
+
         self.process_pending_chunked_abort()
 
         if self.enable_fpm:
