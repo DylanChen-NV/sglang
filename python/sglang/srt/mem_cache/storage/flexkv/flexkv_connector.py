@@ -25,6 +25,8 @@ Modes:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import socket
@@ -59,6 +61,20 @@ except ImportError as exc:  # pragma: no cover - runtime check
     ) from exc
 
 logger = logging.getLogger(__name__)
+
+
+def _token_digest(token_ids) -> str:
+    values = np.asarray(token_ids, dtype=np.int64)
+    return hashlib.sha256(values.tobytes()).hexdigest()[:16]
+
+
+def _abort_trace(phase: str, **fields) -> None:
+    if os.getenv("SGLANG_FLEXKV_ABORT_TRACE", "0") != "1":
+        return
+    payload = {"phase": phase, "wall_ns": time.time_ns(), **fields}
+    logger.warning(
+        "SGLANG_FLEXKV_ABORT_TRACE %s", json.dumps(payload, sort_keys=True)
+    )
 
 
 class FlexKVConnector:
@@ -306,6 +322,17 @@ class FlexKVConnector:
                 )
             hit_length = aligned
 
+        if self._sync_ctx.is_sync_leader:
+            _abort_trace(
+                "LOOKUP_RESULT",
+                rid=rid,
+                task_id=fkv_task_id,
+                query_tokens=len(token_ids),
+                candidate_tokens=int(self._as_numpy_mask(token_mask).sum()),
+                hit_tokens=hit_length,
+                token_digest=_token_digest(token_ids),
+            )
+
         # Decide what to do with the held task. Three cases:
         #   1. hit_length > 0 and rid given → stash for retrieve_kv later.
         #   2. hit_length > 0 and rid is None → cancel; caller can't use it.
@@ -359,15 +386,24 @@ class FlexKVConnector:
                 layerwise_transfer=False,
             )
             resp = self.kv_manager.wait([fkv_task_id], timeout=30.0)
-            if not (
+            success = (
                 fkv_task_id in resp
                 and resp[fkv_task_id].status == KVResponseStatus.SUCCESS
-            ):
+            )
+            if not success:
                 logger.warning(
                     "[FlexKV] retrieve_kv: task %d failed/timed out",
                     fkv_task_id,
                 )
                 n = 0
+            _abort_trace(
+                "LOAD_COMPLETE",
+                rid=rid,
+                task_id=fkv_task_id,
+                requested_slots=int(slot_mapping_cpu.numel()),
+                loaded_slots=int(n),
+                success=success,
+            )
         if self._sync_ctx.needs_sync:
             self._sync_ctx.barrier()
         return n
@@ -484,6 +520,13 @@ class FlexKVConnector:
         if self.page_size > 1:
             aligned_len = (n // self.page_size) * self.page_size
             if aligned_len == 0:
+                if self._sync_ctx.is_sync_leader:
+                    _abort_trace(
+                        "STORE_SKIPPED",
+                        rid=rid,
+                        reason="empty_after_page_alignment",
+                        input_tokens=n,
+                    )
                 self._send_pp_put_meta(-1, [])
                 return -1
             if aligned_len < n:
@@ -498,12 +541,30 @@ class FlexKVConnector:
                 logger.warning("[FlexKV] put_match raised: %s", exc)
                 res = None
             if res is None:
+                _abort_trace(
+                    "STORE_SKIPPED",
+                    rid=rid,
+                    reason="put_match_none",
+                    input_tokens=n,
+                    aligned_tokens=len(token_ids_np),
+                    token_digest=_token_digest(token_ids_np),
+                )
                 self._send_pp_put_meta(-1, [])
             else:
                 fkv_task_id, unmatched_mask = res
+                unmatched_tokens = int(unmatched_mask.sum())
+                _abort_trace(
+                    "STORE_SUBMIT",
+                    rid=rid,
+                    task_id=int(fkv_task_id),
+                    input_tokens=n,
+                    aligned_tokens=len(token_ids_np),
+                    unmatched_tokens=unmatched_tokens,
+                    token_digest=_token_digest(token_ids_np),
+                )
                 self._send_pp_put_meta(fkv_task_id, unmatched_mask)
 
-                if int(unmatched_mask.sum()) > 0:
+                if unmatched_tokens > 0:
                     filtered = kv_indices[unmatched_mask]
                     slot_mapping_cpu = self._to_cpu_int64(filtered)
                     self.kv_manager.launch(
@@ -565,6 +626,13 @@ class FlexKVConnector:
                     if response.status not in terminal_statuses:
                         continue
                     rid = fk_to_rid[fk_tid]
+                    response = completed_dict[fk_tid]
+                    _abort_trace(
+                        "STORE_COMPLETE",
+                        rid=rid,
+                        task_id=int(fk_tid),
+                        status=str(getattr(response, "status", None)),
+                    )
                     completed_rids.append(rid)
                     self._inflight_stores.pop(rid, None)
 
