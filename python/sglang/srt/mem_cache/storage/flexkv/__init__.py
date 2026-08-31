@@ -26,6 +26,12 @@ def _flexkv_factory(ctx):
     FlexKV needs them to fan out lookup/store decisions across the full
     TP × CP × PP topology.
     """
+    if ctx.is_hybrid_ssm:
+        raise ValueError(
+            "FlexKV does not support hybrid SSM/GatedDeltaNet cache state; "
+            "offloading attention KV alone cannot restore a valid prefix."
+        )
+
     from sglang.srt.mem_cache.storage.flexkv.flexkv_radix_cache import (
         FlexKVRadixCache,
     )
