@@ -43,7 +43,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import FlexKVConnector
+from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import (
+    FlexKVConnector,
+    _abort_trace,
+    _token_digest,
+)
 from sglang.srt.runtime_context import get_spec
 
 if TYPE_CHECKING:
@@ -432,6 +436,16 @@ class FlexKVRadixCache(RadixCache):
     ) -> None:
         """Base cache_finished_req then conditionally store KV in FlexKV."""
         store_event = self._finished_store_event(req) if is_insert else None
+        is_trace_leader = self.flexkv_connector._sync_ctx.is_sync_leader
+        if is_trace_leader:
+            _abort_trace(
+                "CACHE_FINISHED_REQ",
+                rid=req.rid,
+                finish_reason=type(req.to_finish).__name__ if req.to_finish else None,
+                prompt_tokens=len(req.origin_input_ids),
+                output_tokens=len(req.output_ids),
+                kv_committed_len=int(req.kv_committed_len),
+            )
         super().cache_finished_req(
             req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
         )
@@ -495,10 +509,25 @@ class FlexKVRadixCache(RadixCache):
             # Nothing to write back (either everything already in
             # FlexKV, or put_match failed / returned None).
             self.dec_lock_ref(new_last_node)
+            if is_trace_leader:
+                _abort_trace(
+                    "CACHE_STORE_NOT_TRACKED",
+                    rid=req.rid,
+                    committed_tokens=kv_committed_len,
+                    token_digest=_token_digest(token_ids),
+                )
             return
 
         with self._node_lock:
             self._inflight_store_nodes[req.rid] = new_last_node
+        if is_trace_leader:
+            _abort_trace(
+                "CACHE_STORE_TRACKED",
+                rid=req.rid,
+                task_id=int(fkv_task_id),
+                committed_tokens=kv_committed_len,
+                token_digest=_token_digest(token_ids),
+            )
 
     @staticmethod
     def _finished_store_event(req: Req) -> str:
@@ -581,12 +610,22 @@ class FlexKVRadixCache(RadixCache):
     def wait_for_pending_stores(self, timeout: float) -> None:
         """Keep source KV pinned until every asynchronous FlexKV store finishes."""
         deadline = time.monotonic() + timeout
+        with self._node_lock:
+            initial_pending = sorted(self._inflight_store_nodes)
+        if self.flexkv_connector._sync_ctx.is_sync_leader:
+            _abort_trace(
+                "STORE_BARRIER_ENTER",
+                pending_count=len(initial_pending),
+                pending_sample=initial_pending[:16],
+            )
         while True:
             self._drain_completed_stores()
             with self._node_lock:
                 pending_rids = list(self._inflight_store_nodes)
             if not pending_rids:
                 logger.info("[FlexKV] abort KV checkpoint barrier completed")
+                if self.flexkv_connector._sync_ctx.is_sync_leader:
+                    _abort_trace("STORE_BARRIER_EXIT", pending_count=0)
                 return
             if time.monotonic() >= deadline:
                 raise TimeoutError(
