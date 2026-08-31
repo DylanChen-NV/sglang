@@ -465,18 +465,16 @@ class FlexKVRadixCache(RadixCache):
     # ------------------------------------------------------------------
 
     def evict(self, params: EvictParams) -> EvictResult:  # type: ignore[override]
-        """Drain completed stores before letting the base evict touch
-        the source nodes."""
+        """Evict only nodes that the rank-consistent store pins permit."""
         if self.disable:
             return EvictResult()
-        self._drain_completed_stores()
         # Make sure the store stream's GPU work is observed before any
         # eviction frees the source slots.
         self.store_stream.synchronize()
         return super().evict(params)
 
     def check_hicache_events(self) -> None:  # type: ignore[override]
-        """Periodic non-blocking sweep called by the scheduler tick.
+        """Drain async work at the rank-lockstep scheduler control point.
 
         Drains both store completions (so source nodes get unlocked
         quickly) and the launched-load tail (so the FlexKV pipe

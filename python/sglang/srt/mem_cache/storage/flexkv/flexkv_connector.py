@@ -38,7 +38,6 @@ import torch
 from sglang.srt.mem_cache.storage.flexkv.flexkv_comm import (
     CMD_LAYERWISE,
     CMD_PUT_META,
-    CMD_STORE_COMPLETE,
     FlexKVComm,
     FlexKVLayerDoneCounter,
     send_fds,
@@ -467,8 +466,10 @@ class FlexKVConnector:
         mask is received over the PP fan-out so cross-node PP can
         forward its slot mappings.
 
-        Returns the FlexKV task id of the in-flight store, or -1 if
-        nothing needed to be written.
+        Returns the FlexKV task id of the in-flight store on every rank,
+        or -1 if nothing needed to be written. Keeping this result
+        rank-consistent is required so every local radix tree pins and
+        later releases the same logical node.
         """
         token_ids_np = np.asarray(token_ids, dtype=np.int64)
         n = len(token_ids_np)
@@ -498,23 +499,21 @@ class FlexKVConnector:
                 res = None
             if res is None:
                 self._send_pp_put_meta(-1, [])
-                return -1
-            fkv_task_id, unmatched_mask = res
+            else:
+                fkv_task_id, unmatched_mask = res
+                self._send_pp_put_meta(fkv_task_id, unmatched_mask)
 
-            self._send_pp_put_meta(fkv_task_id, unmatched_mask)
-
-            if int(unmatched_mask.sum()) > 0:
-                filtered = kv_indices[unmatched_mask]
-                slot_mapping_cpu = self._to_cpu_int64(filtered)
-                self.kv_manager.launch(
-                    task_ids=[fkv_task_id],
-                    slot_mappings=[slot_mapping_cpu],
-                    as_batch=False,
-                    layerwise_transfer=False,
-                )
-                self._inflight_stores[rid] = fkv_task_id
-                return fkv_task_id
-            return -1
+                if int(unmatched_mask.sum()) > 0:
+                    filtered = kv_indices[unmatched_mask]
+                    slot_mapping_cpu = self._to_cpu_int64(filtered)
+                    self.kv_manager.launch(
+                        task_ids=[fkv_task_id],
+                        slot_mappings=[slot_mapping_cpu],
+                        as_batch=False,
+                        layerwise_transfer=False,
+                    )
+                else:
+                    fkv_task_id = -1
 
         # Non-leader path: receive the unmatched mask + maybe forward
         # slot_mapping to the remote-side TransferManager.
@@ -535,14 +534,17 @@ class FlexKVConnector:
                 filtered = kv_indices[unmatched_mask]
                 slot_mapping_cpu = self._to_cpu_int64(filtered)
                 self._send_slot_mapping_to_remote(fkv_task_id, slot_mapping_cpu)
-                self._inflight_stores[rid] = fkv_task_id
+
+        if self._sync_ctx.needs_sync:
+            payload = self._sync_ctx.scatter({"task_id": fkv_task_id})
+            fkv_task_id = int(payload["task_id"])
+        if fkv_task_id >= 0:
+            self._inflight_stores[rid] = fkv_task_id
         return fkv_task_id
 
     def check_completed_stores(self) -> List[str]:
         """Return rids whose stores have completed since the last call."""
         completed_rids: List[str] = []
-        completed_dict: Dict[int, Any] = {}
-
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             if self._inflight_stores:
                 fk_to_rid = {v: k for k, v in self._inflight_stores.items()}
@@ -558,31 +560,11 @@ class FlexKVConnector:
                     completed_rids.append(rid)
                     self._inflight_stores.pop(rid, None)
 
-        if self._sync_ctx.is_pp_sender:
-            self._sync_ctx.scatter_pp(
-                {
-                    "cmd": CMD_STORE_COMPLETE,
-                    "completed_fk_ids": list(completed_dict),
-                }
-            )
-        elif self._sync_ctx.is_pp_receiver:
-            payload = self._sync_ctx.scatter_pp(None)
-            if payload.get("cmd") != CMD_STORE_COMPLETE:
-                raise RuntimeError(
-                    f"Tag mismatch: expected CMD_STORE_COMPLETE, got "
-                    f"{payload.get('cmd')}"
-                )
-            fk_ids = payload.get("completed_fk_ids", [])
-            if fk_ids and self._inflight_stores:
-                fk_to_rid = {v: k for k, v in self._inflight_stores.items()}
-                for fk_tid in fk_ids:
-                    if fk_tid in fk_to_rid:
-                        rid = fk_to_rid[fk_tid]
-                        completed_rids.append(rid)
-                        self._inflight_stores.pop(rid, None)
-
         if self._sync_ctx.needs_sync:
             completed_rids = self._sync_ctx.scatter(completed_rids)
+        if not self._sync_ctx.is_sync_leader:
+            for rid in completed_rids:
+                self._inflight_stores.pop(rid, None)
         return completed_rids
 
     def wait_store(self, rid: str, timeout: float = 30.0) -> bool:
