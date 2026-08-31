@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -149,6 +150,14 @@ class FlexKVRadixCache(RadixCache):
         # ``check_hicache_events``.
         self._inflight_store_nodes: dict[str, TreeNode] = {}
         self._node_lock = threading.Lock()
+        self._force_external_miss = os.getenv(
+            "SGLANG_FLEXKV_FORCE_EXTERNAL_MISS", "0"
+        ).lower() in {"1", "true", "yes", "on"}
+        if self._force_external_miss:
+            logger.warning(
+                "SGLANG_FLEXKV_FORCE_EXTERNAL_MISS is enabled; preserving local "
+                "radix hits while skipping FlexKV external lookup"
+            )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -206,6 +215,9 @@ class FlexKVRadixCache(RadixCache):
 
         device_value: torch.Tensor = base_res.device_indices
         last_node: TreeNode = base_res.last_device_node
+
+        if self._force_external_miss:
+            return base_res
 
         if self._mode is FlexKVMode.MP:
             if params.req is None:
