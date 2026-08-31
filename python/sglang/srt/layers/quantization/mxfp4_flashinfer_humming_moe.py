@@ -65,8 +65,8 @@ class Mxfp4FlashinferHummingMoEMethod:
                 from flashinfer.tllm_enums import ActivationType
         except (ImportError, AttributeError) as exc:
             raise RuntimeError(
-                "flashinfer_humming requires a FlashInfer build containing "
-                "PR #3738 (validated with 0.6.16.post1)"
+                "flashinfer_humming requires FlashInfer >= 0.6.18 with the "
+                "SM90 MXFP4xFP8 Humming backend"
             ) from exc
         return (
             cutlass_fused_moe,
@@ -187,19 +187,15 @@ class Mxfp4FlashinferHummingMoEMethod:
         layer._dsv4_mxfp4_backend = "flashinfer_humming"
 
     @staticmethod
-    def _expert_major_residual_scales(
-        topk_ids: torch.Tensor,
+    def _expert_residual_scales(
         *expert_residuals: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
-        flat_ids = topk_ids.reshape(-1).to(torch.long)
-        expert_major_order = torch.argsort(flat_ids, stable=True)
-        result = []
-        for residual in expert_residuals:
-            route_scale = residual.index_select(0, flat_ids) * 64.0
-            result.append(
-                route_scale.index_select(0, expert_major_order).contiguous()
-            )
-        return tuple(result)
+        # FlashInfer >= 0.6.18 consumes one residual per local expert and
+        # performs the routed-row lookup internally. Both slots retain
+        # Humming fixed 2^6 compensation.
+        return tuple(
+            (residual * 64.0).contiguous() for residual in expert_residuals
+        )
 
     def apply(
         self,
@@ -225,8 +221,7 @@ class Mxfp4FlashinferHummingMoEMethod:
         if routed_scaling_factor != 1.0:
             topk_weights = topk_weights * routed_scaling_factor
 
-        fc1_residual, fc2_residual = self._expert_major_residual_scales(
-            topk_ids,
+        fc1_residual, fc2_residual = self._expert_residual_scales(
             layer.w13_weight_residual,
             layer.w2_weight_residual,
         )
@@ -243,7 +238,7 @@ class Mxfp4FlashinferHummingMoEMethod:
         if not Mxfp4FlashinferHummingMoEMethod._runtime_logged:
             log_info_on_rank0(
                 logger,
-                "Executing FlashInfer PR #3738 Humming MoE "
+                "Executing FlashInfer v0.6.18 Humming MoE "
                 f"with tune_max_num_tokens={_TUNE_MAX_NUM_TOKENS}",
             )
             Mxfp4FlashinferHummingMoEMethod._runtime_logged = True
