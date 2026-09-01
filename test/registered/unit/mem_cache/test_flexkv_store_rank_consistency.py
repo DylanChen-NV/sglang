@@ -4,6 +4,7 @@ from unittest import mock
 
 import numpy as np
 import torch
+from flexkv.common.request import KVResponseStatus
 
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
@@ -62,6 +63,13 @@ class _KVManager:
 
     def try_wait(self, *, task_ids):
         return {task_id: object() for task_id in task_ids}
+
+    def wait(self, task_ids, *, timeout, completely):
+        assert completely
+        return {
+            task_id: SimpleNamespace(status=KVResponseStatus.SUCCESS)
+            for task_id in task_ids
+        }
 
 
 def _connector(*, leader: bool, fanout: _Fanout, manager=None):
