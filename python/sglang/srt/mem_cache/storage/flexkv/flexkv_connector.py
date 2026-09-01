@@ -549,13 +549,23 @@ class FlexKVConnector:
             if self._inflight_stores:
                 fk_to_rid = {v: k for k, v in self._inflight_stores.items()}
                 try:
-                    completed_dict = self.kv_manager.try_wait(
-                        task_ids=list(fk_to_rid.keys())
-                    )
+                    completed_dict = self.kv_manager.wait(
+                        list(fk_to_rid.keys()),
+                        timeout=0.0,
+                        completely=True,
+                    ) or {}
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("[FlexKV] check_completed_stores: %s", exc)
                     completed_dict = {}
-                for fk_tid in completed_dict:
+                terminal_statuses = {
+                    KVResponseStatus.SUCCESS,
+                    KVResponseStatus.FAILED,
+                    KVResponseStatus.CANCELLED,
+                    KVResponseStatus.NOTFOUND,
+                }
+                for fk_tid, response in completed_dict.items():
+                    if response.status not in terminal_statuses:
+                        continue
                     rid = fk_to_rid[fk_tid]
                     completed_rids.append(rid)
                     self._inflight_stores.pop(rid, None)
@@ -569,19 +579,29 @@ class FlexKVConnector:
 
     def wait_store(self, rid: str, timeout: float = 30.0) -> bool:
         """Block until a single store task identified by ``rid`` finishes."""
-        fkv_task_id = self._inflight_stores.pop(rid, -1)
+        fkv_task_id = self._inflight_stores.get(rid, -1)
         if fkv_task_id < 0:
             return True
         if not self._sync_ctx.is_sync_leader or self.kv_manager is None:
+            self._inflight_stores.pop(rid, None)
             return True
         try:
-            resp = self.kv_manager.wait([fkv_task_id], timeout=timeout)
+            resp = self.kv_manager.wait(
+                [fkv_task_id], timeout=timeout, completely=True
+            ) or {}
         except Exception as exc:  # noqa: BLE001
             logger.warning("[FlexKV] wait_store: %s", exc)
             return False
-        return (
-            fkv_task_id in resp and resp[fkv_task_id].status == KVResponseStatus.SUCCESS
-        )
+        response = resp.get(fkv_task_id)
+        if response is None or response.status not in {
+            KVResponseStatus.SUCCESS,
+            KVResponseStatus.FAILED,
+            KVResponseStatus.CANCELLED,
+            KVResponseStatus.NOTFOUND,
+        }:
+            return False
+        self._inflight_stores.pop(rid, None)
+        return response.status == KVResponseStatus.SUCCESS
 
     # ------------------------------------------------------------------
     # Public API — prefetch
