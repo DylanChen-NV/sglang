@@ -40,6 +40,7 @@ class _KVManager:
     def __init__(self, status=None):
         self.launched = []
         self.status = status or KVResponseStatus.SUCCESS
+        self.completed_task_ids = None
 
     def put_match(self, *, token_ids, token_mask):
         return 41, np.ones(len(token_ids), dtype=np.bool_)
@@ -48,7 +49,16 @@ class _KVManager:
         self.launched.append(kwargs)
 
     def try_wait(self, *, task_ids):
-        return {task_id: object() for task_id in task_ids}
+        completed = (
+            task_ids
+            if self.completed_task_ids is None
+            else self.completed_task_ids
+        )
+        return {
+            task_id: SimpleNamespace(status=self.status)
+            for task_id in task_ids
+            if task_id in completed
+        }
 
     def wait(self, task_ids, timeout, completely):
         return {
@@ -106,6 +116,26 @@ class TestFlexKVStoreRankConsistency(unittest.TestCase):
                 self.assertIs(follower.wait_store("req"), expected)
                 self.assertEqual(leader._inflight_stores, {})
                 self.assertEqual(follower._inflight_stores, {})
+
+    def test_completion_poll_keeps_unfinished_store(self):
+        fanout = _Fanout()
+        manager = _KVManager()
+        manager.completed_task_ids = []
+        leader = _connector(leader=True, fanout=fanout, manager=manager)
+        follower = _connector(leader=False, fanout=fanout)
+        leader._inflight_stores = {"req": 41}
+        follower._inflight_stores = {"req": 41}
+
+        self.assertEqual(leader.check_completed_stores(), [])
+        self.assertEqual(follower.check_completed_stores(), [])
+        self.assertEqual(leader._inflight_stores, {"req": 41})
+        self.assertEqual(follower._inflight_stores, {"req": 41})
+
+        manager.completed_task_ids = [41]
+        self.assertEqual(leader.check_completed_stores(), ["req"])
+        self.assertEqual(follower.check_completed_stores(), ["req"])
+        self.assertEqual(leader._inflight_stores, {})
+        self.assertEqual(follower._inflight_stores, {})
 
     def test_retract_checkpoint_stores_before_release(self):
         connector = SimpleNamespace(
