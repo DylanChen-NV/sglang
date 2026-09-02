@@ -265,6 +265,9 @@ class Memory(msgspec.Struct):
             nargs="+",
         ),
     ] = None
+    flexkv_store_timeout: A[
+        float, "Timeout in seconds for persisting retracted KV before device release."
+    ] = 30.0
     flexkv_config_file: A[
         Optional[str],
         (

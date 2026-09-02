@@ -5,6 +5,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
+    get_memory,
     get_parallel,
     get_platform,
     get_schedule,
@@ -2353,6 +2354,17 @@ def release_req(
             token_to_kv_pool_allocator,
             get_disagg().disaggregation_decode_retraction_backup,
         )
+    if offload_kv:
+        checkpointed = tree_cache.checkpoint_retracted_req(
+            req, timeout=get_memory().flexkv_store_timeout
+        )
+        if checkpointed is False:
+            logger.warning(
+                "External KV checkpoint failed for retracted request %s; "
+                "the request will be recomputed when resumed",
+                req.rid,
+            )
+
     # TODO (csy): for preempted requests, we may want to insert into the tree
     release_kv_cache(req, tree_cache, checkpoint=False)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
