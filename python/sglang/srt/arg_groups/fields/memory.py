@@ -254,3 +254,7 @@ class Memory:
             type_parser=json_list_type,
         ),
     ] = None
+    flexkv_store_timeout: A[
+        float,
+        "Timeout in seconds for a synchronous FlexKV request checkpoint.",
+    ] = 30.0

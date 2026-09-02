@@ -418,6 +418,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_flexkv",
     "flexkv_config_file",
     "flexkv_store_events",
+    "flexkv_store_timeout",
     "kt_weight_path",
     "kt_method",
     "kt_cpuinfer",
