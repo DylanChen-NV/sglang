@@ -500,6 +500,40 @@ class FlexKVRadixCache(RadixCache):
             return "error_abort"
         return "cancel_abort"
 
+    def checkpoint_retracted_req(self, req: Req, timeout: float) -> Optional[bool]:
+        """Synchronously persist a retracted prefix before freeing its GPU KV."""
+        if "retract" not in self.store_events or req.req_pool_idx is None:
+            return None
+
+        kv_committed_len = req.effective_kv_committed_len()
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        if not token_ids:
+            return True
+        start_time = time.perf_counter()
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :kv_committed_len
+        ]
+        with torch.cuda.stream(self.store_stream):
+            task_id = self.flexkv_connector.store_kv(
+                rid=req.rid,
+                token_ids=list(token_ids),
+                kv_indices=kv_indices,
+            )
+        if task_id < 0:
+            success = True
+        else:
+            success = self.flexkv_connector.wait_store(req.rid, timeout=timeout)
+        logger.info(
+            "[FlexKV] Retract checkpoint rid=%s tokens=%d task_id=%d "
+            "success=%s duration_s=%.6f",
+            req.rid,
+            len(token_ids),
+            task_id,
+            success,
+            time.perf_counter() - start_time,
+        )
+        return success
+
     # ------------------------------------------------------------------
     # evict + completion draining
     # ------------------------------------------------------------------

@@ -1933,6 +1933,17 @@ def release_req(
             token_to_kv_pool_allocator,
             get_disagg().disaggregation_decode_retraction_backup,
         )
+    if offload_kv:
+        checkpointed = tree_cache.checkpoint_retracted_req(
+            req, timeout=getattr(server_args, "flexkv_store_timeout", 30.0)
+        )
+        if checkpointed is False:
+            logger.warning(
+                "External KV checkpoint failed for retracted request %s; "
+                "the request will be recomputed when resumed",
+                req.rid,
+            )
+
     # TODO (csy): for preempted requests, we may want to insert into the tree
     release_kv_cache(req, tree_cache, is_insert=False)
     # NOTE(lsyin): we should use the newly evictable memory instantly.

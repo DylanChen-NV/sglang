@@ -278,6 +278,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def wait_for_pending_stores(self, timeout: float) -> None:
         """Wait for external stores that still reference device-local KV."""
 
+    def checkpoint_retracted_req(self, req: Req, timeout: float) -> Optional[bool]:
+        """Persist a retracted request before its device KV is released.
+
+        Return ``None`` when this cache does not checkpoint retractions, otherwise
+        return whether the checkpoint completed successfully.
+        """
+        return None
+
     @abstractmethod
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         pass

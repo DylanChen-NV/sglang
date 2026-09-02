@@ -1,14 +1,18 @@
 import unittest
+from contextlib import nullcontext
 from http import HTTPStatus
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import torch
 
 try:
     import flexkv  # noqa: F401
+    from flexkv.common.request import KVResponseStatus
 except ImportError:
     flexkv = None
+    KVResponseStatus = None
 
 from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
 from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import FlexKVConnector
@@ -33,8 +37,9 @@ class _SyncContext:
 
 
 class _KVManager:
-    def __init__(self):
+    def __init__(self, status=None):
         self.launched = []
+        self.status = status or KVResponseStatus.SUCCESS
 
     def put_match(self, *, token_ids, token_mask):
         return 41, np.ones(len(token_ids), dtype=np.bool_)
@@ -44,6 +49,11 @@ class _KVManager:
 
     def try_wait(self, *, task_ids):
         return {task_id: object() for task_id in task_ids}
+
+    def wait(self, task_ids, timeout, completely):
+        return {
+            task_id: SimpleNamespace(status=self.status) for task_id in task_ids
+        }
 
 
 def _connector(*, leader: bool, fanout: _Fanout, manager=None):
@@ -76,6 +86,55 @@ class TestFlexKVStoreRankConsistency(unittest.TestCase):
         self.assertEqual(follower.check_completed_stores(), ["req"])
         self.assertEqual(leader._inflight_stores, {})
         self.assertEqual(follower._inflight_stores, {})
+
+    def test_wait_store_result_is_rank_consistent(self):
+        for status, expected in (
+            (KVResponseStatus.SUCCESS, True),
+            (KVResponseStatus.FAILED, False),
+        ):
+            with self.subTest(status=status):
+                fanout = _Fanout()
+                manager = _KVManager(status=status)
+                leader = _connector(leader=True, fanout=fanout, manager=manager)
+                follower = _connector(leader=False, fanout=fanout)
+                token_ids = [1, 2, 3]
+                kv_indices = torch.tensor([10, 11, 12])
+
+                leader.store_kv("req", token_ids, kv_indices)
+                follower.store_kv("req", token_ids, kv_indices)
+                self.assertIs(leader.wait_store("req"), expected)
+                self.assertIs(follower.wait_store("req"), expected)
+                self.assertEqual(leader._inflight_stores, {})
+                self.assertEqual(follower._inflight_stores, {})
+
+    def test_retract_checkpoint_stores_before_release(self):
+        connector = SimpleNamespace(
+            store_kv=mock.Mock(return_value=41),
+            wait_store=mock.Mock(return_value=True),
+        )
+        cache = FlexKVRadixCache.__new__(FlexKVRadixCache)
+        cache.store_events = frozenset({"retract"})
+        cache.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.tensor([[10, 11, 12, 13]])
+        )
+        cache.store_stream = object()
+        cache.flexkv_connector = connector
+        req = SimpleNamespace(
+            rid="req",
+            req_pool_idx=0,
+            origin_input_ids=[1, 2],
+            output_ids=[3, 4],
+            effective_kv_committed_len=lambda: 3,
+        )
+
+        with mock.patch("torch.cuda.stream", return_value=nullcontext()):
+            self.assertTrue(cache.checkpoint_retracted_req(req, timeout=7.0))
+
+        store_call = connector.store_kv.call_args.kwargs
+        self.assertEqual(store_call["rid"], "req")
+        self.assertEqual(store_call["token_ids"], [1, 2, 3])
+        self.assertEqual(store_call["kv_indices"].tolist(), [10, 11, 12])
+        connector.wait_store.assert_called_once_with("req", timeout=7.0)
 
     def test_hybrid_ssm_is_rejected_before_cache_construction(self):
         ctx = SimpleNamespace(is_hybrid_ssm=True)
