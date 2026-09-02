@@ -582,26 +582,25 @@ class FlexKVConnector:
         fkv_task_id = self._inflight_stores.get(rid, -1)
         if fkv_task_id < 0:
             return True
-        if not self._sync_ctx.is_sync_leader or self.kv_manager is None:
-            self._inflight_stores.pop(rid, None)
-            return True
-        try:
-            resp = self.kv_manager.wait(
-                [fkv_task_id], timeout=timeout, completely=True
-            ) or {}
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[FlexKV] wait_store: %s", exc)
-            return False
-        response = resp.get(fkv_task_id)
-        if response is None or response.status not in {
-            KVResponseStatus.SUCCESS,
-            KVResponseStatus.FAILED,
-            KVResponseStatus.CANCELLED,
-            KVResponseStatus.NOTFOUND,
-        }:
-            return False
+        success = False
+        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+            try:
+                resp = self.kv_manager.wait(
+                    [fkv_task_id], timeout=timeout, completely=True
+                ) or {}
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[FlexKV] wait_store: %s", exc)
+            else:
+                response = resp.get(fkv_task_id)
+                success = (
+                    response is not None
+                    and response.status == KVResponseStatus.SUCCESS
+                )
+        if self._sync_ctx.needs_sync:
+            payload = self._sync_ctx.scatter({"success": success})
+            success = bool(payload["success"])
         self._inflight_stores.pop(rid, None)
-        return response.status == KVResponseStatus.SUCCESS
+        return success
 
     # ------------------------------------------------------------------
     # Public API — prefetch

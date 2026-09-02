@@ -3135,6 +3135,11 @@ class ServerArgs:
         ),
         NS("memory"),
     ] = None
+    flexkv_store_timeout: A[
+        float,
+        "Timeout in seconds for a synchronous FlexKV request checkpoint.",
+        NS("memory"),
+    ] = 30.0
 
     # -------------------------------------------------------------------------
     # Ktransformers/AMX expert parallelism
