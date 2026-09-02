@@ -257,6 +257,14 @@ class Memory(msgspec.Struct):
             "auto-selection chain alongside --enable-lmcache."
         ),
     ] = False
+    flexkv_store_events: A[
+        Optional[list[str]],
+        Arg(
+            help="Request events that export KV into FlexKV; None preserves terminal-event defaults.",
+            choices=["finish", "checkpoint_abort", "cancel_abort", "error_abort", "retract"],
+            nargs="+",
+        ),
+    ] = None
     flexkv_config_file: A[
         Optional[str],
         (

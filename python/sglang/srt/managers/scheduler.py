@@ -5551,6 +5551,7 @@ class Scheduler(
     def abort_request(self, recv_req: AbortReq):
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
+                chunked_req.checkpoint_aborted_kv = recv_req.checkpoint_aborted_kv
                 self._pending_chunked_abort_req = chunked_req
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
@@ -5570,6 +5571,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            req.checkpoint_aborted_kv = recv_req.checkpoint_aborted_kv
             self._release_aborted_request(req)
             self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
@@ -5683,6 +5685,7 @@ class Scheduler(
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
+                req.checkpoint_aborted_kv = recv_req.checkpoint_aborted_kv
                 if recv_req.abort_message:
                     # Timeout aborts carry an SLA message + 503 for the client.
                     req.to_finish = FINISH_ABORT(
