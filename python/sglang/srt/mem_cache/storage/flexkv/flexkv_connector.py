@@ -549,10 +549,8 @@ class FlexKVConnector:
             if self._inflight_stores:
                 fk_to_rid = {v: k for k, v in self._inflight_stores.items()}
                 try:
-                    completed_dict = self.kv_manager.wait(
-                        list(fk_to_rid.keys()),
-                        timeout=0.0,
-                        completely=True,
+                    completed_dict = self.kv_manager.try_wait(
+                        task_ids=list(fk_to_rid.keys())
                     ) or {}
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("[FlexKV] check_completed_stores: %s", exc)
