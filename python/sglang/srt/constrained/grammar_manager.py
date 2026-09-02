@@ -110,6 +110,7 @@ class GrammarManager:
         for req in self.grammar_queue:
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 logger.debug(f"Abort grammar queue request. {req.rid=}")
+                req.checkpoint_aborted_kv = recv_req.checkpoint_aborted_kv
                 if isinstance(req.grammar, futures.Future) and req.grammar:
                     req.grammar.cancel()
                 req.set_finish_with_abort("Aborted by AbortReq.")
