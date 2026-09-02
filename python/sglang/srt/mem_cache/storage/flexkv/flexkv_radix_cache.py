@@ -53,6 +53,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_STORE_EVENTS = frozenset(
+    {"finish", "checkpoint_abort", "cancel_abort", "error_abort"}
+)
+_SUPPORTED_STORE_EVENTS = _DEFAULT_STORE_EVENTS | {"retract"}
+
 
 class FlexKVMode(enum.Enum):
     MP = enum.auto()  # synchronous lookup → retrieve in two phases
@@ -89,6 +94,20 @@ class FlexKVRadixCache(RadixCache):
         attn_cp_group=None,
     ) -> None:
         super().__init__(params)
+
+        configured_store_events = getattr(server_args, "flexkv_store_events", None)
+        self.store_events = frozenset(
+            _DEFAULT_STORE_EVENTS
+            if configured_store_events is None
+            else configured_store_events
+        )
+        unknown_store_events = self.store_events - _SUPPORTED_STORE_EVENTS
+        if unknown_store_events:
+            raise ValueError(
+                "Unsupported FlexKV store events: "
+                f"{sorted(unknown_store_events)}; supported="
+                f"{sorted(_SUPPORTED_STORE_EVENTS)}"
+            )
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
         # ``tp_group`` and ``attn_tp_group`` are sometimes passed
@@ -399,12 +418,21 @@ class FlexKVRadixCache(RadixCache):
     def cache_finished_req(  # type: ignore[override]
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
     ) -> None:
-        """Base cache_finished_req then fire an async FlexKV store."""
+        """Base cache_finished_req then conditionally store KV in FlexKV."""
+        store_event = self._finished_store_event(req) if is_insert else None
         super().cache_finished_req(
             req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
         )
         if not is_insert:
             self._load_markers.pop(req.rid, None)
+            return
+        if store_event not in self.store_events:
+            logger.debug(
+                "[FlexKV] Skip store rid=%s event=%s configured=%s",
+                req.rid,
+                store_event,
+                sorted(self.store_events),
+            )
             return
 
         # Compute the committed prefix mirroring LMCRadixCache's logic.
@@ -459,6 +487,18 @@ class FlexKVRadixCache(RadixCache):
 
         with self._node_lock:
             self._inflight_store_nodes[req.rid] = new_last_node
+
+    @staticmethod
+    def _finished_store_event(req: Req) -> str:
+        reason = req.finished_reason
+        reason_json = reason.to_json() if reason is not None else {}
+        if reason_json.get("type") != "abort":
+            return "finish"
+        if req.checkpoint_aborted_kv:
+            return "checkpoint_abort"
+        if reason_json.get("status_code") is not None:
+            return "error_abort"
+        return "cancel_abort"
 
     # ------------------------------------------------------------------
     # evict + completion draining

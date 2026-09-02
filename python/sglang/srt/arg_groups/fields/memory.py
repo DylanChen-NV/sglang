@@ -14,6 +14,7 @@ import json
 from typing import (
     Any,
     Dict,
+    List,
     Optional,
 )
 
@@ -22,6 +23,7 @@ from sglang.srt.arg_groups.arg_utils import (
     Arg,
 )
 from sglang.srt.arg_groups.choices import RADIX_EVICTION_POLICY_CHOICES
+from sglang.srt.utils.common import json_list_type
 
 
 @dataclasses.dataclass
@@ -238,5 +240,17 @@ class Memory:
             "Path to the FlexKV YAML / JSON configuration file. "
             "Equivalent to setting the FLEXKV_CONFIG_PATH environment "
             "variable."
+        ),
+    ] = None
+    flexkv_store_events: A[
+        Optional[List[str]],
+        Arg(
+            help=(
+                "JSON array of request lifecycle events that may store KV in "
+                "FlexKV. Supported values: finish, checkpoint_abort, "
+                "cancel_abort, error_abort, retract. The default preserves "
+                "the existing behavior of storing terminal requests."
+            ),
+            type_parser=json_list_type,
         ),
     ] = None
