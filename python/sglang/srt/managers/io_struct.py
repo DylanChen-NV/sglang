@@ -2015,6 +2015,9 @@ class AbortReq(BaseReq, kw_only=True):
     finished_reason: Optional[FinishReasonDict] = None
     abort_message: Optional[str] = None
     weight_versions: Optional[WeightVersionSpans] = None
+    # True only for a recoverable abort whose KV must be checkpointed before
+    # the engine releases device memory (for example dynamic deactivate).
+    checkpoint_aborted_kv: bool = False
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code

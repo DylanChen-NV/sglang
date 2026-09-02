@@ -3122,6 +3122,19 @@ class ServerArgs:
         ),
         NS("memory"),
     ] = None
+    flexkv_store_events: A[
+        Optional[List[str]],
+        Arg(
+            help=(
+                "JSON array of request lifecycle events that may store KV in "
+                "FlexKV. Supported values: finish, checkpoint_abort, "
+                "cancel_abort, error_abort, retract. The default preserves "
+                "the existing behavior of storing terminal requests."
+            ),
+            type_parser=json_list_type,
+        ),
+        NS("memory"),
+    ] = None
 
     # -------------------------------------------------------------------------
     # Ktransformers/AMX expert parallelism

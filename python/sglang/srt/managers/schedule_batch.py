@@ -978,6 +978,9 @@ class Req(ReqDllmMixin):
         # set to_finish instead of directly setting finished_reason.
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
         self.to_finish: Optional[BaseFinishReason] = None
+        # Set by a checkpointing AbortReq. Generic user/error aborts leave it
+        # false so external KV storage can distinguish recoverable interrupts.
+        self.checkpoint_aborted_kv: bool = False
         self.stream = stream
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size

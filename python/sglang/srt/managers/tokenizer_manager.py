@@ -1943,7 +1943,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_exceptions=True,
             )
 
-    def abort_request(self, rid: str = "", abort_all: bool = False):
+    def abort_request(
+        self,
+        rid: str = "",
+        abort_all: bool = False,
+        checkpoint_aborted_kv: bool = False,
+    ):
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
@@ -1954,7 +1959,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and rid not in self.rid_to_state
         ):
             return
-        req = AbortReq(rid=rid, abort_all=abort_all)
+        req = AbortReq(
+            rid=rid,
+            abort_all=abort_all,
+            checkpoint_aborted_kv=checkpoint_aborted_kv,
+        )
         self._dispatch_to_scheduler(req)
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
@@ -1971,7 +1980,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # we are using the model_update_lock to check if there is still on-going requests.
                 while True:
                     # TODO: maybe make it async instead of fire-and-forget
-                    self.abort_request(abort_all=True)
+                    self.abort_request(
+                        abort_all=True,
+                        checkpoint_aborted_kv=obj.checkpoint_aborted_kv,
+                    )
                     is_locked = await self.model_update_lock.is_locked()
                     if not is_locked:
                         break

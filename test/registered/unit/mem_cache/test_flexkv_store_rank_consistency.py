@@ -1,4 +1,5 @@
 import unittest
+from http import HTTPStatus
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,6 +12,7 @@ except ImportError:
 
 from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
 from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import FlexKVConnector
+from sglang.srt.mem_cache.storage.flexkv.flexkv_radix_cache import FlexKVRadixCache
 
 
 class _Fanout:
@@ -79,6 +81,43 @@ class TestFlexKVStoreRankConsistency(unittest.TestCase):
         ctx = SimpleNamespace(is_hybrid_ssm=True)
         with self.assertRaisesRegex(ValueError, "hybrid SSM/GatedDeltaNet"):
             _flexkv_factory(ctx)
+
+    def test_finished_store_event_classification(self):
+        def reason(kind, status_code=None):
+            return SimpleNamespace(
+                to_json=lambda: {"type": kind, "status_code": status_code}
+            )
+
+        req = SimpleNamespace(
+            finished_reason=reason("stop"), checkpoint_aborted_kv=False
+        )
+        self.assertEqual(FlexKVRadixCache._finished_store_event(req), "finish")
+
+        req.finished_reason = reason("abort")
+        req.checkpoint_aborted_kv = True
+        self.assertEqual(
+            FlexKVRadixCache._finished_store_event(req), "checkpoint_abort"
+        )
+
+        req.checkpoint_aborted_kv = False
+        self.assertEqual(
+            FlexKVRadixCache._finished_store_event(req), "cancel_abort"
+        )
+
+        req.finished_reason = reason(
+            "abort", status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+        self.assertEqual(
+            FlexKVRadixCache._finished_store_event(req), "error_abort"
+        )
+
+    def test_abort_req_carries_checkpoint_intent(self):
+        from sglang.srt.managers.io_struct import AbortReq
+
+        self.assertFalse(AbortReq(rid="req").checkpoint_aborted_kv)
+        self.assertTrue(
+            AbortReq(rid="req", checkpoint_aborted_kv=True).checkpoint_aborted_kv
+        )
 
 
 if __name__ == "__main__":
