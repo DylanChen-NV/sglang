@@ -1,11 +1,13 @@
 """End-to-end correctness check for the FlexKV sglang connector.
 
-Run twice with different server configurations:
+Run twice with different server configurations. Pass
+``--enable-deterministic-inference`` to both servers:
 
-    # 1. Baseline: launch sglang WITHOUT --enable-flexkv first, then:
+    # 1. Baseline: launch sglang WITH --enable-deterministic-inference but
+    #    WITHOUT --enable-flexkv, then:
     python verify_outputs.py --phase baseline
 
-    # 2. Restart sglang WITH --enable-flexkv, then:
+    # 2. Restart sglang WITH both flags, then:
     python verify_outputs.py --phase test
 
 Each prompt is requested twice in the test phase:
@@ -15,7 +17,9 @@ Each prompt is requested twice in the test phase:
   * R2 (cached) — after /flush_cache; the GPU radix is empty but
     FlexKV's CPU pool keeps the data, so R2 should be a host hit.
 
-Both R1 and R2 output_ids must byte-equal the baseline. Any mismatch
+Both R1 and R2 output_ids must byte-equal the baseline. Deterministic
+inference is required because full-prefill and cached-prefix execution can
+otherwise diverge numerically even when the restored KV is exact. Any mismatch
 is reported and exit code is non-zero. Run again with
 ``FLEXKV_ENABLE_LAYERWISE_TRANSFER=1`` set on the server to exercise
 the layerwise path.
@@ -153,7 +157,9 @@ def main() -> int:
 
         # Give the async D2H store a beat to complete before we flush.
         time.sleep(2)
-        _post(args.host, "/flush_cache")
+        # Clear only the device radix. Resetting the connector would also
+        # remove the external FlexKV entry that R2 is intended to verify.
+        _post(args.host, "/flush_cache?reset_connector=false")
         time.sleep(1)
 
         # R2 (cached): GPU radix is empty; FlexKV must serve the prefix.
