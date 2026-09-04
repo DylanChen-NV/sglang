@@ -797,17 +797,20 @@ class FlexKVConnector:
         ), f"Expected 3D KV cache tensor, got shape={kv_caches[0].shape}"
 
         kv_dim = self.model_config.kv_dim
-        num_blocks, num_kv_heads, head_size = kv_caches[0].shape
+        num_blocks, physical_num_kv_heads, head_size = kv_caches[0].shape
+        global_num_kv_heads = self.model_config.num_kv_heads
+        # FlexKV uses num_kv_heads == 1 for KV shared across all TP ranks.
+        # TODO: represent partial KV-head replication when 1 < global heads < TP.
 
         gpu_layout = KVCacheLayout(
             type=KVCacheLayoutType.LAYERFIRST,
             num_layer=self.rank_info.num_layers_per_pp_stage,
             num_block=num_blocks // self.page_size,
             tokens_per_block=self.page_size,
-            num_head=num_kv_heads,
+            num_head=physical_num_kv_heads,
             head_size=head_size,
             kv_dim=kv_dim,
-            num_kv_heads=num_kv_heads,
+            num_kv_heads=global_num_kv_heads,
         )
 
         indexer_layout = None
@@ -832,7 +835,7 @@ class FlexKVConnector:
             layer_groups = [
                 LayerGroupSpec(
                     num_layers=self.rank_info.num_layers_per_pp_stage,
-                    num_kv_heads=num_kv_heads,
+                    num_kv_heads=physical_num_kv_heads,
                     head_size=head_size,
                     layer_indices=list(range(self.rank_info.num_layers_per_pp_stage)),
                     dtype=kv_caches[0].dtype,
