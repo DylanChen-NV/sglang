@@ -68,6 +68,63 @@ def _token_digest(token_ids) -> str:
     return hashlib.sha256(values.tobytes()).hexdigest()[:16]
 
 
+def _int_digest(values) -> str:
+    array = np.asarray(values, dtype=np.int64)
+    return hashlib.sha256(array.tobytes()).hexdigest()[:16]
+
+
+def _page_bindings(
+    token_ids,
+    selected_positions,
+    slot_mapping,
+    page_size: int,
+) -> dict:
+    """Build diagnostic token-page to GPU-slot bindings.
+
+    The normal FlexKV path transfers complete pages. Keep partial or
+    non-contiguous selections observable, but do not claim an exact page
+    mapping for them.
+    """
+    tokens = np.asarray(token_ids, dtype=np.int64)
+    positions = np.asarray(selected_positions, dtype=np.int64)
+    slots = np.asarray(slot_mapping, dtype=np.int64)
+    paired = min(positions.size, slots.size)
+    pages = []
+    exact = positions.size == slots.size
+    for offset in range(0, paired, page_size):
+        page_positions = positions[offset : offset + page_size]
+        page_slots = slots[offset : offset + page_size]
+        full_page = page_positions.size == page_size
+        token_contiguous = full_page and bool(
+            np.all(np.diff(page_positions) == 1)
+        )
+        slot_contiguous = full_page and bool(np.all(np.diff(page_slots) == 1))
+        exact_page = token_contiguous and slot_contiguous
+        exact = exact and exact_page
+        pages.append(
+            {
+                "ordinal": offset // page_size,
+                "tokens": int(page_positions.size),
+                "token_start": int(page_positions[0]) if page_positions.size else -1,
+                "token_digest": _token_digest(tokens[page_positions]),
+                "slot_start": int(page_slots[0]) if page_slots.size else -1,
+                "slot_digest": _int_digest(page_slots),
+                "slot_block": (
+                    int(page_slots[0] // page_size) if exact_page else None
+                ),
+                "exact_page": exact_page,
+            }
+        )
+    return {
+        "selected_tokens": int(positions.size),
+        "mapped_slots": int(slots.size),
+        "position_digest": _int_digest(positions),
+        "slot_digest": _int_digest(slots),
+        "exact_page_mapping": exact,
+        "pages": pages,
+    }
+
+
 def _abort_trace(phase: str, **fields) -> None:
     if os.getenv("SGLANG_FLEXKV_ABORT_TRACE", "0") != "1":
         return
@@ -240,6 +297,7 @@ class FlexKVConnector:
         # 10. Per-rank in-flight tracking.
         # Loads
         self._pending_lookups: Dict[str, int] = {}  # rid -> fkv_task_id
+        self._pending_lookup_trace: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
         self._inflight_loads: Dict[int, int] = {}  # producer_id -> rid hashlike
         self._completed_layerwise: List[int] = []
         self._launched_load_tids: List[int] = []  # leader-only, for periodic drain
@@ -288,6 +346,7 @@ class FlexKVConnector:
         """
         fkv_task_id = -1
         hit_length = 0
+        matched_mask = None
 
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             tids_np = np.asarray(token_ids, dtype=np.int64)
@@ -324,6 +383,11 @@ class FlexKVConnector:
             hit_length = aligned
 
         if self._sync_ctx.is_sync_leader:
+            matched_positions = (
+                np.flatnonzero(np.asarray(matched_mask, dtype=np.bool_))[:hit_length]
+                if matched_mask is not None and hit_length > 0
+                else np.empty((0,), dtype=np.int64)
+            )
             _abort_trace(
                 "LOOKUP_RESULT",
                 rid=rid,
@@ -332,6 +396,7 @@ class FlexKVConnector:
                 candidate_tokens=int(self._as_numpy_mask(token_mask).sum()),
                 hit_tokens=hit_length,
                 token_digest=_token_digest(token_ids),
+                matched_position_digest=_int_digest(matched_positions),
             )
 
         # Decide what to do with the held task. Three cases:
@@ -341,6 +406,11 @@ class FlexKVConnector:
         #      empty graph COMPLETED inside get_match, cancel would warn.
         if hit_length > 0 and rid is not None and fkv_task_id >= 0:
             self._pending_lookups[rid] = fkv_task_id
+            if self._sync_ctx.is_sync_leader:
+                self._pending_lookup_trace[rid] = (
+                    np.asarray(token_ids, dtype=np.int64),
+                    matched_positions,
+                )
         elif hit_length > 0 and fkv_task_id >= 0 and self._sync_ctx.is_sync_leader:
             assert self.kv_manager is not None
             self.kv_manager.cancel([fkv_task_id])
@@ -351,6 +421,7 @@ class FlexKVConnector:
         """Cancel the task held by an earlier ``lookup_kv(rid=...)`` that
         won't be followed by a ``retrieve_kv`` (e.g. allocation failed)."""
         fkv_task_id = self._pending_lookups.pop(rid, -1)
+        self._pending_lookup_trace.pop(rid, None)
         if fkv_task_id >= 0 and self._sync_ctx.is_sync_leader:
             assert self.kv_manager is not None
             self.kv_manager.cancel([fkv_task_id])
@@ -367,6 +438,7 @@ class FlexKVConnector:
         equal to ``hit_length`` from a prior ``lookup_kv``.
         """
         fkv_task_id = self._pending_lookups.pop(rid, -1)
+        trace_lookup = self._pending_lookup_trace.pop(rid, None)
         if fkv_task_id < 0:
             return 0
 
@@ -404,6 +476,16 @@ class FlexKVConnector:
                 requested_slots=int(slot_mapping_cpu.numel()),
                 loaded_slots=int(n),
                 success=success,
+                binding=(
+                    _page_bindings(
+                        trace_lookup[0],
+                        trace_lookup[1],
+                        slot_mapping_cpu.numpy(),
+                        self.page_size,
+                    )
+                    if trace_lookup is not None
+                    else None
+                ),
             )
         if self._sync_ctx.needs_sync:
             self._sync_ctx.barrier()
@@ -613,6 +695,12 @@ class FlexKVConnector:
                     aligned_tokens=len(token_ids_np),
                     unmatched_tokens=unmatched_tokens,
                     token_digest=_token_digest(token_ids_np),
+                    binding=_page_bindings(
+                        token_ids_np,
+                        np.flatnonzero(np.asarray(unmatched_mask, dtype=np.bool_)),
+                        self._to_cpu_int64(kv_indices[unmatched_mask]).numpy(),
+                        self.page_size,
+                    ),
                 )
                 self._send_pp_put_meta(fkv_task_id, unmatched_mask)
 
