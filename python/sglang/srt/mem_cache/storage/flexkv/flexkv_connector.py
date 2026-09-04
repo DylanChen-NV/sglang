@@ -407,6 +407,30 @@ class FlexKVConnector:
             )
         if self._sync_ctx.needs_sync:
             self._sync_ctx.barrier()
+
+        debug_snapshot = getattr(self, "_debug_store_snapshot", None)
+        if debug_snapshot is not None:
+            dst_indices = slot_mapping.to(
+                device=self._kv_caches[0].device, dtype=torch.long
+            )
+            bad_buffers = []
+            for buffer_idx, (cache, source) in enumerate(
+                zip(self._kv_caches, debug_snapshot)
+            ):
+                loaded = cache.index_select(0, dst_indices).detach().cpu()
+                reference = source[: loaded.shape[0]]
+                if not torch.equal(loaded, reference):
+                    mismatch = int(torch.count_nonzero(loaded != reference))
+                    max_abs = float(
+                        (loaded.float() - reference.float()).abs().max().item()
+                    )
+                    bad_buffers.append((buffer_idx, mismatch, max_abs))
+            logger.info(
+                "[FlexKV-DIAG] load compare %s slots=%d bad_buffers=%s",
+                self._label,
+                int(dst_indices.numel()),
+                bad_buffers,
+            )
         return n
 
     def start_load_kv_layerwise(
@@ -533,6 +557,33 @@ class FlexKVConnector:
             if aligned_len < n:
                 token_ids_np = token_ids_np[:aligned_len]
                 kv_indices = kv_indices[:aligned_len]
+
+        # Diagnostic only: establish whether the external FlexKV process can
+        # race the CUDA stream that produced these KV slots.
+        if os.environ.get("FLEXKV_DEBUG_SYNC_BEFORE_STORE") == "1":
+            torch.cuda.synchronize()
+
+        if (
+            os.environ.get("FLEXKV_DEBUG_VERIFY_TRANSFER") == "1"
+            and n >= int(os.environ.get("FLEXKV_DEBUG_VERIFY_MIN_TOKENS", "1000"))
+        ):
+            source_indices = kv_indices.to(
+                device=self._kv_caches[0].device, dtype=torch.long
+            )
+            self._debug_store_snapshot = [
+                cache.index_select(0, source_indices).detach().cpu()
+                for cache in self._kv_caches
+            ]
+            logger.info(
+                "[FlexKV-DIAG] store snapshot %s slots=%d buffers=%d layout=%s",
+                self._label,
+                int(source_indices.numel()),
+                len(self._debug_store_snapshot),
+                [
+                    (tuple(cache.shape), cache.stride(), cache.storage_offset())
+                    for cache in self._kv_caches[:2]
+                ],
+            )
 
         fkv_task_id = -1
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
@@ -866,17 +917,20 @@ class FlexKVConnector:
         ), f"Expected 3D KV cache tensor, got shape={kv_caches[0].shape}"
 
         kv_dim = self.model_config.kv_dim
-        num_blocks, num_kv_heads, head_size = kv_caches[0].shape
+        num_blocks, physical_num_kv_heads, head_size = kv_caches[0].shape
+        global_num_kv_heads = self.model_config.num_kv_heads
+        # FlexKV uses num_kv_heads == 1 for KV shared across all TP ranks.
+        # TODO: represent partial KV-head replication when 1 < global heads < TP.
 
         gpu_layout = KVCacheLayout(
             type=KVCacheLayoutType.LAYERFIRST,
             num_layer=self.rank_info.num_layers_per_pp_stage,
             num_block=num_blocks // self.page_size,
             tokens_per_block=self.page_size,
-            num_head=num_kv_heads,
+            num_head=physical_num_kv_heads,
             head_size=head_size,
             kv_dim=kv_dim,
-            num_kv_heads=num_kv_heads,
+            num_kv_heads=global_num_kv_heads,
         )
 
         indexer_layout = None
@@ -901,7 +955,7 @@ class FlexKVConnector:
             layer_groups = [
                 LayerGroupSpec(
                     num_layers=self.rank_info.num_layers_per_pp_stage,
-                    num_kv_heads=num_kv_heads,
+                    num_kv_heads=physical_num_kv_heads,
                     head_size=head_size,
                     layer_indices=list(range(self.rank_info.num_layers_per_pp_stage)),
                     dtype=kv_caches[0].dtype,
