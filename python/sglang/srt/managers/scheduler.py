@@ -264,6 +264,9 @@ from sglang.srt.managers.scheduler_components.profiler_manager import (
 from sglang.srt.managers.scheduler_components.recv_skipper import (
     SchedulerRecvSkipper,
 )
+from sglang.srt.managers.scheduler_components.request_timeline_recorder import (
+    RequestTimelineRecorder,
+)
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -536,6 +539,13 @@ class Scheduler(
             moe_ep_size=get_parallel().ep_size,
             moe_dp_rank=moe_dp_rank,
             moe_dp_size=get_parallel().moe_dp_size,
+            gpu_id=gpu_id,
+        )
+        self.request_timeline_recorder = RequestTimelineRecorder(
+            output_dir=os.getenv("SGLANG_REQUEST_TIMELINE_DIR"),
+            tp_rank=tp_rank,
+            pp_rank=pp_rank,
+            dp_rank=dp_rank,
             gpu_id=gpu_id,
         )
 
@@ -4214,6 +4224,7 @@ class Scheduler(
         batch.launch_ts = time.monotonic()
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
+        self.request_timeline_recorder.on_batch_launch(batch)
 
         # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
         if batch.extend_num_tokens:
@@ -4593,6 +4604,7 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
+        self.request_timeline_recorder.on_batch_result(batch)
 
     def _record_step_counters(
         self, batch: ScheduleBatch, result: GenerationBatchResult
@@ -5339,6 +5351,7 @@ class Scheduler(
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         assert recv_req.mode in ("abort", "in_place", "retract")
+        self.request_timeline_recorder.flush_pending(f"pause_{recv_req.mode}")
         self._engine_paused = True
 
         if recv_req.mode == "abort":
