@@ -444,7 +444,7 @@ class FlexKVRadixCache(RadixCache):
                 finish_reason=type(req.to_finish).__name__ if req.to_finish else None,
                 prompt_tokens=len(req.origin_input_ids),
                 output_tokens=len(req.output_ids),
-                kv_committed_len=int(req.kv_committed_len),
+                kv_committed_len=int(req.kv.kv_committed_len),
             )
         super().cache_finished_req(
             req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
