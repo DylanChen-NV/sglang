@@ -127,6 +127,15 @@ class DeepEPMoE(FusedMoE):
         ):
             self.deprecate_flag = True
         elif (
+            get_moe_runner_backend().is_flashinfer_mxfp4()
+            and quant_config is not None
+            and quant_config.get_name() == "mxfp4"
+        ):
+            # Kimi-K3 MXFP4 + FlashInfer Humming uses the generic MoE runner.
+            # Its DeepEP fused adapter currently supports BF16 normal dispatch;
+            # low-latency dispatch is rejected explicitly by that adapter.
+            self.deprecate_flag = True
+        elif (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and get_moe_runner_backend().is_deep_gemm()
             and quant_config is not None

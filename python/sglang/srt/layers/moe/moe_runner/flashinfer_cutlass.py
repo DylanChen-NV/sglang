@@ -338,6 +338,64 @@ def fused_experts_none_to_flashinfer_mxfp4(
     )
 
 
+@register_fused_func("deepep", "flashinfer_mxfp4")
+def fused_experts_deepep_to_flashinfer_mxfp4(
+    dispatch_output,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+):
+    """Run FlashInfer MXFP4 after DeepEP normal BF16 dispatch.
+
+    DeepEP normal already routes tokens to the owning EP rank. Its received
+    tensors have the same row-wise routing semantics consumed by the
+    FlashInfer SM90 MXFP4/Humming kernel; only the carrier types differ. Keep
+    the original routing tensors for DeepEP combine and reuse the standard
+    FlashInfer fused path without another physical token permutation.
+    """
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPNormalCombineInput,
+        DeepEPNormalDispatchOutput,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+    if not isinstance(dispatch_output, DeepEPNormalDispatchOutput):
+        raise NotImplementedError(
+            "flashinfer_mxfp4 currently supports DeepEP normal mode only"
+        )
+    if (
+        dispatch_output.hidden_states.dtype != torch.bfloat16
+        or dispatch_output.hidden_states_scale is not None
+    ):
+        raise ValueError(
+            "flashinfer_mxfp4 DeepEP normal requires BF16 dispatch without scales"
+        )
+    if dispatch_output.hidden_states.shape[0] == 0:
+        return DeepEPNormalCombineInput(
+            hidden_states=torch.empty_like(dispatch_output.hidden_states),
+            topk_ids=dispatch_output.topk_ids,
+            topk_weights=dispatch_output.topk_weights,
+        )
+
+    standard_output = StandardDispatchOutput(
+        hidden_states=dispatch_output.hidden_states,
+        hidden_states_scale=None,
+        topk_output=StandardTopKOutput(
+            topk_weights=dispatch_output.topk_weights,
+            topk_ids=dispatch_output.topk_ids,
+            router_logits=None,
+        ),
+    )
+    result = fused_experts_none_to_flashinfer_mxfp4(
+        standard_output, quant_info, runner_config
+    )
+    return DeepEPNormalCombineInput(
+        hidden_states=result.hidden_states,
+        topk_ids=dispatch_output.topk_ids,
+        topk_weights=dispatch_output.topk_weights,
+    )
+
+
 def _fused_experts_flashinfer_mxfp4_cutlass(
     dispatch_output: StandardDispatchOutput,
     quant_info: FlashInferCutlassMxfp4MoeQuantInfo,

@@ -1602,6 +1602,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if _use_aiter and DispatchOutputChecker.format_is_deepep(dispatch_output):
             return self._apply_aiter(layer, dispatch_output)
 
+        # FlashInfer SM90 MXFP4/Humming also accepts DeepEP's routed carrier
+        # through its fused runner. Handle it before the standard-only
+        # `.topk_output` access below.
+        if self._fi_kernel == "cutlass_sm90" and DispatchOutputChecker.format_is_deepep(
+            dispatch_output
+        ):
+            return self._apply_sm90_cutlass(layer, dispatch_output)
+
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         if _is_cpu:
