@@ -177,6 +177,8 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
 
 def _autotune_tactic_sync_group(
     tp_group: GroupCoordinator,
+    *,
+    a2a_backend: Optional[str] = None,
 ) -> Optional[torch.distributed.ProcessGroup]:
     """CPU group over the ranks that must agree on the tuned tactics.
 
@@ -184,8 +186,13 @@ def _autotune_tactic_sync_group(
     tactic for the same shape. FlashInfer all-reduces the timings over this
     group so every rank minimizes over the same numbers. TP is the scope: those
     ranks run the same dummy forward, and PP stages are already separate groups.
+
+    DeepEP is the exception: dispatch gives each EP rank a different local
+    shape (possibly zero tokens), so reducing per-tactic timings would match
+    unrelated autotune keys and deadlock. Those ranks tune independently into
+    their already rank-specific caches.
     """
-    if tp_group.world_size <= 1:
+    if tp_group.world_size <= 1 or a2a_backend == "deepep":
         return None
     # The CPU group keeps the reduction of these scalars off the profiled stream.
     return tp_group.cpu_group
@@ -254,7 +261,10 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
 
     mr = model_runner
     cache_path = flashinfer_autotune_cache_path(mr)
-    sync_group = _autotune_tactic_sync_group(mr.tp_group)
+    a2a_backend = get_exec().moe.moe_a2a_backend
+    sync_group = _autotune_tactic_sync_group(
+        mr.tp_group, a2a_backend=a2a_backend
+    )
     if envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get():
         autotune_cache = cache_path
         if sync_group is not None:
@@ -404,7 +414,13 @@ def maybe_flashinfer_autotune_extend(
     try:
         run_flashinfer_autotune_forward(mr, forward_fn, run_lm_head=False)
     except torch.OutOfMemoryError:
-        if _autotune_tactic_sync_group(mr.tp_group) is not None:
+        if (
+            _autotune_tactic_sync_group(
+                mr.tp_group,
+                a2a_backend=get_exec().moe.moe_a2a_backend,
+            )
+            is not None
+        ):
             # Tuning is collective: this rank has stopped reducing while its
             # peers wait on the next tactic, so skipping the pass would hang
             # them. Fail instead of degrading alone.

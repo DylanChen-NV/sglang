@@ -58,6 +58,15 @@ class TestAutotuneTacticSyncGroup(CustomTestCase):
         tp_group = SimpleNamespace(world_size=1, cpu_group=object())
         self.assertIsNone(_autotune_tactic_sync_group(tp_group))
 
+    def test_deepep_ranks_tune_their_local_shapes_independently(self):
+        # DeepEP dispatch produces rank-dependent token counts, including zero.
+        # A per-tactic TP reduction would therefore pair different autotune keys
+        # (or no key) and deadlock. Each EP rank owns a separate tactic cache.
+        tp_group = SimpleNamespace(world_size=8, cpu_group=object())
+        self.assertIsNone(
+            _autotune_tactic_sync_group(tp_group, a2a_backend="deepep")
+        )
+
 
 class TestAutotuneCacheDigest(CustomTestCase):
     def setUp(self):
