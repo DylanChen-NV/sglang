@@ -21,6 +21,10 @@ class Mxfp4LowLatencyMoEMethod:
     """MXFP4 experts served by LowLatencyGroupedGEMM on SM90."""
 
     _VALID_VARIANTS = {"preopt", "s0", "final"}
+    # CUDA Graph records every MoE layer sequentially. Reuse one fixed scratch
+    # arena across method instances so full-model capture does not retain one
+    # multi-GB DeepEP carrier workspace per layer.
+    _SHARED_DEEPEP_LL_WORKSPACE_CACHE = {}
 
     def __init__(
         self, fp8_method, prefix: str, serialized_mxfp4: bool = False
@@ -44,7 +48,7 @@ class Mxfp4LowLatencyMoEMethod:
         self._persistent_ctas_fixed = persistent_ctas_override is not None
         self.persistent_ctas = int(persistent_ctas_override or "312")
         self._deepep_ll_offsets_cache = {}
-        self._deepep_ll_workspace_cache = {}
+        self._deepep_ll_workspace_cache = self._SHARED_DEEPEP_LL_WORKSPACE_CACHE
         self.deepep_layout = os.getenv(
             "SGLANG_LOWLATENCY_DEEPEP_LAYOUT", "compact"
         ).lower()
