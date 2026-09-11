@@ -643,6 +643,15 @@ class Mxfp4LowLatencyMoEMethod:
                 f"DeepEP expected_m={expected_m} exceeds capacity={capacity}"
             )
         rows = num_experts * capacity
+        # DeepEP low-latency supports fewer than 256 decode tokens per rank.
+        # FC1 writes only compact routed rows, so its intermediates need at
+        # most 256 * top_k rows instead of the padded E * capacity carrier.
+        compact_rows = min(rows, 256 * self.moe_runner_config.top_k)
+        if expected_m * num_experts > compact_rows:
+            raise ValueError(
+                "DeepEP low-latency compact workspace supports fewer than "
+                "256 decode tokens per rank"
+            )
         if use_deepep_fp8:
             expected_scale_shape = (
                 num_experts, capacity, layer.hidden_size // 128,
@@ -696,15 +705,17 @@ class Mxfp4LowLatencyMoEMethod:
                 "num_tiles": torch.empty((1,), **int_options),
                 "fc1_token_scales": torch.empty((rows,), **float_options),
                 "gate_up": torch.empty(
-                    (rows, 2 * layer.intermediate_size_per_partition),
+                    (compact_rows, 2 * layer.intermediate_size_per_partition),
                     dtype=torch.bfloat16, device=hidden_states.device,
                 ),
                 "q2": torch.empty(
-                    (rows, layer.intermediate_size_per_partition),
+                    (compact_rows, layer.intermediate_size_per_partition),
                     dtype=torch.float8_e4m3fn, device=hidden_states.device,
                 ),
-                "q2_scales": torch.empty((rows, 1), **float_options),
-                "fc2_token_scales": torch.empty((rows,), **float_options),
+                "q2_scales": torch.empty((compact_rows, 1), **float_options),
+                "fc2_token_scales": torch.empty(
+                    (compact_rows,), **float_options
+                ),
                 "out": torch.empty(
                     (rows, layer.hidden_size),
                     dtype=torch.bfloat16, device=hidden_states.device,
