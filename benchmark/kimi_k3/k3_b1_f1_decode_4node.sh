@@ -95,9 +95,10 @@ python3 -m sglang.launch_server \
   --chunked-prefill-size 8192 \
   --max-prefill-tokens 8192 \
   --max-running-requests 128 \
-  --max-mamba-cache-size 128 \
+  --max-mamba-cache-size 640 \
+  --mamba-ssm-dtype bfloat16 \
   --enable-shared-experts-attn-tp \
-  --mem-fraction-static 0.81 \
+  --mem-fraction-static 0.84 \
   --cuda-graph-backend-decode full \
   --cuda-graph-max-bs-decode 128 \
   --cuda-graph-backend-prefill disabled \
