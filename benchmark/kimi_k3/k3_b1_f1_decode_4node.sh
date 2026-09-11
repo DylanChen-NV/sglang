@@ -101,6 +101,7 @@ python3 -m sglang.launch_server \
   --mem-fraction-static 0.84 \
   --cuda-graph-backend-decode full \
   --cuda-graph-max-bs-decode 128 \
+  --cuda-graph-bs-decode 128 \
   --cuda-graph-backend-prefill disabled \
   --watchdog-timeout 3600 \
   --host 0.0.0.0 \
