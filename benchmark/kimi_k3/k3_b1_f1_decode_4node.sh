@@ -18,7 +18,8 @@ esac
 
 base=/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/ziqingc/05_claude_ws/kimi-k3-deepep-lowlatency/b1-validation
 model=/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/ziqingc/05_claude_ws/models/Kimi-K3-official-f831ab6
-run_dir="$base/results/full-k3-b1-f1-${SLURM_JOB_ID}-${mode}"
+run_id="${K3_RUN_ID:-$SLURM_JOB_ID}"
+run_dir="$base/results/full-k3-b1-f1-${run_id}-${mode}"
 case "$mode" in
   b1)
     port=30111
@@ -29,7 +30,8 @@ case "$mode" in
     deepep_dtype=fp8
     ;;
 esac
-rank="${SLURM_NODEID}"
+local_rank="${SLURM_NODEID}"
+rank="$((local_rank + ${K3_NODE_RANK_OFFSET:-0}))"
 mkdir -p "$run_dir"
 
 sglang_src="${K3_SGLANG_SRC:-$base/sglang}"
@@ -61,6 +63,8 @@ if [[ "$rank" == 0 ]]; then
   hostname >"$run_dir/master_host"
   {
     echo "mode=$mode"
+    echo "run_id=$run_id"
+    echo "allocation_job_id=$SLURM_JOB_ID"
     echo "dispatcher_output_dtype=$deepep_dtype"
     echo "sglang_sha=$(git -C "$sglang_src" rev-parse HEAD)"
     echo "llgg_sha=$(git -C "$llgg_src" rev-parse HEAD)"
