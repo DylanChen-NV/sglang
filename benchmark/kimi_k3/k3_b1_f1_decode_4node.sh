@@ -148,7 +148,6 @@ if [[ "$rank" == 0 ]]; then
         --host 127.0.0.1 \
         --port "$port" \
         --dataset-name generated-shared-prefix \
-        --tokenize-prompt \
         --tokenizer "$model" \
         --model "$model" \
         --num-prompts 128 \
