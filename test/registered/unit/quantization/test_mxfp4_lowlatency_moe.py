@@ -24,6 +24,8 @@ class TestMxfp4LowLatencyMoEShapes(unittest.TestCase):
             (256, 4096, 512),
             (128, 3072, 768),
             (64, 2048, 2048),
+            (28, 3584, 3072),
+            (56, 3584, 3072),
         ):
             method = self._method()
             method.create_weights(

@@ -354,7 +354,16 @@ class Mxfp4Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
             if self.is_checkpoint_mxfp4_serialized:
-                return Mxfp4MoEMethod(prefix=prefix)
+                base_method = Mxfp4MoEMethod(prefix=prefix)
+                if get_moe_runner_backend().is_lowlatency_mxfp4():
+                    from sglang.srt.layers.quantization.mxfp4_lowlatency_moe import (
+                        Mxfp4LowLatencyMoEMethod,
+                    )
+
+                    return Mxfp4LowLatencyMoEMethod(
+                        base_method, prefix=prefix, serialized_mxfp4=True
+                    )
+                return base_method
             else:
                 return Mxfp4DynamicQuantMoEMethod()
         else:

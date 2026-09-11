@@ -136,6 +136,14 @@ class DeepEPMoE(FusedMoE):
             # low-latency dispatch is rejected explicitly by that adapter.
             self.deprecate_flag = True
         elif (
+            get_moe_runner_backend().is_lowlatency_mxfp4()
+            and quant_config is not None
+            and quant_config.get_name() == "mxfp4"
+        ):
+            # The LowLatency MXFP4 quant method consumes DeepEP low-latency
+            # expert-major carrier directly.
+            self.deprecate_flag = True
+        elif (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and get_moe_runner_backend().is_deep_gemm()
             and quant_config is not None
