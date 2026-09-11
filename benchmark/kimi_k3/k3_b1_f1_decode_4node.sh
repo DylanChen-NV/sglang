@@ -20,6 +20,18 @@ base=/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/ziqingc/05_
 model=/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/ziqingc/05_claude_ws/models/Kimi-K3-official-f831ab6
 run_id="${K3_RUN_ID:-$SLURM_JOB_ID}"
 run_dir="$base/results/full-k3-b1-f1-${run_id}-${mode}"
+mem_fraction_static="${K3_MEM_FRACTION_STATIC:-0.84}"
+max_running_requests="${K3_MAX_RUNNING_REQUESTS:-128}"
+max_mamba_cache_size="${K3_MAX_MAMBA_CACHE_SIZE:-640}"
+cuda_graph_bs="${K3_CUDA_GRAPH_BS:-128}"
+bench_num_prompts="${K3_BENCH_NUM_PROMPTS:-128}"
+gsp_prompts_per_group="${K3_GSP_PROMPTS_PER_GROUP:-128}"
+gsp_system_prompt_len="${K3_GSP_SYSTEM_PROMPT_LEN:-99999}"
+gsp_question_len="${K3_GSP_QUESTION_LEN:-1}"
+gsp_output_len="${K3_GSP_OUTPUT_LEN:-128}"
+max_concurrency="${K3_MAX_CONCURRENCY:-128}"
+capacity_gate_min="${K3_CAPACITY_GATE_MIN:-100006}"
+expected_input_tokens="$((bench_num_prompts * (gsp_system_prompt_len + gsp_question_len)))"
 case "$mode" in
   b1)
     port=30111
@@ -94,14 +106,14 @@ python3 -m sglang.launch_server \
   --context-length 131072 \
   --chunked-prefill-size 8192 \
   --max-prefill-tokens 8192 \
-  --max-running-requests 128 \
-  --max-mamba-cache-size 640 \
+  --max-running-requests "$max_running_requests" \
+  --max-mamba-cache-size "$max_mamba_cache_size" \
   --mamba-ssm-dtype bfloat16 \
   --enable-shared-experts-attn-tp \
-  --mem-fraction-static 0.84 \
+  --mem-fraction-static "$mem_fraction_static" \
   --cuda-graph-backend-decode full \
-  --cuda-graph-max-bs-decode 128 \
-  --cuda-graph-bs-decode 128 \
+  --cuda-graph-max-bs-decode "$cuda_graph_bs" \
+  --cuda-graph-bs-decode "$cuda_graph_bs" \
   --cuda-graph-backend-prefill disabled \
   --watchdog-timeout 3600 \
   --host 0.0.0.0 \
@@ -132,7 +144,7 @@ if [[ "$rank" == 0 ]]; then
   done
   if [[ "$ready" == 1 ]]; then
     max_total_tokens=$(grep -a -o 'max_total_num_tokens=[0-9]*' "$run_dir/rank0.log" | tail -1 | cut -d= -f2)
-    if [[ -z "$max_total_tokens" || "$max_total_tokens" -lt 100006 ]]; then
+    if [[ -z "$max_total_tokens" || "$max_total_tokens" -lt "$capacity_gate_min" ]]; then
       echo "Insufficient token capacity: max_total_num_tokens=${max_total_tokens:-missing}" >"$run_dir/capacity_gate.log"
       echo FAIL >"$run_dir/status"
       touch "$run_dir/done"
@@ -150,16 +162,16 @@ if [[ "$rank" == 0 ]]; then
         --dataset-name generated-shared-prefix \
         --tokenizer "$model" \
         --model "$model" \
-        --num-prompts 128 \
+        --num-prompts "$bench_num_prompts" \
         --gsp-num-groups 1 \
-        --gsp-prompts-per-group 128 \
-        --gsp-system-prompt-len 99999 \
-        --gsp-question-len 1 \
-        --gsp-output-len 128 \
+        --gsp-prompts-per-group "$gsp_prompts_per_group" \
+        --gsp-system-prompt-len "$gsp_system_prompt_len" \
+        --gsp-question-len "$gsp_question_len" \
+        --gsp-output-len "$gsp_output_len" \
         --gsp-range-ratio 1.0 \
         --gsp-fast-prepare \
         --gsp-ordered \
-        --max-concurrency 128 \
+        --max-concurrency "$max_concurrency" \
         --request-rate inf \
         --warmup-requests 1 \
         --seed 42 \
@@ -170,8 +182,8 @@ if [[ "$rank" == 0 ]]; then
           touch "$run_dir/done"
           exit 1
         }
-      grep -q "#Input tokens: 12800000" "$run_dir/bench_shared100k_bs128.log" || {
-        echo "Expected 128 fixed 100K prompts" >>"$run_dir/bench_shared100k_bs128.log"
+      grep -q "#Input tokens: ${expected_input_tokens}" "$run_dir/bench_shared100k_bs128.log" || {
+        echo "Expected ${bench_num_prompts} fixed $((gsp_system_prompt_len + gsp_question_len))-token prompts" >>"$run_dir/bench_shared100k_bs128.log"
         echo FAIL >"$run_dir/status"
         touch "$run_dir/done"
         exit 1
