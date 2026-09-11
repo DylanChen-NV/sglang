@@ -36,7 +36,7 @@ mkdir -p "$run_dir"
 
 sglang_src="${K3_SGLANG_SRC:-$base/sglang}"
 llgg_src="${K3_LLGG_SRC:-$base/LowLatencyGroupedGEMM}"
-llgg_build="${K3_LLGG_BUILD:-$base/build/lowlatency-extension-5fc901d}"
+llgg_build="${K3_LLGG_BUILD:-$base/build/lowlatency-extension-c40c108}"
 export PYTHONPATH="$sglang_src/python:$llgg_build:${PYTHONPATH:-}"
 export SGLANG_LOWLATENCY_DEEPEP_LAYOUT=compact
 export SGLANG_LOWLATENCY_MXFP4_VARIANT=final
