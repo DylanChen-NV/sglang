@@ -574,7 +574,12 @@ class Mxfp4LowLatencyMoEMethod:
     def _run_deepep_ll_compact(
         self, layer: Module, dispatch_output
     ) -> torch.Tensor:
-        """Run the B1 padded-input/compact-internal/padded-output pipeline."""
+        """Run the B1/F1 compact-internal, padded-output pipeline.
+
+        B1 accepts the padded BF16 carrier and quantizes it after dispatch.
+        F1 accepts DeepEP's padded E4M3 plus group-128 FP32 scales and lets
+        LowLatency compact/requantize only valid rows without a BF16 roundtrip.
+        """
         from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
 
         try:
@@ -591,15 +596,21 @@ class Mxfp4LowLatencyMoEMethod:
             )
 
         hidden_states = dispatch_output.hidden_states
-        if dispatch_output.hidden_states_scale is not None:
+        hidden_states_scale = dispatch_output.hidden_states_scale
+        use_deepep_fp8 = hidden_states_scale is not None
+        if use_deepep_fp8:
+            if not hasattr(llop, "deepep_fp8_moe_out"):
+                raise RuntimeError(
+                    "LowLatencyGroupedGEMM extension lacks deepep_fp8_moe_out; "
+                    "checkout the F1-compatible commit"
+                )
+            if hidden_states.dtype != torch.float8_e4m3fn or hidden_states.ndim != 3:
+                raise ValueError(
+                    "F1 DeepEP LowLatency requires a 3D E4M3 expert-major carrier"
+                )
+        elif hidden_states.dtype != torch.bfloat16 or hidden_states.ndim not in (2, 3):
             raise ValueError(
-                "B1 compact DeepEP LowLatency keeps BF16 communication; "
-                "FP8 communication belongs to the F1 milestone"
-            )
-        if hidden_states.dtype != torch.bfloat16 or hidden_states.ndim not in (2, 3):
-            raise ValueError(
-                "compact DeepEP LowLatency requires a 2D or 3D BF16 "
-                "expert-major tensor"
+                "B1 DeepEP LowLatency requires a 2D or 3D BF16 expert-major carrier"
             )
         num_experts = layer.num_local_experts
         if hidden_states.ndim == 3:
@@ -628,7 +639,20 @@ class Mxfp4LowLatencyMoEMethod:
                 f"DeepEP expected_m={expected_m} exceeds capacity={capacity}"
             )
         rows = num_experts * capacity
-        flat_hidden = hidden_states.reshape(rows, layer.hidden_size)
+        if use_deepep_fp8:
+            expected_scale_shape = (
+                num_experts, capacity, layer.hidden_size // 128,
+            )
+            if (
+                layer.hidden_size % 128
+                or hidden_states_scale.dtype != torch.float32
+                or tuple(hidden_states_scale.shape) != expected_scale_shape
+            ):
+                raise ValueError(
+                    "F1 requires DeepEP FP32 group-128 scales shaped "
+                    f"{expected_scale_shape}, got dtype={hidden_states_scale.dtype}, "
+                    f"shape={tuple(hidden_states_scale.shape)}"
+                )
         masked_m = dispatch_output.masked_m.to(torch.int32).contiguous()
         if masked_m.numel() != num_experts:
             raise ValueError(
@@ -684,22 +708,35 @@ class Mxfp4LowLatencyMoEMethod:
             }
             self._deepep_ll_workspace_cache[cache_key] = workspace
 
-        sgl_per_token_quant_fp8(
-            flat_hidden, workspace["q1"], workspace["q1_scales"]
-        )
-        llop.deepep_moe_out(
-            workspace["q1"], workspace["q1_scales"],
+        common_args = (
             layer.w13_weight, layer.w13_weight_exp_offsets,
             layer.w13_expert_residual, layer.w2_weight,
             layer.w2_weight_exp_offsets, layer.w2_expert_residual,
             masked_m, workspace["padded_offsets"], workspace["compact_offsets"],
             workspace["tile_experts"], workspace["tile_n"],
-            workspace["num_tiles"], workspace["fc1_token_scales"],
-            workspace["gate_up"], workspace["q2"], workspace["q2_scales"],
+            workspace["num_tiles"],
+        )
+        common_tail = (
+            workspace["fc1_token_scales"], workspace["gate_up"],
+            workspace["q2"], workspace["q2_scales"],
             workspace["fc2_token_scales"], workspace["out"], capacity,
             layer.hidden_size, layer.intermediate_size_per_partition,
             self.persistent_ctas, float(beta), float(linear_beta),
         )
+        if use_deepep_fp8:
+            llop.deepep_fp8_moe_out(
+                hidden_states, hidden_states_scale, *common_args,
+                workspace["q1"], workspace["q1_scales"], *common_tail,
+            )
+        else:
+            flat_hidden = hidden_states.reshape(rows, layer.hidden_size)
+            sgl_per_token_quant_fp8(
+                flat_hidden, workspace["q1"], workspace["q1_scales"]
+            )
+            llop.deepep_moe_out(
+                workspace["q1"], workspace["q1_scales"],
+                *common_args, *common_tail,
+            )
         return workspace["out"].view(
             num_experts, capacity, layer.hidden_size
         )
