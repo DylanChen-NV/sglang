@@ -27,6 +27,10 @@ class Mxfp4LowLatencyMoEMethod:
             raise RuntimeError("lowlatency_mxfp4 requires an SM90 GPU.")
         self._fp8 = fp8_method
         self.prefix = prefix
+        # This backend executes its fused MoE path directly from apply().
+        # Newer FusedMoE layers still expect every quant method to expose the
+        # optional runner attribute for overlap hooks.
+        self.runner = None
         self.variant = os.getenv("SGLANG_LOWLATENCY_MXFP4_VARIANT", "final").lower()
         if self.variant not in self._VALID_VARIANTS:
             raise ValueError(

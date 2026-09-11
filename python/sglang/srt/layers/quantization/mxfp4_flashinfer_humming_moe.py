@@ -44,6 +44,10 @@ class Mxfp4FlashinferHummingMoEMethod:
             raise RuntimeError("flashinfer_humming requires an SM90 GPU")
         self._fp8 = fp8_method
         self.prefix = prefix
+        # This backend executes its fused MoE path directly from apply().
+        # Newer FusedMoE layers still expect every quant method to expose the
+        # optional runner attribute for overlap hooks.
+        self.runner = None
         self.moe_runner_config = None
         self._swiglu_limit_tensor: torch.Tensor | None = None
 
