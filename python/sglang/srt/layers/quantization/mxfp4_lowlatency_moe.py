@@ -44,6 +44,15 @@ class Mxfp4LowLatencyMoEMethod:
         self._persistent_ctas_fixed = persistent_ctas_override is not None
         self.persistent_ctas = int(persistent_ctas_override or "312")
         self._deepep_ll_offsets_cache = {}
+        self._deepep_ll_workspace_cache = {}
+        self.deepep_layout = os.getenv(
+            "SGLANG_LOWLATENCY_DEEPEP_LAYOUT", "compact"
+        ).lower()
+        if self.deepep_layout not in {"strided", "compact"}:
+            raise ValueError(
+                "SGLANG_LOWLATENCY_DEEPEP_LAYOUT must be strided or compact, "
+                f"got {self.deepep_layout!r}."
+            )
         if self.persistent_ctas <= 0:
             raise ValueError("LowLatency persistent_ctas must be positive.")
 
@@ -90,7 +99,8 @@ class Mxfp4LowLatencyMoEMethod:
         log_info_on_rank0(
             logger,
             "Using lowlatency_mxfp4 "
-            f"variant={self.variant}, persistent_ctas={self.persistent_ctas}",
+            f"variant={self.variant}, persistent_ctas={self.persistent_ctas}, "
+            f"deepep_layout={self.deepep_layout}",
         )
 
     @staticmethod
@@ -416,7 +426,9 @@ class Mxfp4LowLatencyMoEMethod:
             self.moe_runner_config.routed_scaling_factor,
         )
 
-    def _run_deepep_ll(self, layer: Module, dispatch_output) -> torch.Tensor:
+    def _run_deepep_ll_strided(
+        self, layer: Module, dispatch_output
+    ) -> torch.Tensor:
         """Consume DeepEP low-latency expert-major masked BF16 input.
 
         DeepEP gives every local expert a fixed expected_m stride and exposes
@@ -438,7 +450,10 @@ class Mxfp4LowLatencyMoEMethod:
                 "lowlatency_mxfp4 DeepEP low-latency initially supports BF16 "
                 "communication only"
             )
-        if hidden_states.dtype != torch.bfloat16 or hidden_states.ndim not in (2, 3):
+        if hidden_states.dtype != torch.bfloat16 or hidden_states.ndim not in (
+            2,
+            3,
+        ):
             raise ValueError(
                 "lowlatency_mxfp4 DeepEP low-latency requires a 2D or 3D BF16 "
                 "expert-major tensor"
@@ -555,6 +570,144 @@ class Mxfp4LowLatencyMoEMethod:
             ),
         )
         return down.view(num_experts, capacity, layer.hidden_size)
+
+    def _run_deepep_ll_compact(
+        self, layer: Module, dispatch_output
+    ) -> torch.Tensor:
+        """Run the B1 padded-input/compact-internal/padded-output pipeline."""
+        from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
+
+        try:
+            import low_latency_mxfp4 as llop
+        except ImportError as exc:
+            raise RuntimeError(
+                "compact DeepEP LowLatency requires the matching "
+                "LowLatencyGroupedGEMM extension"
+            ) from exc
+        if not hasattr(llop, "deepep_moe_out"):
+            raise RuntimeError(
+                "LowLatencyGroupedGEMM extension lacks deepep_moe_out; "
+                "checkout the B1-compatible commit"
+            )
+
+        hidden_states = dispatch_output.hidden_states
+        if dispatch_output.hidden_states_scale is not None:
+            raise ValueError(
+                "B1 compact DeepEP LowLatency keeps BF16 communication; "
+                "FP8 communication belongs to the F1 milestone"
+            )
+        if hidden_states.dtype != torch.bfloat16 or hidden_states.ndim not in (2, 3):
+            raise ValueError(
+                "compact DeepEP LowLatency requires a 2D or 3D BF16 "
+                "expert-major tensor"
+            )
+        num_experts = layer.num_local_experts
+        if hidden_states.ndim == 3:
+            if (
+                hidden_states.shape[0] != num_experts
+                or hidden_states.shape[2] != layer.hidden_size
+            ):
+                raise ValueError(
+                    "DeepEP low-latency carrier does not match local experts "
+                    f"and hidden size: {tuple(hidden_states.shape)}"
+                )
+            capacity = int(hidden_states.shape[1])
+        else:
+            if (
+                hidden_states.shape[1] != layer.hidden_size
+                or hidden_states.shape[0] % num_experts
+            ):
+                raise ValueError(
+                    "Flattened DeepEP carrier has an invalid expert-major shape: "
+                    f"{tuple(hidden_states.shape)}"
+                )
+            capacity = hidden_states.shape[0] // num_experts
+        expected_m = int(dispatch_output.expected_m)
+        if expected_m < 0 or expected_m > capacity:
+            raise ValueError(
+                f"DeepEP expected_m={expected_m} exceeds capacity={capacity}"
+            )
+        rows = num_experts * capacity
+        flat_hidden = hidden_states.reshape(rows, layer.hidden_size)
+        masked_m = dispatch_output.masked_m.to(torch.int32).contiguous()
+        if masked_m.numel() != num_experts:
+            raise ValueError(
+                f"DeepEP masked_m must have {num_experts} entries, "
+                f"got {masked_m.numel()}"
+            )
+        beta = self.moe_runner_config.gemm1_alpha
+        linear_beta = self.moe_runner_config.gemm1_clamp_limit
+        if (
+            self.moe_runner_config.activation != "situ"
+            or beta is None
+            or linear_beta is None
+        ):
+            raise ValueError(
+                "compact DeepEP LowLatency currently requires Kimi K3 SiTU "
+                "with beta and linear_beta"
+            )
+
+        cache_key = (
+            hidden_states.device, num_experts, capacity, layer.hidden_size,
+            layer.intermediate_size_per_partition,
+        )
+        workspace = self._deepep_ll_workspace_cache.get(cache_key)
+        if workspace is None:
+            int_options = dict(dtype=torch.int32, device=hidden_states.device)
+            float_options = dict(dtype=torch.float32, device=hidden_states.device)
+            workspace = {
+                "q1": torch.empty(
+                    (rows, layer.hidden_size),
+                    dtype=torch.float8_e4m3fn, device=hidden_states.device,
+                ),
+                "q1_scales": torch.empty((rows, 1), **float_options),
+                "padded_offsets": torch.empty((num_experts + 1,), **int_options),
+                "compact_offsets": torch.empty((num_experts + 1,), **int_options),
+                "tile_experts": torch.empty((rows,), **int_options),
+                "tile_n": torch.empty((rows,), **int_options),
+                "num_tiles": torch.empty((1,), **int_options),
+                "fc1_token_scales": torch.empty((rows,), **float_options),
+                "gate_up": torch.empty(
+                    (rows, 2 * layer.intermediate_size_per_partition),
+                    dtype=torch.bfloat16, device=hidden_states.device,
+                ),
+                "q2": torch.empty(
+                    (rows, layer.intermediate_size_per_partition),
+                    dtype=torch.float8_e4m3fn, device=hidden_states.device,
+                ),
+                "q2_scales": torch.empty((rows, 1), **float_options),
+                "fc2_token_scales": torch.empty((rows,), **float_options),
+                "out": torch.empty(
+                    (rows, layer.hidden_size),
+                    dtype=torch.bfloat16, device=hidden_states.device,
+                ),
+            }
+            self._deepep_ll_workspace_cache[cache_key] = workspace
+
+        sgl_per_token_quant_fp8(
+            flat_hidden, workspace["q1"], workspace["q1_scales"]
+        )
+        llop.deepep_moe_out(
+            workspace["q1"], workspace["q1_scales"],
+            layer.w13_weight, layer.w13_weight_exp_offsets,
+            layer.w13_expert_residual, layer.w2_weight,
+            layer.w2_weight_exp_offsets, layer.w2_expert_residual,
+            masked_m, workspace["padded_offsets"], workspace["compact_offsets"],
+            workspace["tile_experts"], workspace["tile_n"],
+            workspace["num_tiles"], workspace["fc1_token_scales"],
+            workspace["gate_up"], workspace["q2"], workspace["q2_scales"],
+            workspace["fc2_token_scales"], workspace["out"], capacity,
+            layer.hidden_size, layer.intermediate_size_per_partition,
+            self.persistent_ctas, float(beta), float(linear_beta),
+        )
+        return workspace["out"].view(
+            num_experts, capacity, layer.hidden_size
+        )
+
+    def _run_deepep_ll(self, layer: Module, dispatch_output) -> torch.Tensor:
+        if self.deepep_layout == "strided":
+            return self._run_deepep_ll_strided(layer, dispatch_output)
+        return self._run_deepep_ll_compact(layer, dispatch_output)
 
     def apply(self, layer: Module, dispatch_output: DispatchOutput) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
