@@ -26,6 +26,8 @@ export TMPDIR=/tmp
 export SGLANG_WARMUP_TIMEOUT=1800
 export SGLANG_CACHE_DIR="$base/cache/sglang"
 export FLASHINFER_WORKSPACE_DIR="$base/cache/flashinfer"
+# NIXL UCX does not honor --disaggregation-ib-device. DFW mlx5_0 cannot register these CUDA buffers.
+export UCX_NET_DEVICES="${K3_UCX_NET_DEVICES:-mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_8:1}"
 
 node_cache="/tmp/k3-pd-${run_id}-${role}-$(hostname)"
 mkdir -p "$node_cache"
@@ -57,6 +59,7 @@ else
   port=30100
   dist_port=21000
   mem_fraction_static="${K3_DECODE_MEM_FRACTION_STATIC:-0.841}"
+  decode_extra_slots="${K3_PD_DECODE_EXTRA_SLOTS:-64}"
   export SGLANG_LOWLATENCY_DEEPEP_LAYOUT=compact
   export SGLANG_LOWLATENCY_MXFP4_VARIANT=final
   export SGLANG_LOWLATENCY_MXFP4_PERSISTENT_CTAS="${SGLANG_LOWLATENCY_MXFP4_PERSISTENT_CTAS:-528}"
@@ -70,7 +73,7 @@ else
     --disaggregation-transfer-backend nixl
     --disaggregation-bootstrap-port 8998
     --disaggregation-decode-enable-radix-cache
-    --disaggregation-decode-extra-slots 128
+    --disaggregation-decode-extra-slots "$decode_extra_slots"
     --num-reserved-decode-tokens 128
     --moe-runner-backend lowlatency_mxfp4
     --moe-a2a-backend deepep
@@ -163,4 +166,8 @@ while [[ ! -e "$run_root/stop_${role}" ]]; do
   fi
   sleep 2
 done
+
+if [[ -e "$run_root/failed_${role}" ]]; then
+  exit 1
+fi
 
