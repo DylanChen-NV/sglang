@@ -12,9 +12,12 @@ model=/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/ziqingc/05
 run_id="${K3_RUN_ID:?K3_RUN_ID must identify the shared PD run}"
 run_root="$base/results/pd-k3-b1-f1-${run_id}"
 role_dir="$run_root/$role"
+coord_id="${K3_PD_COORD_ID:-$run_id}"
+coord_dir="$run_root/coord"
+coord_host_file="$coord_dir/${role}-${coord_id}.host"
 local_rank="${RANK:-${SLURM_NODEID:-0}}"
 rank="$((local_rank + ${K3_NODE_RANK_OFFSET:-0}))"
-mkdir -p "$role_dir"
+mkdir -p "$role_dir" "$coord_dir"
 
 sglang_src="${K3_SGLANG_SRC:-$base/sglang}"
 llgg_src="${K3_LLGG_SRC:-$base/LowLatencyGroupedGEMM}"
@@ -41,7 +44,7 @@ export SGLANG_JIT_CACHE_DIR="$node_cache/sglang-jit"
 python3 -c 'import torch; assert torch.cuda.device_count() == 8; assert all(torch.cuda.get_device_name(i).startswith("NVIDIA H100") for i in range(8)); [torch.empty(1, device=f"cuda:{i}") for i in range(8)]' >"$role_dir/gpu_probe_rank${rank}.log" 2>&1
 
 if [[ "$role" == prefill ]]; then
-  host_file="$run_root/prefill_master_host"
+  route_host_file="$run_root/prefill_master_host"
   port=30000
   dist_port=20000
   mem_fraction_static="${K3_PREFILL_MEM_FRACTION_STATIC:-0.84}"
@@ -58,7 +61,7 @@ if [[ "$role" == prefill ]]; then
     --cuda-graph-backend-decode disabled
   )
 else
-  host_file="$run_root/decode_master_host"
+  route_host_file="$run_root/decode_master_host"
   port=30100
   dist_port=21000
   mem_fraction_static="${K3_DECODE_MEM_FRACTION_STATIC:-0.841}"
@@ -93,10 +96,14 @@ else
 fi
 
 if [[ "$rank" == 0 ]]; then
-  hostname >"$host_file"
+  hostname >"${coord_host_file}.tmp.$$"
+  mv -f "${coord_host_file}.tmp.$$" "$coord_host_file"
+  hostname >"${route_host_file}.tmp.$$"
+  mv -f "${route_host_file}.tmp.$$" "$route_host_file"
   {
     echo "role=$role"
     echo "run_id=$run_id"
+    echo "coord_id=$coord_id"
     echo "slurm_job_id=${SLURM_JOB_ID:-persistent}"
     echo "sglang_sha=$(git -C "$sglang_src" rev-parse HEAD)"
     echo "llgg_sha=$(git -C "$llgg_src" rev-parse HEAD)"
@@ -104,10 +111,14 @@ if [[ "$rank" == 0 ]]; then
   } >"$role_dir/code_manifest.txt"
 fi
 for _ in $(seq 1 300); do
-  [[ -s "$host_file" ]] && break
+  [[ -s "$coord_host_file" ]] && break
   sleep 1
 done
-master_host=$(head -1 "$host_file")
+if [[ ! -s "$coord_host_file" ]]; then
+  echo "Timed out waiting for coordination host file: $coord_host_file" >&2
+  exit 1
+fi
+master_host=$(head -1 "$coord_host_file")
 
 python3 -m sglang.launch_server \
   --model-path "$model" \
