@@ -42,6 +42,10 @@ case "$mode" in
     deepep_dtype=fp8
     ;;
 esac
+server_extra_args=()
+if [[ "${K3_SKIP_SERVER_WARMUP:-0}" == 1 ]]; then
+  server_extra_args+=(--skip-server-warmup)
+fi
 local_rank="${SLURM_NODEID}"
 rank="$((local_rank + ${K3_NODE_RANK_OFFSET:-0}))"
 mkdir -p "$run_dir"
@@ -90,6 +94,7 @@ done
 master_host=$(head -1 "$run_dir/master_host")
 
 python3 -m sglang.launch_server \
+  "${server_extra_args[@]}" \
   --model-path "$model" \
   --tokenizer-path "$model" \
   --trust-remote-code \
