@@ -581,8 +581,9 @@ class Mxfp4LowLatencyMoEMethod:
         """Run the B1/F1 compact-internal, padded-output pipeline.
 
         B1 accepts the padded BF16 carrier and quantizes it after dispatch.
-        F1 accepts DeepEP's padded E4M3 plus group-128 FP32 scales and lets
-        LowLatency compact/requantize only valid rows without a BF16 roundtrip.
+        The per-token-equivalent F1 accepts DeepEP's padded E4M3 carrier whose
+        group-128 scale slots repeat one token scale. LowLatency compacts valid
+        rows byte-for-byte and collapses the repeated scale without requantizing.
         """
         from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
 
@@ -603,14 +604,15 @@ class Mxfp4LowLatencyMoEMethod:
         hidden_states_scale = dispatch_output.hidden_states_scale
         use_deepep_fp8 = hidden_states_scale is not None
         if use_deepep_fp8:
-            if not hasattr(llop, "deepep_fp8_moe_out"):
+            if not hasattr(llop, "deepep_per_token_fp8_moe_out"):
                 raise RuntimeError(
-                    "LowLatencyGroupedGEMM extension lacks deepep_fp8_moe_out; "
-                    "checkout the F1-compatible commit"
+                    "LowLatencyGroupedGEMM extension lacks "
+                    "deepep_per_token_fp8_moe_out; checkout the "
+                    "per-token-equivalent F1 commit"
                 )
             if hidden_states.dtype != torch.float8_e4m3fn or hidden_states.ndim != 3:
                 raise ValueError(
-                    "F1 DeepEP LowLatency requires a 3D E4M3 expert-major carrier"
+                    "per-token F1 requires a 3D E4M3 expert-major carrier"
                 )
         elif hidden_states.dtype != torch.bfloat16 or hidden_states.ndim not in (2, 3):
             raise ValueError(
@@ -662,7 +664,7 @@ class Mxfp4LowLatencyMoEMethod:
                 or tuple(hidden_states_scale.shape) != expected_scale_shape
             ):
                 raise ValueError(
-                    "F1 requires DeepEP FP32 group-128 scales shaped "
+                    "per-token F1 requires repeated DeepEP FP32 scales shaped "
                     f"{expected_scale_shape}, got dtype={hidden_states_scale.dtype}, "
                     f"shape={tuple(hidden_states_scale.shape)}"
                 )
@@ -739,7 +741,7 @@ class Mxfp4LowLatencyMoEMethod:
             self.persistent_ctas, float(beta), float(linear_beta),
         )
         if use_deepep_fp8:
-            llop.deepep_fp8_moe_out(
+            llop.deepep_per_token_fp8_moe_out(
                 hidden_states, hidden_states_scale, *common_args,
                 workspace["q1"], workspace["q1_scales"], *common_tail,
             )

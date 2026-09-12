@@ -27,6 +27,7 @@ from sglang.srt.layers.moe.utils import (
     DispatcherOutputDtype,
     get_deepep_config,
     get_deepep_output_dtype,
+    get_moe_runner_backend,
     is_tbo_enabled,
 )
 from sglang.srt.utils import (
@@ -707,6 +708,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self.return_recv_hook = return_recv_hook
         self.device_module = torch.get_device_module()
         self.quant_config = {}
+        self._per_token_scale_runtime_checked = False
 
     def dispatch_a(
         self,
@@ -810,6 +812,46 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self._low_latency_quant_mode_runtime_checked = True
 
         use_fp8 = self.use_fp8
+        use_per_token_scale = (
+            use_fp8 and get_moe_runner_backend().is_lowlatency_mxfp4()
+        )
+        if use_per_token_scale and not self._per_token_scale_runtime_checked:
+            try:
+                dispatch_signature = inspect.signature(buffer.low_latency_dispatch)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "lowlatency_mxfp4 with FP8 DeepEP dispatch requires a "
+                    "runtime exposing low_latency_dispatch(..., "
+                    "use_per_token_scale=...)."
+                ) from exc
+            if "use_per_token_scale" not in dispatch_signature.parameters:
+                raise RuntimeError(
+                    "lowlatency_mxfp4 with FP8 DeepEP dispatch requires the "
+                    "per-token-scale DeepEP runtime; the installed runtime "
+                    "still exposes only group-128 communication quantization."
+                )
+            self._per_token_scale_runtime_checked = True
+
+        dispatch_hidden_states = hidden_states
+        if use_per_token_scale:
+            # Reuse the exact B1 quantization op before dispatch. DeepEP only
+            # transports these FP8 bytes and repeats the single token scale in
+            # its legacy group-128 scale carrier.
+            from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
+
+            hidden_states_q = torch.empty_like(
+                hidden_states, dtype=torch.float8_e4m3fn
+            )
+            hidden_states_scale = torch.empty(
+                (hidden_states.shape[0], 1),
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+            sgl_per_token_quant_fp8(
+                hidden_states, hidden_states_q, hidden_states_scale
+            )
+            dispatch_hidden_states = (hidden_states_q, hidden_states_scale)
+
         low_latency_quant_kwargs = {}
         if self.low_latency_quant_mode is not None:
             deep_use_mode = os.environ.get("DEEP_USE_MODE", "default")
@@ -835,11 +877,16 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         _deepep_precompile_tp_barrier()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
-                hidden_states,
+                dispatch_hidden_states,
                 topk_ids,
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=use_fp8,
+                **(
+                    dict(use_per_token_scale=True)
+                    if use_per_token_scale
+                    else dict()
+                ),
                 **low_latency_quant_kwargs,
                 **(
                     dict(topk_weights=topk_weights)
