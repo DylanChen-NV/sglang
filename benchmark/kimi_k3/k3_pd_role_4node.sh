@@ -60,6 +60,7 @@ else
   dist_port=21000
   mem_fraction_static="${K3_DECODE_MEM_FRACTION_STATIC:-0.841}"
   decode_extra_slots="${K3_PD_DECODE_EXTRA_SLOTS:-64}"
+  decode_radix_cache="${K3_PD_DECODE_RADIX_CACHE:-0}"
   export SGLANG_LOWLATENCY_DEEPEP_LAYOUT=compact
   export SGLANG_LOWLATENCY_MXFP4_VARIANT=final
   export SGLANG_LOWLATENCY_MXFP4_PERSISTENT_CTAS="${SGLANG_LOWLATENCY_MXFP4_PERSISTENT_CTAS:-528}"
@@ -72,7 +73,6 @@ else
     --disaggregation-mode decode
     --disaggregation-transfer-backend nixl
     --disaggregation-bootstrap-port 8998
-    --disaggregation-decode-enable-radix-cache
     --disaggregation-decode-extra-slots "$decode_extra_slots"
     --num-reserved-decode-tokens 128
     --moe-runner-backend lowlatency_mxfp4
@@ -83,6 +83,9 @@ else
     --cuda-graph-max-bs-decode 128
     --cuda-graph-bs-decode 128
   )
+  if [[ "$decode_radix_cache" == 1 ]]; then
+    role_args+=(--disaggregation-decode-enable-radix-cache)
+  fi
 fi
 
 if [[ "$rank" == 0 ]]; then

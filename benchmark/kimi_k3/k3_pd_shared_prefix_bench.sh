@@ -15,6 +15,15 @@ bench_dir="$run_root/bench_${mode}"
 decode_role="decode_${mode}"
 mkdir -p "$bench_dir"
 
+num_prompts="${K3_NUM_PROMPTS:-128}"
+max_concurrency="${K3_MAX_CONCURRENCY:-$num_prompts}"
+system_prompt_len="${K3_GSP_SYSTEM_PROMPT_LEN:-99999}"
+question_len="${K3_GSP_QUESTION_LEN:-1}"
+output_len="${K3_GSP_OUTPUT_LEN:-128}"
+warmup_requests="${K3_WARMUP_REQUESTS:-1}"
+expected_input_tokens="$((num_prompts * (system_prompt_len + question_len)))"
+result_stem="shared$((system_prompt_len + question_len))_bs${max_concurrency}"
+
 sglang_src="${K3_SGLANG_SRC:-$base/sglang}"
 export PYTHONPATH="$sglang_src/python:${PYTHONPATH:-}"
 prefill_host=$(head -1 "$run_root/prefill_master_host")
@@ -58,25 +67,25 @@ python3 -m sglang.bench_serving \
   --dataset-name generated-shared-prefix \
   --tokenizer "$model" \
   --model "$model" \
-  --num-prompts 128 \
+  --num-prompts "$num_prompts" \
   --gsp-num-groups 1 \
-  --gsp-prompts-per-group 128 \
-  --gsp-system-prompt-len 99999 \
-  --gsp-question-len 1 \
-  --gsp-output-len 128 \
+  --gsp-prompts-per-group "$num_prompts" \
+  --gsp-system-prompt-len "$system_prompt_len" \
+  --gsp-question-len "$question_len" \
+  --gsp-output-len "$output_len" \
   --gsp-range-ratio 1.0 \
   --gsp-fast-prepare \
   --gsp-ordered \
   --gsp-send-routing-key \
-  --max-concurrency 128 \
+  --max-concurrency "$max_concurrency" \
   --request-rate inf \
-  --warmup-requests 1 \
+  --warmup-requests "$warmup_requests" \
   --seed 42 \
   --output-details \
-  --output-file "$bench_dir/bench_shared100k_bs128.jsonl" \
-  >"$bench_dir/bench_shared100k_bs128.log" 2>&1
+  --output-file "$bench_dir/bench_${result_stem}.jsonl" \
+  >"$bench_dir/bench_${result_stem}.log" 2>&1
 
-grep -q '#Input tokens: 12800000' "$bench_dir/bench_shared100k_bs128.log"
-grep -q 'Successful requests:                     128' "$bench_dir/bench_shared100k_bs128.log"
+grep -q "#Input tokens: ${expected_input_tokens}" "$bench_dir/bench_${result_stem}.log"
+grep -q "Successful requests:                     ${num_prompts}" "$bench_dir/bench_${result_stem}.log"
 echo PASS >"$bench_dir/status"
 
