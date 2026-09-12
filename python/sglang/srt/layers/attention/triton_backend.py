@@ -480,7 +480,9 @@ class TritonAttnBackend(AttentionBackend):
         kv_indices: torch.Tensor,
     ) -> torch.Tensor:
         kv_indptr = self.kv_indptr[: bs + 1]
-        kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
+        # ForwardBatch tensors can retain CUDA-graph padding beyond the logical
+        # batch size. Only the first bs entries describe live requests.
+        kv_indptr[1:] = torch.cumsum(seq_lens[:bs], dim=0)
         self.kv_index_translator.fill_packed_read_stream(
             req_pool_indices=req_pool_indices[:bs],
             seq_lens=seq_lens[:bs],

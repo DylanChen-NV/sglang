@@ -17,6 +17,9 @@ import ast
 import os
 import re
 import unittest
+from unittest.mock import MagicMock
+
+import torch
 
 from sglang.srt.layers.attention import triton_backend as _anchor_module
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -179,6 +182,31 @@ class TestWrapperBackendsForwardTranslator(CustomTestCase):
         for name, wrapper in _build_wrappers(translator).items():
             with self.subTest(wrapper=name):
                 self.assertIs(wrapper.kv_index_translator, translator)
+
+
+class TestTritonKvIndptrLogicalBatch(CustomTestCase):
+    def test_ignores_cuda_graph_padding_in_seq_lens(self):
+        backend = object.__new__(_anchor_module.TritonAttnBackend)
+        backend.kv_indptr = torch.zeros(9, dtype=torch.int32)
+        backend.kv_index_translator = MagicMock()
+
+        seq_lens = torch.tensor([3, 5, 99, 99], dtype=torch.int32)
+        req_pool_indices = torch.tensor([7, 8, 0, 0], dtype=torch.int32)
+        kv_indices = torch.empty(8, dtype=torch.int64)
+        result = backend._fill_kv_indptr_and_indices(
+            bs=2,
+            seq_lens=seq_lens,
+            req_pool_indices=req_pool_indices,
+            kv_indices=kv_indices,
+        )
+
+        self.assertEqual(result.tolist(), [0, 3, 8])
+        call = backend.kv_index_translator.fill_packed_read_stream.call_args
+        self.assertTrue(torch.equal(call.kwargs["seq_lens"], seq_lens[:2]))
+        self.assertTrue(
+            torch.equal(call.kwargs["req_pool_indices"], req_pool_indices[:2])
+        )
+        self.assertEqual(call.kwargs["total_tokens"], 8)
 
 
 if __name__ == "__main__":
