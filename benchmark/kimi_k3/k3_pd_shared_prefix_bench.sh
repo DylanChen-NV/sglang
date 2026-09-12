@@ -91,7 +91,7 @@ python3 -m sglang.bench_serving \
   >"$bench_dir/bench_${result_stem}.log" 2>&1
 
 if [[ "$fast_prepare" == 0 ]]; then
-  actual_input_tokens=$(awk '/^Total input tokens:/{print $4}' "$bench_dir/bench_${result_stem}.log")
+  actual_input_tokens=$(awk '/^Total input tokens:/{value=$4} END{print value}' "$bench_dir/bench_${result_stem}.log")
   [[ "$actual_input_tokens" -ge "$expected_input_tokens" ]]
 fi
 grep -q "Successful requests:                     ${num_prompts}" "$bench_dir/bench_${result_stem}.log"
