@@ -26,6 +26,8 @@ export TMPDIR=/tmp
 export SGLANG_WARMUP_TIMEOUT=1800
 export SGLANG_CACHE_DIR="$base/cache/sglang"
 export FLASHINFER_WORKSPACE_DIR="$base/cache/flashinfer"
+transfer_backend="${K3_PD_TRANSFER_BACKEND:-mooncake}"
+ib_devices="${K3_PD_IB_DEVICES:-mlx5_0,mlx5_1,mlx5_2,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8}"
 # NIXL UCX does not honor --disaggregation-ib-device. DFW mlx5_0 cannot register these CUDA buffers.
 export UCX_NET_DEVICES="${K3_UCX_NET_DEVICES:-mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_8:1}"
 
@@ -45,7 +47,8 @@ if [[ "$role" == prefill ]]; then
   mem_fraction_static="${K3_PREFILL_MEM_FRACTION_STATIC:-0.84}"
   role_args=(
     --disaggregation-mode prefill
-    --disaggregation-transfer-backend nixl
+    --disaggregation-transfer-backend "$transfer_backend"
+    --disaggregation-ib-device "$ib_devices"
     --disaggregation-bootstrap-port 8998
     --moe-runner-backend flashinfer_mxfp4
     --flashinfer-mxfp4-moe-precision fp8
@@ -71,7 +74,8 @@ else
   fi
   role_args=(
     --disaggregation-mode decode
-    --disaggregation-transfer-backend nixl
+    --disaggregation-transfer-backend "$transfer_backend"
+    --disaggregation-ib-device "$ib_devices"
     --disaggregation-bootstrap-port 8998
     --disaggregation-decode-extra-slots "$decode_extra_slots"
     --num-reserved-decode-tokens 128
