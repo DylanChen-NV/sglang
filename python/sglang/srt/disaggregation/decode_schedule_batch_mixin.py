@@ -18,6 +18,23 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
+def _prepare_mamba_for_pd_radix_insert(req) -> None:
+    """Discard prefix-match state actions superseded by the PD transfer.
+
+    A decode-side radix match may stage a deferred Mamba COW (or clear) before
+    the prefill worker transfers the authoritative prompt-end recurrent state
+    into the request's active slot. Applying that deferred action on the first
+    decode step would overwrite the transferred state with an older checkpoint.
+
+    The no-buffer cache path can insert the active slot directly, so it only
+    needs the stale deferred metadata removed before cache_unfinished_req().
+    Extra-buffer handoff checkpointing is rejected during KV-cache construction
+    until its ping-pong keep slot and tracked length are committed explicitly.
+    """
+    req.kv.mamba_cow_src_index = None
+    req.kv.mamba_needs_clear = False
+
+
 class ScheduleBatchDisaggregationDecodeMixin:
     def prepare_for_prebuilt(self: ScheduleBatch):
         """
@@ -120,6 +137,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             # PREBUILT does not materialize a local SWA branching window.
             if req.swa_branching_seqlen is not None:
                 req.swa_branching_seqlen = None
+            _prepare_mamba_for_pd_radix_insert(req)
             maybe_cache_unfinished_req(req, self.tree_cache)
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.

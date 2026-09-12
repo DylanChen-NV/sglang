@@ -140,6 +140,43 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertTrue(torch.equal(batch.out_cache_loc, torch.tensor([2, 3, 4])))
         req.get_fill_ids.assert_not_called()
 
+    def test_prebuilt_discards_stale_mamba_prefix_action_before_cache(self):
+        stale_cow = torch.tensor([17], dtype=torch.int64)
+        req = SimpleNamespace(
+            kv=SimpleNamespace(
+                mamba_cow_src_index=stale_cow,
+                mamba_needs_clear=True,
+            ),
+            output_ids=[23],
+            swa_branching_seqlen=None,
+            grammar=None,
+        )
+        batch = SimpleNamespace(
+            reqs=[req],
+            tree_cache=Mock(),
+            spec_algorithm=Mock(),
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            device="cpu",
+        )
+        batch.spec_algorithm.build_disagg_draft_input.return_value = None
+        future_map = Mock()
+
+        def assert_authoritative_transfer_wins(cached_req, _tree_cache):
+            self.assertIs(cached_req, req)
+            self.assertIsNone(cached_req.kv.mamba_cow_src_index)
+            self.assertFalse(cached_req.kv.mamba_needs_clear)
+
+        with patch(
+            "sglang.srt.disaggregation.decode_schedule_batch_mixin."
+            "maybe_cache_unfinished_req",
+            side_effect=assert_authoritative_transfer_wins,
+        ):
+            ScheduleBatchDisaggregationDecodeMixin.process_prebuilt(
+                batch, future_map
+            )
+
+        future_map.stash.assert_called_once()
+
     def test_list_of_buffers_roundtrip(self):
         bufs = [b"abc", b"", b"de", b"x" * 17]
         self.assertEqual(unpack_list_of_buffers(pack_list_of_buffers(bufs)), bufs)
