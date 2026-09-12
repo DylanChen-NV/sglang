@@ -43,8 +43,13 @@ case "$mode" in
     ;;
 esac
 server_extra_args=()
+bench_extra_args=()
 if [[ "${K3_SKIP_SERVER_WARMUP:-0}" == 1 ]]; then
   server_extra_args+=(--skip-server-warmup)
+fi
+if [[ "${K3_FAKE_PREFILL:-0}" == 1 ]]; then
+  server_extra_args+=(--disaggregation-mode decode --disaggregation-transfer-backend fake)
+  bench_extra_args+=(--fake-prefill)
 fi
 local_rank="${SLURM_NODEID}"
 rank="$((local_rank + ${K3_NODE_RANK_OFFSET:-0}))"
@@ -155,13 +160,16 @@ if [[ "$rank" == 0 ]]; then
       touch "$run_dir/done"
       exit 1
     fi
-    curl -fsS "http://127.0.0.1:${port}/generate" \
-      -H 'Content-Type: application/json' \
-      -d '{"text":"Hello","sampling_params":{"temperature":0,"max_new_tokens":2}}' \
-      >"$run_dir/response.json"
+    if [[ "${K3_FAKE_PREFILL:-0}" != 1 ]]; then
+      curl -fsS "http://127.0.0.1:${port}/generate" \
+        -H 'Content-Type: application/json' \
+        -d '{"text":"Hello","sampling_params":{"temperature":0,"max_new_tokens":2}}' \
+        >"$run_dir/response.json"
+    fi
     if [[ "${K3_RUN_BENCH:-1}" == 1 ]]; then
       python3 -m sglang.bench_serving \
         --backend sglang \
+        "${bench_extra_args[@]}" \
         --host 127.0.0.1 \
         --port "$port" \
         --dataset-name generated-shared-prefix \
