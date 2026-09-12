@@ -24,7 +24,14 @@ llgg_src="${K3_LLGG_SRC:-$base/LowLatencyGroupedGEMM}"
 llgg_build="${K3_LLGG_BUILD:-$base/build/lowlatency-extension-c40c108}"
 export PYTHONPATH="$sglang_src/python:$llgg_build:${PYTHONPATH:-}"
 export PYTHONDONTWRITEBYTECODE=1
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# CUDA VMM-backed expandable segments cannot be registered by the tested
+# NIXL/UCX and Mooncake/RDMA stacks on DFW H100. Keep the legacy allocator for
+# PD KV buffers unless an explicit experiment overrides it.
+if [[ -n "${K3_PYTORCH_CUDA_ALLOC_CONF:-}" ]]; then
+  export PYTORCH_CUDA_ALLOC_CONF="$K3_PYTORCH_CUDA_ALLOC_CONF"
+else
+  unset PYTORCH_CUDA_ALLOC_CONF PYTORCH_ALLOC_CONF
+fi
 export TMPDIR=/tmp
 export SGLANG_WARMUP_TIMEOUT=1800
 export SGLANG_CACHE_DIR="$base/cache/sglang"
