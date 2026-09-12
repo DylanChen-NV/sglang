@@ -21,8 +21,13 @@ system_prompt_len="${K3_GSP_SYSTEM_PROMPT_LEN:-99999}"
 question_len="${K3_GSP_QUESTION_LEN:-1}"
 output_len="${K3_GSP_OUTPUT_LEN:-128}"
 warmup_requests="${K3_WARMUP_REQUESTS:-1}"
+fast_prepare="${K3_GSP_FAST_PREPARE:-1}"
 expected_input_tokens="$((num_prompts * (system_prompt_len + question_len)))"
 result_stem="shared$((system_prompt_len + question_len))_bs${max_concurrency}"
+fast_prepare_args=()
+if [[ "$fast_prepare" == 1 ]]; then
+  fast_prepare_args+=(--gsp-fast-prepare)
+fi
 
 sglang_src="${K3_SGLANG_SRC:-$base/sglang}"
 export PYTHONPATH="$sglang_src/python:${PYTHONPATH:-}"
@@ -74,7 +79,7 @@ python3 -m sglang.bench_serving \
   --gsp-question-len "$question_len" \
   --gsp-output-len "$output_len" \
   --gsp-range-ratio 1.0 \
-  --gsp-fast-prepare \
+  "${fast_prepare_args[@]}" \
   --gsp-ordered \
   --gsp-send-routing-key \
   --max-concurrency "$max_concurrency" \
@@ -85,7 +90,9 @@ python3 -m sglang.bench_serving \
   --output-file "$bench_dir/bench_${result_stem}.jsonl" \
   >"$bench_dir/bench_${result_stem}.log" 2>&1
 
-grep -q "#Input tokens: ${expected_input_tokens}" "$bench_dir/bench_${result_stem}.log"
+if [[ "$fast_prepare" == 0 ]]; then
+  grep -q "Total input tokens: *${expected_input_tokens}" "$bench_dir/bench_${result_stem}.log"
+fi
 grep -q "Successful requests:                     ${num_prompts}" "$bench_dir/bench_${result_stem}.log"
 echo PASS >"$bench_dir/status"
 
