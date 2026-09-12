@@ -280,12 +280,6 @@ def build_kv_cache(
                     "--disaggregation-decode-enable-radix-cache does not support "
                     "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
                 )
-        if is_hybrid_ssm and get_exec().mamba.enable_mamba_extra_buffer:
-            raise ValueError(
-                "--disaggregation-decode-enable-radix-cache with Mamba/SSM "
-                "models currently requires --mamba-radix-cache-strategy "
-                "no_buffer; extra_buffer handoff checkpoints are not supported yet"
-            )
 
     effective_chunked_prefill_size = get_schedule().chunked_prefill_size
     if model_config.is_multimodal and uses_transformers_backend:

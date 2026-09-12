@@ -18,21 +18,34 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
-def _prepare_mamba_for_pd_radix_insert(req) -> None:
-    """Discard prefix-match state actions superseded by the PD transfer.
+def _prepare_mamba_for_pd_radix_insert(req, req_to_token_pool) -> None:
+    """Commit the authoritative PD Mamba state for radix insertion.
 
     A decode-side radix match may stage a deferred Mamba COW (or clear) before
     the prefill worker transfers the authoritative prompt-end recurrent state
     into the request's active slot. Applying that deferred action on the first
     decode step would overwrite the transferred state with an older checkpoint.
 
-    The no-buffer cache path can insert the active slot directly, so it only
-    needs the stale deferred metadata removed before cache_unfinished_req().
-    Extra-buffer handoff checkpointing is rejected during KV-cache construction
-    until its ping-pong keep slot and tracked length are committed explicitly.
+    The no-buffer cache path can insert the active slot directly. The
+    extra-buffer path normally caches a tracked ping-pong snapshot, but PREBUILT
+    does not execute the model and therefore never produces that snapshot. Copy
+    the transferred active state into the current keep slot and label it with
+    the transferred committed length before cache_unfinished_req() donates it.
     """
     req.kv.mamba_cow_src_index = None
     req.kv.mamba_needs_clear = False
+    if not getattr(req_to_token_pool, "enable_mamba_extra_buffer", False):
+        return
+
+    keep_idx = req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
+    active_slot = req.kv.mamba_pool_idx.reshape(1)
+    checkpoint_slot = req.kv.mamba_ping_pong_track_buffer[keep_idx].reshape(1)
+    translate = req_to_token_pool.translate_mamba_indices
+    req_to_token_pool.copy_mamba_state(
+        translate(active_slot),
+        translate(checkpoint_slot),
+    )
+    req.kv.mamba_last_track_seqlen = req.kv.kv_committed_len
 
 
 class ScheduleBatchDisaggregationDecodeMixin:
@@ -137,7 +150,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             # PREBUILT does not materialize a local SWA branching window.
             if req.swa_branching_seqlen is not None:
                 req.swa_branching_seqlen = None
-            _prepare_mamba_for_pd_radix_insert(req)
+            _prepare_mamba_for_pd_radix_insert(req, self.req_to_token_pool)
             maybe_cache_unfinished_req(req, self.tree_cache)
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.

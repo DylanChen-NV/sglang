@@ -154,6 +154,7 @@ class TestDisaggregationWire(unittest.TestCase):
         batch = SimpleNamespace(
             reqs=[req],
             tree_cache=Mock(),
+            req_to_token_pool=SimpleNamespace(enable_mamba_extra_buffer=False),
             spec_algorithm=Mock(),
             req_pool_indices=torch.tensor([0], dtype=torch.int64),
             device="cpu",
@@ -176,6 +177,52 @@ class TestDisaggregationWire(unittest.TestCase):
             )
 
         future_map.stash.assert_called_once()
+
+    def test_prebuilt_commits_extra_buffer_mamba_checkpoint_before_cache(self):
+        active_slot = torch.tensor(11, dtype=torch.int64)
+        checkpoint_slots = torch.tensor([17, 19], dtype=torch.int64)
+        req = SimpleNamespace(
+            kv=SimpleNamespace(
+                mamba_cow_src_index=torch.tensor([23], dtype=torch.int64),
+                mamba_needs_clear=True,
+                mamba_pool_idx=active_slot,
+                mamba_ping_pong_track_buffer=checkpoint_slots,
+                mamba_last_track_idx=1,
+                mamba_last_track_seqlen=None,
+                kv_committed_len=128,
+            ),
+            output_ids=[29],
+            swa_branching_seqlen=None,
+            grammar=None,
+        )
+        pool = Mock(enable_mamba_extra_buffer=True)
+        pool.get_mamba_ping_pong_keep_idx.return_value = 1
+        pool.translate_mamba_indices.side_effect = lambda slots: slots + 100
+        batch = SimpleNamespace(
+            reqs=[req],
+            tree_cache=Mock(),
+            req_to_token_pool=pool,
+            spec_algorithm=Mock(),
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            device="cpu",
+        )
+        batch.spec_algorithm.build_disagg_draft_input.return_value = None
+
+        def assert_checkpoint_ready(cached_req, _tree_cache):
+            self.assertIsNone(cached_req.kv.mamba_cow_src_index)
+            self.assertFalse(cached_req.kv.mamba_needs_clear)
+            self.assertEqual(cached_req.kv.mamba_last_track_seqlen, 128)
+            pool.copy_mamba_state.assert_called_once()
+            src, dst = pool.copy_mamba_state.call_args.args
+            self.assertTrue(torch.equal(src, torch.tensor([111])))
+            self.assertTrue(torch.equal(dst, torch.tensor([119])))
+
+        with patch(
+            "sglang.srt.disaggregation.decode_schedule_batch_mixin."
+            "maybe_cache_unfinished_req",
+            side_effect=assert_checkpoint_ready,
+        ):
+            ScheduleBatchDisaggregationDecodeMixin.process_prebuilt(batch, Mock())
 
     def test_list_of_buffers_roundtrip(self):
         bufs = [b"abc", b"", b"de", b"x" * 17]
