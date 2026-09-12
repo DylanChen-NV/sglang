@@ -645,6 +645,16 @@ class Mxfp4LowLatencyMoEMethod:
                 f"DeepEP expected_m={expected_m} exceeds capacity={capacity}"
             )
         rows = num_experts * capacity
+        if rows == 0:
+            # In high-EP topologies a legal request can route no tokens to a
+            # rank. DeepEP represents that case with an empty expert-major
+            # carrier; skip the LowLatency pipeline, whose GEMM output contract
+            # requires at least one physical row.
+            return torch.empty(
+                (num_experts, capacity, layer.hidden_size),
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
+            )
         # DeepEP low-latency supports fewer than 256 decode tokens per rank.
         # FC1 writes only compact routed rows, so its intermediates need at
         # most 256 * top_k rows instead of the padded E * capacity carrier.

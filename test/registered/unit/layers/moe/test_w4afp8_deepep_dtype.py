@@ -13,7 +13,7 @@ from sglang.srt.layers.moe.utils import (
     DispatcherOutputDtype,
     MoeRunnerBackend,
 )
-from sglang.srt.layers.quantization import w4afp8
+from sglang.srt.layers.quantization import mxfp4_lowlatency_moe, w4afp8
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -209,6 +209,24 @@ class TestW4AFP8DeepEPDispatcherDtype(CustomTestCase):
             ),
         ):
             impl._dispatch_core(hidden_states, topk_ids, topk_weights)
+
+    def test_lowlatency_mxfp4_preserves_empty_deepep_rank(self):
+        method = object.__new__(mxfp4_lowlatency_moe.Mxfp4LowLatencyMoEMethod)
+        hidden_states = torch.empty((28, 0, 3584), dtype=torch.bfloat16)
+        dispatch_output = SimpleNamespace(
+            hidden_states=hidden_states,
+            hidden_states_scale=None,
+            expected_m=0,
+        )
+        layer = SimpleNamespace(num_local_experts=28, hidden_size=3584)
+        fake_extension = SimpleNamespace(deepep_moe_out=Mock())
+
+        with patch.dict("sys.modules", {"low_latency_mxfp4": fake_extension}):
+            output = method._run_deepep_ll_compact(layer, dispatch_output)
+
+        self.assertEqual(output.shape, (28, 0, 3584))
+        self.assertEqual(output.dtype, torch.bfloat16)
+        fake_extension.deepep_moe_out.assert_not_called()
 
     def test_low_latency_requires_fp8_scales(self):
         method = w4afp8.W4AFp8MoEMethod(SimpleNamespace())
