@@ -47,6 +47,9 @@ class Mxfp4FlashinferCutlassMoEMethod:
         self.prefix = prefix
         self._swiglu_limit_tensor: torch.Tensor | None = None
         self._use_swiglu_step = False
+        self._situ_beta_tensor: torch.Tensor | None = None
+        self._situ_linear_beta_tensor: torch.Tensor | None = None
+        self._use_situ = False
         self._mxfp4_weight_global_scale_tensor: torch.Tensor | None = None
 
     @property
@@ -96,19 +99,42 @@ class Mxfp4FlashinferCutlassMoEMethod:
                 E, dtype=torch.float32, device=device
             )
 
-        # FlashInfer defaults alpha/beta to 1/0, so DSv4 only supplies its clamp.
+        # Kimi K3 uses SiTU-GLU. FlashInfer CUTLASS gained this activation in
+        # flashinfer-ai/flashinfer#4460; older releases silently used SwiGLU
+        # here and produced catastrophically wrong model outputs.
+        self._use_situ = moe_runner_config.activation == "situ"
+        if self._use_situ:
+            beta = (
+                moe_runner_config.gemm1_alpha
+                if moe_runner_config.gemm1_alpha is not None
+                else 4.0
+            )
+            linear_beta = (
+                moe_runner_config.gemm1_clamp_limit
+                if moe_runner_config.gemm1_clamp_limit is not None
+                else 25.0
+            )
+            self._situ_beta_tensor = torch.full(
+                (E,), float(beta), dtype=torch.float32, device=device
+            )
+            self._situ_linear_beta_tensor = torch.full(
+                (E,), float(linear_beta), dtype=torch.float32, device=device
+            )
+
+        # FlashInfer defaults alpha/beta to 1/0, so non-SiTU DSv4 only
+        # supplies its clamp.
         # Bailing clamps after SiLU (gemm1_clamp_limit), which the kernel only
         # implements in its SwigluStep variant.
         swiglu_limit = getattr(moe_runner_config, "swiglu_limit", None)
         gemm1_clamp_limit = getattr(moe_runner_config, "gemm1_clamp_limit", None)
-        self._use_swiglu_step = (
+        self._use_swiglu_step = not self._use_situ and (
             gemm1_clamp_limit is not None
             and getattr(moe_runner_config, "gemm1_alpha", None) is None
         )
         clamp_limit = (
             gemm1_clamp_limit if gemm1_clamp_limit is not None else swiglu_limit
         )
-        if clamp_limit is not None:
+        if clamp_limit is not None and not self._use_situ:
             self._swiglu_limit_tensor = torch.full(
                 (E,), float(clamp_limit), dtype=torch.float32, device=device
             )
@@ -248,7 +274,10 @@ class Mxfp4FlashinferCutlassMoEMethod:
             swiglu_alpha=None,
             swiglu_beta=None,
             swiglu_limit=self._swiglu_limit_tensor,
+            situ_beta=self._situ_beta_tensor,
+            situ_linear_beta=self._situ_linear_beta_tensor,
             use_swiglu_step=self._use_swiglu_step,
+            use_situ=self._use_situ,
             moe_tp_size=layer.moe_tp_size,
             moe_tp_rank=layer.moe_tp_rank,
             moe_ep_size=layer.moe_ep_size,

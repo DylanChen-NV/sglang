@@ -1268,6 +1268,33 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
 
+        # Kimi K3 uses SiTU-GLU. Keep the per-expert parameters next to the
+        # processed weights so the actual Mxfp4MoEMethod path can pass them to
+        # FlashInfer CUTLASS. K3 constructs this base method directly (rather
+        # than Mxfp4FlashinferCutlassMoEMethod) after replacing its compressed
+        # tensors config with Mxfp4Config.
+        if layer.moe_runner_config.activation == "situ":
+            situ_beta = layer.moe_runner_config.gemm1_alpha
+            situ_linear_beta = layer.moe_runner_config.gemm1_clamp_limit
+            layer.situ_beta = Parameter(
+                torch.full(
+                    (E,),
+                    4.0 if situ_beta is None else float(situ_beta),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                requires_grad=False,
+            )
+            layer.situ_linear_beta = Parameter(
+                torch.full(
+                    (E,),
+                    25.0 if situ_linear_beta is None else float(situ_linear_beta),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                requires_grad=False,
+            )
+
         # ---- FlashInfer SM90 byte / scale interleave -----------------------
         # The padded buffers above are contiguous by construction (allocated
         # via torch.zeros + slice assignment), so we feed them straight in.
@@ -1482,6 +1509,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             swiglu_alpha=layer.swiglu_alpha,
             swiglu_beta=layer.swiglu_beta,
             swiglu_limit=layer.swiglu_limit,
+            situ_beta=getattr(layer, "situ_beta", None),
+            situ_linear_beta=getattr(layer, "situ_linear_beta", None),
+            use_situ=self.moe_runner_config.activation == "situ",
             moe_tp_size=layer.moe_tp_size,
             moe_tp_rank=layer.moe_tp_rank,
             moe_ep_size=layer.moe_ep_size,

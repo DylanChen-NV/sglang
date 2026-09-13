@@ -97,9 +97,18 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
     swiglu_beta: Optional[torch.Tensor] = None
     swiglu_limit: Optional[torch.Tensor] = None
 
+    # Optional per-expert SiTU tanh scales, fp32 [E]. Kimi K3 uses
+    # beta=4 and linear_beta=25.
+    situ_beta: Optional[torch.Tensor] = None
+    situ_linear_beta: Optional[torch.Tensor] = None
+
     # Bailing clamps after SiLU, which the kernel only implements in its
     # SwigluStep variant.
     use_swiglu_step: bool = False
+
+    # Kimi K3 uses SiTU-GLU rather than SwiGLU. This requires FlashInfer's
+    # CUTLASS SiTU support (flashinfer-ai/flashinfer#4460).
+    use_situ: bool = False
 
     # TP/EP topology (forwarded to the FlashInfer kernel)
     moe_tp_size: int = 1
@@ -493,6 +502,24 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
     with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
         out = torch.empty(x.shape[0], out_hidden, dtype=output_dtype, device=x.device)
 
+    activation_type = (
+        ActivationType.Situ
+        if quant_info.use_situ
+        else (
+            ActivationType.SwigluStep
+            if quant_info.use_swiglu_step
+            else ActivationType.Swiglu
+        )
+    )
+    situ_kwargs = (
+        {
+            "situ_beta": quant_info.situ_beta,
+            "situ_linear_beta": quant_info.situ_linear_beta,
+        }
+        if quant_info.use_situ
+        else {}
+    )
+
     flashinfer_cutlass_fused_moe(
         input=x,
         token_selected_experts=topk_ids.to(torch.int32),
@@ -513,14 +540,11 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
         ep_rank=quant_info.moe_ep_rank,
         use_w4_group_scaling=not use_mxfp8_act_scaling,
         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
-        activation_type=(
-            ActivationType.SwigluStep
-            if quant_info.use_swiglu_step
-            else ActivationType.Swiglu
-        ),
+        activation_type=activation_type,
         tune_max_num_tokens=next_power_of_2(x.shape[0]),
         output=out,
         use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
+        **situ_kwargs,
         **humming_kwargs,
     )
 
