@@ -550,7 +550,31 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
+        use_per_token_humming_scale = (
+            self.use_fp8
+            and get_moe_runner_backend().is_flashinfer_mxfp4()
+            and not is_blackwell()
+        )
+        if use_per_token_humming_scale:
+            # FlashInfer Humming consumes per-token FP8 directly. DeepEP normal
+            # accepts an arbitrary two-dimensional FP32 scale carrier, so keep
+            # the exact [T, 1] descale used by the low-latency F1 path instead
+            # of expanding it to legacy group-128 scales.
+            from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
+
+            hidden_states_q = torch.empty_like(
+                hidden_states, dtype=torch.float8_e4m3fn
+            )
+            hidden_states_scale = torch.empty(
+                (hidden_states.shape[0], 1),
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+            sgl_per_token_quant_fp8(
+                hidden_states, hidden_states_q, hidden_states_scale
+            )
+            hidden_states = (hidden_states_q, hidden_states_scale)
+        elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
                 hidden_states,

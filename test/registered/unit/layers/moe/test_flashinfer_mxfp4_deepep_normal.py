@@ -67,10 +67,31 @@ class TestFlashInferMxfp4DeepEPNormal(CustomTestCase):
         self.assertIs(result.topk_ids, dispatch_output.topk_ids)
         self.assertIs(result.topk_weights, dispatch_output.topk_weights)
 
-    def test_rejects_fp8_normal_dispatch(self):
-        with self.assertRaisesRegex(ValueError, "requires BF16"):
+    def test_preserves_fp8_per_token_scale_contract(self):
+        dispatch_output = self._dispatch_output(torch.float8_e4m3fn, with_scale=True)
+        kernel_output = torch.randn(3, 16, dtype=torch.bfloat16)
+
+        with patch(
+            "sglang.srt.layers.moe.moe_runner.flashinfer_cutlass."
+            "fused_experts_none_to_flashinfer_mxfp4",
+            return_value=StandardCombineInput(hidden_states=kernel_output),
+        ) as run_flashinfer:
+            result = fused_experts_deepep_to_flashinfer_mxfp4(
+                dispatch_output, self._quant_info(), SimpleNamespace()
+            )
+
+        standard_output = run_flashinfer.call_args.args[0]
+        self.assertIs(standard_output.hidden_states, dispatch_output.hidden_states)
+        self.assertIs(
+            standard_output.hidden_states_scale,
+            dispatch_output.hidden_states_scale,
+        )
+        self.assertIs(result.hidden_states, kernel_output)
+
+    def test_rejects_fp8_normal_dispatch_without_scale(self):
+        with self.assertRaisesRegex(ValueError, "FP8 E4M3"):
             fused_experts_deepep_to_flashinfer_mxfp4(
-                self._dispatch_output(torch.float8_e4m3fn, with_scale=True),
+                self._dispatch_output(torch.float8_e4m3fn, with_scale=False),
                 self._quant_info(),
                 SimpleNamespace(),
             )
@@ -92,6 +113,25 @@ class TestFlashInferMxfp4DeepEPNormal(CustomTestCase):
             )
         run_flashinfer.assert_not_called()
         self.assertEqual(result.hidden_states.shape, (0, 16))
+        self.assertEqual(result.hidden_states.dtype, torch.bfloat16)
+
+    def test_empty_fp8_rank_returns_bf16(self):
+        dispatch_output = DeepEPNormalDispatchOutput(
+            hidden_states=torch.empty(0, 16, dtype=torch.float8_e4m3fn),
+            hidden_states_scale=torch.empty(0, 1, dtype=torch.float32),
+            topk_ids=torch.empty(0, 2, dtype=torch.int64),
+            topk_weights=torch.empty(0, 2),
+            num_recv_tokens_per_expert=[0, 0],
+        )
+        with patch(
+            "sglang.srt.layers.moe.moe_runner.flashinfer_cutlass."
+            "fused_experts_none_to_flashinfer_mxfp4"
+        ) as run_flashinfer:
+            result = fused_experts_deepep_to_flashinfer_mxfp4(
+                dispatch_output, self._quant_info(), SimpleNamespace()
+            )
+        run_flashinfer.assert_not_called()
+        self.assertEqual(result.hidden_states.dtype, torch.bfloat16)
 
     def test_mxfp4_apply_bypasses_standard_topk_access(self):
         method = object.__new__(Mxfp4MoEMethod)

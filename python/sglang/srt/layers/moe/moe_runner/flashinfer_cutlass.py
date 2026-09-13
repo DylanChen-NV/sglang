@@ -373,23 +373,35 @@ def fused_experts_deepep_to_flashinfer_mxfp4(
         raise NotImplementedError(
             "flashinfer_mxfp4 currently supports DeepEP normal mode only"
         )
-    if (
-        dispatch_output.hidden_states.dtype != torch.bfloat16
-        or dispatch_output.hidden_states_scale is not None
-    ):
+    hidden_states = dispatch_output.hidden_states
+    hidden_states_scale = dispatch_output.hidden_states_scale
+    is_bf16 = hidden_states.dtype == torch.bfloat16 and hidden_states_scale is None
+    is_fp8 = (
+        hidden_states.dtype == torch.float8_e4m3fn
+        and hidden_states_scale is not None
+        and hidden_states_scale.dtype == torch.float32
+        and hidden_states_scale.ndim == 2
+        and hidden_states_scale.shape == (hidden_states.shape[0], 1)
+    )
+    if not (is_bf16 or is_fp8):
         raise ValueError(
-            "flashinfer_mxfp4 DeepEP normal requires BF16 dispatch without scales"
+            "flashinfer_mxfp4 DeepEP normal requires BF16 without scales or "
+            "FP8 E4M3 with FP32 per-token scales shaped [num_tokens, 1]"
         )
-    if dispatch_output.hidden_states.shape[0] == 0:
+    if hidden_states.shape[0] == 0:
         return DeepEPNormalCombineInput(
-            hidden_states=torch.empty_like(dispatch_output.hidden_states),
+            hidden_states=torch.empty(
+                hidden_states.shape,
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
+            ),
             topk_ids=dispatch_output.topk_ids,
             topk_weights=dispatch_output.topk_weights,
         )
 
     standard_output = StandardDispatchOutput(
-        hidden_states=dispatch_output.hidden_states,
-        hidden_states_scale=None,
+        hidden_states=hidden_states,
+        hidden_states_scale=hidden_states_scale,
         topk_output=StandardTopKOutput(
             topk_weights=dispatch_output.topk_weights,
             topk_ids=dispatch_output.topk_ids,
@@ -459,7 +471,7 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
         )
     if use_wfp4afp8_humming and use_mxfp8_act_scaling:
         raise ValueError("SM90 Humming and SM120 MXFP8 scaling are mutually exclusive.")
-    input_sf = None
+    input_sf = dispatch_output.hidden_states_scale
     fc1_expert_weights = quant_info.w13_weight
     fc2_expert_weights = quant_info.w2_weight
     if weight_global_scale is not None:
@@ -489,6 +501,10 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
             quant_info.w2_weight_scale.view(torch.int32),
             w2_humming_residual_scale,
         ]
+        if x.dtype == torch.float8_e4m3fn and input_sf is None:
+            raise ValueError(
+                "prequantized FlashInfer Humming input requires per-token scales"
+            )
     else:
         quant_scales = [
             quant_info.w13_weight_scale.view(torch.int32),
