@@ -294,6 +294,7 @@ class Mxfp4LowLatencyMoEMethod:
 
     def _run_preopt(self, layer: Module, hidden_states, topk_ids, topk_weights):
         from sglang.kernels.ops.moe.ep_moe_kernels import moe_permute, moe_unpermute
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import situ_and_mul
         from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
         from sglang.kernels.ops.moe.fused_moe_triton_kernels import act_and_mul_triton
 
@@ -317,11 +318,12 @@ class Mxfp4LowLatencyMoEMethod:
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
+        is_ep = getattr(layer.dispatcher, "local_expert_mapping", None) is not None
         compact, src2dst, offsets = moe_permute(
             hidden_states,
             topk_ids,
             layer.num_local_experts,
-            is_ep=False,
+            is_ep=is_ep,
             outputs=compact,
         )
         q1, s1 = fc1["q"], fc1["token_scales"]
@@ -332,13 +334,20 @@ class Mxfp4LowLatencyMoEMethod:
             dtype=torch.bfloat16,
             device=hidden_states.device,
         )
-        act_and_mul_triton(
-            gate_up,
-            activated,
-            {},
-            activation=self.moe_runner_config.activation,
-            swiglu_limit=self.moe_runner_config.swiglu_limit,
-        )
+        if self.moe_runner_config.activation == "situ":
+            beta = self.moe_runner_config.gemm1_alpha
+            linear_beta = self.moe_runner_config.gemm1_clamp_limit
+            if beta is None or linear_beta is None:
+                raise ValueError("Kimi K3 SiTU requires beta and linear_beta")
+            situ_and_mul(activated, gate_up, beta, linear_beta)
+        else:
+            act_and_mul_triton(
+                gate_up,
+                activated,
+                {},
+                activation=self.moe_runner_config.activation,
+                swiglu_limit=self.moe_runner_config.swiglu_limit,
+            )
         q2, s2 = fc2["q"], fc2["token_scales"]
         sgl_per_token_quant_fp8(activated, q2, s2)
         down = self._gemm(layer, "w2", q2, s2, offsets, fc2)
@@ -352,6 +361,7 @@ class Mxfp4LowLatencyMoEMethod:
 
     def _run_optimized(self, layer: Module, hidden_states, topk_ids, topk_weights):
         from sglang.kernels.ops.moe.ep_moe_kernels import moe_unpermute
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import situ_and_mul
         from sglang.kernels.ops.moe.fused_activation_quant import fused_swiglu_quant_fp8
         from sglang.kernels.ops.moe.fused_moe_triton_kernels import act_and_mul_triton
         from sglang.kernels.ops.moe.fused_quant_permute import fused_quant_permute_fp8
@@ -387,7 +397,7 @@ class Mxfp4LowLatencyMoEMethod:
             scales=fc1["token_scales"],
         )
         gate_up = self._gemm(layer, "w13", q1, s1, offsets, fc1, schedule)
-        if self.variant == "final":
+        if self.variant == "final" and self.moe_runner_config.activation != "situ":
             q2, s2 = fused_swiglu_quant_fp8(
                 gate_up,
                 offsets,
@@ -412,13 +422,20 @@ class Mxfp4LowLatencyMoEMethod:
                 dtype=torch.bfloat16,
                 device=hidden_states.device,
             )
-            act_and_mul_triton(
-                gate_up,
-                activated,
-                {},
-                activation=self.moe_runner_config.activation,
-                swiglu_limit=self.moe_runner_config.swiglu_limit,
-            )
+            if self.moe_runner_config.activation == "situ":
+                beta = self.moe_runner_config.gemm1_alpha
+                linear_beta = self.moe_runner_config.gemm1_clamp_limit
+                if beta is None or linear_beta is None:
+                    raise ValueError("Kimi K3 SiTU requires beta and linear_beta")
+                situ_and_mul(activated, gate_up, beta, linear_beta)
+            else:
+                act_and_mul_triton(
+                    gate_up,
+                    activated,
+                    {},
+                    activation=self.moe_runner_config.activation,
+                    swiglu_limit=self.moe_runner_config.swiglu_limit,
+                )
             q2, s2 = fc2["q"], fc2["token_scales"]
             sgl_per_token_quant_fp8(activated, q2, s2)
             down = self._gemm(layer, "w2", q2, s2, offsets, fc2, schedule)
@@ -799,7 +816,12 @@ class Mxfp4LowLatencyMoEMethod:
         hidden_states = dispatch_output.hidden_states
         topk_ids = topk_output.topk_ids.contiguous().to(torch.int32)
         topk_weights = topk_output.topk_weights
-        use_preopt = self.variant == "preopt" or topk_ids.numel() > 64
+        # The decode-specialized routing/schedule builder currently supports
+        # only the EP1 DSV4 shape. Under standard EP dispatch, non-local
+        # routes have already been mapped to -1, so use the generic EP-aware
+        # permutation path which removes those rows and emits local offsets.
+        is_ep = getattr(layer.dispatcher, "local_expert_mapping", None) is not None
+        use_preopt = self.variant == "preopt" or topk_ids.numel() > 64 or is_ep
 
         def run():
             if use_preopt:
