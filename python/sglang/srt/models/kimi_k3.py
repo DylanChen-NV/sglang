@@ -407,6 +407,13 @@ def _o_proj_takes_output(o_proj: RowParallelLinear) -> bool:
     return getattr(o_proj.quant_method, "apply_into", None) is not None
 
 
+def _use_shared_experts_attn_tp_comm(
+    *, enabled: bool, ep_a2a: bool, attn_tp_size: int
+) -> bool:
+    """Whether shared experts need row gather + output reduce-scatter."""
+    return enabled and ep_a2a and attn_tp_size > 1
+
+
 def _k3_symm_o_proj_out(o_proj: RowParallelLinear, x: torch.Tensor) -> torch.Tensor:
     """Symmetric storage for o_proj's TP-partial output; the fused attention
     all-reduce reduces it in place."""
@@ -562,21 +569,22 @@ class KimiK3MoE(nn.Module):
         )
 
         # Shared experts (operate in original hidden_size space).
-        # Replicate the shared-expert weights (tp1, DSv2 convention) under EP
-        # a2a: the block runs on partial batches (shard / DP-local rows), and
-        # a TP-sharded partial sum could never be reduced across ranks that
-        # hold different tokens.
-        self._shared_experts_tp1 = (
-            self._ep_a2a and not get_parallel().enable_shared_experts_attn_tp
-        )
-        # NPU compatibility mode keeps DeepEP's DP-local token dispatch but
-        # uses the original TP-sharded shared MLP. Gather only that branch's
-        # inputs, then reduce-scatter its output back to the DP-local rows.
+        # A TP-sharded shared MLP must see the same rows on every attention-TP
+        # rank. Under both DP attention and SP-MoE, gather that branch's token
+        # shards before the MLP and reduce-scatter its output back afterwards.
+        # Directly all-reducing the partial outputs is invalid here because
+        # the ranks hold different tokens.
         self._shared_experts_attn_tp_comm = (
-            get_parallel().enable_shared_experts_attn_tp
-            and self._ep_a2a
-            and self._dp_attention
-            and get_parallel().attn_tp_size > 1
+            _use_shared_experts_attn_tp_comm(
+                enabled=get_parallel().enable_shared_experts_attn_tp,
+                ep_a2a=self._ep_a2a,
+                attn_tp_size=get_parallel().attn_tp_size,
+            )
+        )
+        # Otherwise replicate the shared-expert weights (tp1, DSv2
+        # convention), so each partial batch can be processed independently.
+        self._shared_experts_tp1 = (
+            self._ep_a2a and not self._shared_experts_attn_tp_comm
         )
         shared_experts_tp_kwargs = {}
         if self._shared_experts_tp1:
