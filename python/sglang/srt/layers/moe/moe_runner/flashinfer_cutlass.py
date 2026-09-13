@@ -8,7 +8,7 @@ small quant_info payload and route through ``MoeRunner``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -355,11 +355,12 @@ def fused_experts_deepep_to_flashinfer_mxfp4(
 ):
     """Run FlashInfer MXFP4 after DeepEP normal BF16 dispatch.
 
-    DeepEP normal already routes tokens to the owning EP rank. Its received
-    tensors have the same row-wise routing semantics consumed by the
-    FlashInfer SM90 MXFP4/Humming kernel; only the carrier types differ. Keep
-    the original routing tensors for DeepEP combine and reuse the standard
-    FlashInfer fused path without another physical token permutation.
+    DeepEP normal already routes tokens to the owning EP rank and rewrites
+    valid ``topk_ids`` into that rank's local expert namespace (invalid slots
+    are ``-1``). FlashInfer therefore has to see this as an EP1 problem over
+    the already-local weight shard; forwarding the model's global EP rank
+    would offset the local IDs a second time. Keep the row carrier and routing
+    tensors unchanged for DeepEP combine, but normalize the kernel topology.
     """
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
         DeepEPNormalCombineInput,
@@ -395,8 +396,9 @@ def fused_experts_deepep_to_flashinfer_mxfp4(
             router_logits=None,
         ),
     )
+    local_quant_info = replace(quant_info, moe_ep_size=1, moe_ep_rank=0)
     result = fused_experts_none_to_flashinfer_mxfp4(
-        standard_output, quant_info, runner_config
+        standard_output, local_quant_info, runner_config
     )
     return DeepEPNormalCombineInput(
         hidden_states=result.hidden_states,

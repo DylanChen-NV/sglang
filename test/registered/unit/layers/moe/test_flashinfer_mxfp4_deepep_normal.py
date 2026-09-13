@@ -7,6 +7,7 @@ from unittest.mock import ANY, patch
 import torch
 
 from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+    FlashInferCutlassMxfp4MoeQuantInfo,
     fused_experts_deepep_to_flashinfer_mxfp4,
 )
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPNormalDispatchOutput
@@ -19,6 +20,18 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestFlashInferMxfp4DeepEPNormal(CustomTestCase):
+    @staticmethod
+    def _quant_info(ep_size=4, ep_rank=3):
+        tensor = torch.empty(0)
+        return FlashInferCutlassMxfp4MoeQuantInfo(
+            w13_weight=tensor,
+            w2_weight=tensor,
+            w13_weight_scale=tensor,
+            w2_weight_scale=tensor,
+            moe_ep_size=ep_size,
+            moe_ep_rank=ep_rank,
+        )
+
     def _dispatch_output(self, dtype=torch.bfloat16, with_scale=False):
         return DeepEPNormalDispatchOutput(
             hidden_states=torch.randn(3, 16).to(dtype),
@@ -38,15 +51,18 @@ class TestFlashInferMxfp4DeepEPNormal(CustomTestCase):
             return_value=StandardCombineInput(hidden_states=kernel_output),
         ) as run_flashinfer:
             result = fused_experts_deepep_to_flashinfer_mxfp4(
-                dispatch_output, SimpleNamespace(), SimpleNamespace()
+                dispatch_output, self._quant_info(), SimpleNamespace()
             )
 
         standard_output = run_flashinfer.call_args.args[0]
+        local_quant_info = run_flashinfer.call_args.args[1]
         self.assertIs(standard_output.hidden_states, dispatch_output.hidden_states)
         self.assertIs(standard_output.topk_output.topk_ids, dispatch_output.topk_ids)
         self.assertIs(
             standard_output.topk_output.topk_weights, dispatch_output.topk_weights
         )
+        self.assertEqual(local_quant_info.moe_ep_size, 1)
+        self.assertEqual(local_quant_info.moe_ep_rank, 0)
         self.assertIs(result.hidden_states, kernel_output)
         self.assertIs(result.topk_ids, dispatch_output.topk_ids)
         self.assertIs(result.topk_weights, dispatch_output.topk_weights)
@@ -55,7 +71,7 @@ class TestFlashInferMxfp4DeepEPNormal(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "requires BF16"):
             fused_experts_deepep_to_flashinfer_mxfp4(
                 self._dispatch_output(torch.float8_e4m3fn, with_scale=True),
-                SimpleNamespace(),
+                self._quant_info(),
                 SimpleNamespace(),
             )
 
@@ -72,7 +88,7 @@ class TestFlashInferMxfp4DeepEPNormal(CustomTestCase):
             "fused_experts_none_to_flashinfer_mxfp4"
         ) as run_flashinfer:
             result = fused_experts_deepep_to_flashinfer_mxfp4(
-                dispatch_output, SimpleNamespace(), SimpleNamespace()
+                dispatch_output, self._quant_info(), SimpleNamespace()
             )
         run_flashinfer.assert_not_called()
         self.assertEqual(result.hidden_states.shape, (0, 16))
