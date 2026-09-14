@@ -46,5 +46,10 @@ def per_token_quant_fp8(
     output_s: torch.Tensor,
 ) -> None:
     """Dynamically quantize each row to FP8 E4M3."""
+    # DeepEP may legitimately route no tokens to an EP rank. Preserve the
+    # preallocated empty outputs and avoid launching a zero-grid CUDA kernel.
+    if input.shape[0] == 0:
+        return
+
     module = _jit_per_token_quant_fp8_module(input.dtype)
     module.per_token_quant_fp8(input, output_q, output_s.view(output_s.shape[0], 1))
