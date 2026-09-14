@@ -712,12 +712,18 @@ struct FusedFrontEpilogueKernel {
     params.routed_stride = static_cast<long long>(routed.stride(0));
 
     // Tunables come from the JSON config table; see kernels/ops/moe/moe_front.py.
-    // cast_vec * 4 bytes per thread must stay inside the 32B vector-load limit.
+    // cast_vec * 4 bytes per thread must stay inside the architecture's
+    // vector-load limit: 16 B through Hopper, 32 B starting with Blackwell.
+#if SGL_CUDA_ARCH >= 1000
     RuntimeCheck(cast_vec == 2 || cast_vec == 4 || cast_vec == 8, "fused_front_epilogue: cast_vec must be 2, 4 or 8");
+#else
+    RuntimeCheck(cast_vec == 2 || cast_vec == 4, "fused_front_epilogue: cast_vec must be 2 or 4 before Blackwell");
+#endif
     RuntimeCheck(latent % cast_vec == 0, "fused_front_epilogue: cast_vec must divide latent");
 
 #define SGL_FRONT_LAUNCH(BS, CV, CF) \
   LaunchKernel(M, BS, device.unwrap()).enable_pdl(kUsePDL)(fused_front_epilogue_kernel<kUsePDL, BS, CV, CF>, params)
+#if SGL_CUDA_ARCH >= 1000
 #define SGL_FRONT_DISPATCH_CV(BS, CF) \
   do {                                \
     if (cast_vec == 2) {              \
@@ -728,6 +734,16 @@ struct FusedFrontEpilogueKernel {
       SGL_FRONT_LAUNCH(BS, 8, CF);    \
     }                                 \
   } while (0)
+#else
+#define SGL_FRONT_DISPATCH_CV(BS, CF) \
+  do {                                \
+    if (cast_vec == 2) {              \
+      SGL_FRONT_LAUNCH(BS, 2, CF);    \
+    } else {                          \
+      SGL_FRONT_LAUNCH(BS, 4, CF);    \
+    }                                 \
+  } while (0)
+#endif
 #define SGL_FRONT_DISPATCH_BS(CF)     \
   do {                                \
     if (block_size == 448) {          \

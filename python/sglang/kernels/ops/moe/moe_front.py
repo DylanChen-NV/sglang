@@ -74,11 +74,10 @@ _CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs", "moe_front")
 #   cast_vec    fp32 elements each thread converts per step in the latent cast.
 #   cast_first  issue the cast before the select (loads in flight during the
 #               radix rounds) or after it.
-# Fallbacks when no tuned table matches the device. Both were the sweep's most
-# common winners: cast_vec 8 is 32 B/thread, the Blackwell vector-load limit, and
-# it won at every one of the 28 token counts measured; issuing the cast after the
-# select beat issuing it before almost everywhere.
-DEFAULT_EPILOGUE_CONFIG = {"block_size": 224, "cast_vec": 8, "cast_first": False}
+# Fallback when no device-specific tuned table exists. Keep the generic vector
+# width at 16 B/thread so the JIT remains valid on Hopper. Blackwell tables can
+# explicitly select cast_vec 8 (32 B/thread) where that wider load is supported.
+DEFAULT_EPILOGUE_CONFIG = {"block_size": 224, "cast_vec": 4, "cast_first": False}
 
 _tables = {}
 
