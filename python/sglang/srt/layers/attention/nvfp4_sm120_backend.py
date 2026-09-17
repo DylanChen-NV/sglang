@@ -343,6 +343,17 @@ class NVFP4SM120AttnBackend(FlashInferAttnBackend):
                 ],
                 dim=0,
             ).contiguous()
+
+            # Match the normal FlashInfer path for checkpoints with static
+            # FP8 KV-cache scales. Qwen3.5 NVFP4 checkpoints can emit K/V in
+            # the checkpoint's scaled domain; FlashInfer applies these
+            # per-layer dequant scales when reading the cache. The dense
+            # NVFP4 path bypasses that cache read, so apply them explicitly
+            # before quantizing K/V to NVFP4.
+            if layer.k_scale_float is not None:
+                k_dense.mul_(layer.k_scale_float)
+            if layer.v_scale_float is not None:
+                v_dense.mul_(layer.v_scale_float)
             if self._nvfp4_profile:
                 pre_adapter_end.record()
                 quantize_start.record()
