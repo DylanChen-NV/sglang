@@ -353,7 +353,7 @@ def fused_experts_deepep_to_flashinfer_mxfp4(
     quant_info: MoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ):
-    """Run FlashInfer MXFP4 after DeepEP normal BF16 dispatch.
+    """Run FlashInfer MXFP4 after DeepEP normal or low-latency dispatch.
 
     DeepEP normal already routes tokens to the owning EP rank and rewrites
     valid ``topk_ids`` into that rank's local expert namespace (invalid slots
@@ -363,16 +363,25 @@ def fused_experts_deepep_to_flashinfer_mxfp4(
     tensors unchanged for DeepEP combine, but normalize the kernel topology.
     """
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPLLDispatchOutput,
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
     )
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
     from sglang.srt.layers.moe.topk import StandardTopKOutput
 
-    if not isinstance(dispatch_output, DeepEPNormalDispatchOutput):
-        raise NotImplementedError(
-            "flashinfer_mxfp4 currently supports DeepEP normal mode only"
+    if isinstance(dispatch_output, DeepEPLLDispatchOutput):
+        from sglang.srt.layers.moe.moe_runner.flashinfer_humming_deepep_ll import (
+            run_deepep_ll_humming,
         )
+        if not isinstance(quant_info, FlashInferCutlassMxfp4MoeQuantInfo):
+            raise ValueError("DeepEP LL requires FlashInfer CUTLASS Humming quant info")
+        return run_deepep_ll_humming(
+            dispatch_output, quant_info, runner_config,
+            fused_experts_none_to_flashinfer_mxfp4,
+        )
+    if not isinstance(dispatch_output, DeepEPNormalDispatchOutput):
+        raise ValueError("Unsupported DeepEP dispatch output for flashinfer_mxfp4")
     hidden_states = dispatch_output.hidden_states
     hidden_states_scale = dispatch_output.hidden_states_scale
     is_bf16 = hidden_states.dtype == torch.bfloat16 and hidden_states_scale is None

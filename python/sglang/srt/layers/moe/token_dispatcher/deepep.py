@@ -837,20 +837,23 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
         use_fp8 = self.use_fp8
         use_per_token_scale = (
-            use_fp8 and get_moe_runner_backend().is_lowlatency_mxfp4()
+            use_fp8 and (
+                get_moe_runner_backend().is_lowlatency_mxfp4()
+                or (get_moe_runner_backend().is_flashinfer_mxfp4() and not is_blackwell())
+            )
         )
         if use_per_token_scale and not self._per_token_scale_runtime_checked:
             try:
                 dispatch_signature = inspect.signature(buffer.low_latency_dispatch)
             except (TypeError, ValueError) as exc:
                 raise RuntimeError(
-                    "lowlatency_mxfp4 with FP8 DeepEP dispatch requires a "
+                    "MXFP4 per-token FP8 DeepEP dispatch requires a "
                     "runtime exposing low_latency_dispatch(..., "
                     "use_per_token_scale=...)."
                 ) from exc
             if "use_per_token_scale" not in dispatch_signature.parameters:
                 raise RuntimeError(
-                    "lowlatency_mxfp4 with FP8 DeepEP dispatch requires the "
+                    "MXFP4 FP8 DeepEP dispatch requires the "
                     "per-token-scale DeepEP runtime; the installed runtime "
                     "still exposes only group-128 communication quantization."
                 )
