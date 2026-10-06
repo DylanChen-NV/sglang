@@ -81,6 +81,8 @@ def errors(actual, reference):
         raise AssertionError("non-finite result")
     rel = float(torch.linalg.vector_norm(a - b) / torch.linalg.vector_norm(b).clamp_min(1e-12))
     cosine = float(torch.nn.functional.cosine_similarity(a[None], b[None]))
+    print("NUMERICS", {"relative_l2": rel, "cosine": cosine,
+                       "max_abs": float((a - b).abs().max())}, flush=True)
     torch.testing.assert_close(actual.float(), reference.float(), rtol=0.025, atol=0.025)
     assert rel < 0.01, (rel, cosine)
     return {"relative_l2": rel, "cosine": cosine, "max_abs": float((a - b).abs().max())}
@@ -227,6 +229,53 @@ def distributed_tests(qi, args, rank, world):
                 dist.barrier()
                 out = pipeline()
                 torch.cuda.synchronize()
+                print("CASE", rank, bs, routing, carrier, flush=True)
+                if carrier == "fp8":
+                    # Diagnostic reference with one physical row per assignment:
+                    # distinguish top-k>1 prequantized Humming scale indexing
+                    # from transport/adapter issues, without relaxing the gate.
+                    expanded_x = all_x.repeat_interleave(topk, dim=0)
+                    expanded_sf = all_sf.repeat_interleave(topk, dim=0)
+                    expanded_ids = local_ids.reshape(-1, 1).int()
+                    with autotune(tune_mode=True):
+                        per_assignment = standard(
+                            expanded_x, expanded_ids,
+                            torch.ones_like(all_weights.reshape(-1, 1)), qi, expanded_sf,
+                        )
+                    explicit = (per_assignment.float().view(world * bs, topk, H)
+                                * all_weights[..., None]).sum(1)
+                    dist.all_reduce(explicit)
+                    explicit = explicit[rank * bs:(rank + 1) * bs].contiguous()
+                    print("EXPLICIT_REFERENCE", rank,
+                          float(torch.linalg.vector_norm(out.float() - explicit)
+                                / torch.linalg.vector_norm(explicit).clamp_min(1e-12)),
+                          "STANDARD_REFERENCE", float(torch.linalg.vector_norm(ref.float() - explicit)
+                                / torch.linalg.vector_norm(explicit).clamp_min(1e-12)), flush=True)
+                    # DeepEP result buffers are ping-pong aliases: inspect a
+                    # fresh dispatch and match each received row to an input.
+                    recv, counts, _, _, recv_hook = buffer.low_latency_dispatch(
+                        send, ids, max_send, global_experts, use_fp8=True,
+                        use_per_token_scale=True, return_recv_hook=True,
+                    )
+                    recv_hook()
+                    rx, rs = recv
+                    diagnostics = []
+                    for expert in range(E):
+                        n = int(counts[expert])
+                        candidates = ((all_ids == expert + rank * E).any(-1)).nonzero().flatten()
+                        for row in range(n):
+                            matches = (rx[expert, row].view(torch.uint8)[None, :]
+                                       == all_x.view(torch.uint8)[candidates]).all(-1)
+                            matched = candidates[matches]
+                            diagnostics.append({"expert": expert, "row": row,
+                                "matched_tokens": matched.tolist(),
+                                "scale": float(rs[expert, row, 0]),
+                                "expected_scales": all_sf[matched].flatten().tolist(),
+                                "all_groups_same": bool((rs[expert, row] == rs[expert, row, 0]).all())})
+                    print("TRANSPORT_DIAGNOSTICS", rank, diagnostics, flush=True)
+                    dump = args.output.with_name("diagnostic.rank%d.bs%d.%s.pt" % (rank, bs, routing))
+                    torch.save({"actual": out.clone(), "standard": ref.clone(),
+                                "explicit": explicit, "transport": diagnostics}, dump)
                 eager_err = errors(out, ref)
                 dist.barrier()
                 out, us = graph_time(pipeline, args.tests)
