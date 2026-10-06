@@ -131,6 +131,8 @@ class TestFlashInferDeepEPLL(unittest.TestCase):
         calls = []
 
         class FakeBuffer:
+            group_size = 2
+
             def low_latency_dispatch(self, x, ids, capacity, experts,
                                      use_per_token_scale=False, **kwargs):
                 calls.append((x, use_per_token_scale, kwargs))
@@ -142,7 +144,7 @@ class TestFlashInferDeepEPLL(unittest.TestCase):
         impl.use_fp8, impl.use_nvfp4 = True, False
         impl.low_latency_quant_mode = None
         impl._per_token_scale_runtime_checked = False
-        impl.num_max_dispatch_tokens_per_rank = 5
+        impl.num_max_dispatch_tokens_per_rank = 64
         impl.num_experts = 4
         impl.return_recv_hook = True
         backend = SimpleNamespace(is_lowlatency_mxfp4=lambda: False,
@@ -166,6 +168,16 @@ class TestFlashInferDeepEPLL(unittest.TestCase):
         self.assertEqual(calls[0][0][0].dtype, torch.float8_e4m3fn)
         self.assertEqual(calls[0][0][1].shape, (20, 1))
         self.assertTrue(impl._per_token_scale_runtime_checked)
+
+        # An unsafe capacity must fail before quantization/communication;
+        # padding-layout unit cases are unrelated to this wire constraint.
+        impl.num_max_dispatch_tokens_per_rank = 5
+        with patch.object(impl, "_get_buffer", return_value=FakeBuffer()), \
+             patch.object(dispatcher, "get_moe_runner_backend", return_value=backend), \
+             patch.object(dispatcher, "is_blackwell", return_value=False), \
+             self.assertRaisesRegex(RuntimeError, "multiple of 128"):
+            impl._dispatch_core(self.x.flatten(0, 1), self.ids, self.weights)
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":

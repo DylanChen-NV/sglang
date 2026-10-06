@@ -842,6 +842,21 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 or (get_moe_runner_backend().is_flashinfer_mxfp4() and not is_blackwell())
             )
         )
+        if (
+            use_per_token_scale
+            and get_moe_runner_backend().is_flashinfer_mxfp4()
+            and (self.num_max_dispatch_tokens_per_rank * buffer.group_size) % 128
+        ):
+            # The pinned legacy DeepEP kernel rounds its FP8 scale expert
+            # base to 128 slots, but allocates unrounded capacity. Reject
+            # unsafe small carriers before dispatch (scale corruption/OOB).
+            # This is a DeepEP dependency constraint, not a Humming GEMM
+            # shape limitation; remove after that runtime is fixed/updated.
+            raise RuntimeError(
+                "FlashInfer Humming + pinned DeepEP LL FP8 requires "
+                "world_size * SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK "
+                "to be a multiple of 128 (legacy receive-scale alignment)."
+            )
         if use_per_token_scale and not self._per_token_scale_runtime_checked:
             try:
                 dispatch_signature = inspect.signature(buffer.low_latency_dispatch)
