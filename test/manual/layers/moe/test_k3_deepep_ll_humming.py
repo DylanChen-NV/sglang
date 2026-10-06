@@ -76,17 +76,21 @@ def standard(x, ids, weights, qi, sf=None):
     return runner.fused_experts_none_to_flashinfer_mxfp4(dispatch, qi, CONFIG).hidden_states
 
 
-def errors(actual, reference):
+def numerical_metrics(actual, reference):
     a, b = actual.float().flatten(), reference.float().flatten()
     if not torch.isfinite(a).all() or not torch.isfinite(b).all():
         raise AssertionError("non-finite result")
     rel = float(torch.linalg.vector_norm(a - b) / torch.linalg.vector_norm(b).clamp_min(1e-12))
     cosine = float(torch.nn.functional.cosine_similarity(a[None], b[None]))
-    print("NUMERICS", {"relative_l2": rel, "cosine": cosine,
-                       "max_abs": float((a - b).abs().max())}, flush=True)
-    torch.testing.assert_close(actual.float(), reference.float(), rtol=0.025, atol=0.025)
-    assert rel < 0.01, (rel, cosine)
     return {"relative_l2": rel, "cosine": cosine, "max_abs": float((a - b).abs().max())}
+
+
+def errors(actual, reference):
+    metrics = numerical_metrics(actual, reference)
+    print("NUMERICS", metrics, flush=True)
+    torch.testing.assert_close(actual.float(), reference.float(), rtol=0.025, atol=0.025)
+    assert metrics["relative_l2"] < 0.01, metrics
+    return metrics
 
 
 def graph_time(fn, tests):
@@ -243,9 +247,23 @@ def distributed_tests(qi, args, rank, world):
                 local_ids = all_ids - rank * E
                 local_ids.masked_fill_((local_ids < 0) | (local_ids >= E), -1)
                 with autotune(tune_mode=True):
-                    ref = standard(all_x, local_ids, all_weights, qi, all_sf)
+                    direct_ref = standard(all_x, local_ids, all_weights, qi, all_sf)
+                    # Match DeepEP combine's precision boundary: each expert
+                    # FC2 result is BF16, weights and accumulation are FP32,
+                    # and the final token sum is cast once. Standard EP rounds
+                    # a partial top-k sum on each shard BEFORE all-reduce.
+                    assignment_out = standard(
+                        all_x.repeat_interleave(topk, dim=0),
+                        local_ids.reshape(-1, 1).int(),
+                        torch.ones_like(all_weights.reshape(-1, 1)), qi,
+                        all_sf.repeat_interleave(topk, dim=0) if all_sf is not None else None,
+                    )
+                dist.all_reduce(direct_ref)
+                direct_ref = direct_ref[rank * bs:(rank + 1) * bs].clone()
+                ref = (assignment_out.float().view(world * bs, topk, H)
+                       * all_weights[..., None]).sum(1)
                 dist.all_reduce(ref)
-                ref = ref[rank * bs:(rank + 1) * bs].contiguous()
+                ref = ref[rank * bs:(rank + 1) * bs].to(torch.bfloat16).contiguous()
                 # Rank-varying Humming autotune must not occur inside a live
                 # DeepEP collective; the full padded top-k1 shape is warmed
                 # separately with synthetic counts before entering the pipe.
@@ -328,6 +346,7 @@ def distributed_tests(qi, args, rank, world):
                                 "routing": routing, "rank": rank, "world": world,
                                 "capacity_per_expert": c, "pipeline_graph_us": us,
                                 "eager": eager_err, "graph": graph_err,
+                                "standard_ep_partial_bf16_vs_oracle": numerical_metrics(direct_ref, ref),
                                 "instrumented_components": components})
                 print("DISTRIBUTED", records[-1], flush=True)
                 dist.barrier()
