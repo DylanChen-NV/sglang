@@ -8,6 +8,7 @@ Run local mode first, then torchrun --nproc_per_node=2 ... --distributed.
 import argparse
 import inspect
 import json
+import math
 import os
 import statistics
 import time
@@ -158,7 +159,12 @@ def local_tests(qi, args):
 def distributed_tests(qi, args, rank, world):
     from deep_ep import Buffer
 
-    max_send = max(args.batches)
+    # Pinned DeepEP legacy kernel aligns each expert's FP8 scale base to
+    # 128 receive slots, while its allocation uses the requested capacity.
+    # Use a matching capacity: smaller non-aligned carriers overwrite scales
+    # and can write outside their allocation (not a Humming numerical issue).
+    quantum = 128 // math.gcd(world, 128)
+    max_send = ((max(args.batches) + quantum - 1) // quantum) * quantum
     global_experts = E * world
     rdma_bytes = Buffer.get_low_latency_rdma_size_hint(max_send, H, world, global_experts)
     buffer = Buffer(dist.group.WORLD, num_rdma_bytes=rdma_bytes, low_latency_mode=True,
@@ -230,7 +236,7 @@ def distributed_tests(qi, args, rank, world):
                 out = pipeline()
                 torch.cuda.synchronize()
                 print("CASE", rank, bs, routing, carrier, flush=True)
-                if carrier == "fp8":
+                if carrier == "fp8" and args.diagnose:
                     # Diagnostic reference with one physical row per assignment:
                     # distinguish top-k>1 prequantized Humming scale indexing
                     # from transport/adapter issues, without relaxing the gate.
@@ -295,6 +301,7 @@ def main():
     parser.add_argument("--distributed", action="store_true")
     parser.add_argument("--batches", default="1,2,4,8")
     parser.add_argument("--tests", type=int, default=30)
+    parser.add_argument("--diagnose", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     args.batches = [int(x) for x in args.batches.split(",")]
