@@ -197,7 +197,7 @@ def distributed_tests(qi, args, rank, world):
     records = []
     for bs in args.batches:
         for routing in ("spread", "hot"):
-            topk = 4
+            topk = args.topk
             x = torch.randn(bs, H, device="cuda", dtype=torch.bfloat16).mul_(0.05)
             ids = torch.arange(bs * topk, device="cuda").reshape(bs, topk)
             ids = (ids + rank * 11) % global_experts if routing == "spread" else ids % topk
@@ -333,6 +333,37 @@ def distributed_tests(qi, args, rank, world):
                 out, us = graph_time(pipeline, args.tests)
                 torch.cuda.synchronize()
                 graph_err = errors(out, ref)
+                comparison = {}
+                if args.compare:
+                    # Same rank-local input/routing, DP-style replication for
+                    # Standard EP, local Humming shard, then shard all-reduce.
+                    # Quant is performed in the timed pipeline on both paths.
+                    def standard_pipeline():
+                        xs = [torch.empty_like(x) for _ in range(world)]
+                        dist.all_gather(xs, x)
+                        replicated = torch.cat(xs)
+                        partial = standard(replicated, local_ids, all_weights, qi)
+                        dist.all_reduce(partial)
+                        return partial[rank * bs:(rank + 1) * bs]
+
+                    def inclusive_pipeline():
+                        nonlocal send
+                        send = quantize(x) if carrier == "fp8" else x
+                        return pipeline()
+
+                    # The BF16 input Standard path quantizes in Humming.
+                    with autotune(tune_mode=True):
+                        standard(all_x.to(torch.bfloat16) if carrier == "bf16" else gather(x),
+                                 local_ids, all_weights, qi)
+                    dist.barrier()
+                    baseline, baseline_us = graph_time(standard_pipeline, args.tests)
+                    dist.barrier()
+                    inclusive, inclusive_us = graph_time(inclusive_pipeline, args.tests)
+                    errors(inclusive, ref)
+                    comparison = {"standard_ep_inclusive_graph_us": baseline_us,
+                                  "deepep_ll_inclusive_graph_us": inclusive_us,
+                                  "standard_vs_same_precision_oracle": numerical_metrics(baseline, ref),
+                                  "scope": "DP all-gather + shard compute + all-reduce vs quant + LL dispatch + adapters + compute + combine"}
                 components = {}
                 if args.components:
                     dist.barrier()
@@ -345,6 +376,7 @@ def distributed_tests(qi, args, rank, world):
                 records.append({"carrier": carrier, "batch_per_rank": bs,
                                 "routing": routing, "rank": rank, "world": world,
                                 "capacity_per_expert": c, "pipeline_graph_us": us,
+                                "topk": topk, "comparison": comparison,
                                 "eager": eager_err, "graph": graph_err,
                                 "standard_ep_partial_bf16_vs_oracle": numerical_metrics(direct_ref, ref),
                                 "instrumented_components": components})
@@ -360,6 +392,8 @@ def main():
     parser.add_argument("--tests", type=int, default=30)
     parser.add_argument("--diagnose", action="store_true")
     parser.add_argument("--components", action="store_true")
+    parser.add_argument("--compare", action="store_true")
+    parser.add_argument("--topk", type=int, default=4)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     args.batches = [int(x) for x in args.batches.split(",")]
