@@ -25,11 +25,19 @@ def _prepare_ll_rows(
     slot = row % CAPACITY
     valid = slot < tl.load(COUNTS + expert)
     cols = chunk * BLOCK + tl.arange(0, BLOCK)
+    if FP8:
+        # Transport FP8 bytes unchanged. Besides avoiding an unnecessary
+        # conversion, uint8 masking works on Triton versions that cannot
+        # cast the integer `other=0` of tl.load directly into FP8 E4M3.
+        src = X.to(tl.pointer_type(tl.uint8))
+        dst = Y.to(tl.pointer_type(tl.uint8))
+    else:
+        src, dst = X, Y
     values = tl.load(
-        X + expert * X_E + slot * X_M + cols * X_H,
+        src + expert * X_E + slot * X_M + cols * X_H,
         mask=valid & (cols < HIDDEN), other=0,
     )
-    tl.store(Y + row * HIDDEN + cols, values, mask=cols < HIDDEN)
+    tl.store(dst + row * HIDDEN + cols, values, mask=cols < HIDDEN)
     if chunk == 0:
         tl.store(IDS + row, tl.where(valid, expert, -1))
         # DeepEP low_latency_combine applies the original router weights.

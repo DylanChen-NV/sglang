@@ -68,6 +68,10 @@ class TestFlashInferDeepEPLL(unittest.TestCase):
         sf[..., 1] = sf[..., 0]
         x = torch.cat([x.float(), x.float()], -1).to(torch.float8_e4m3fn)
         prepared = prepare_ll_rows(self.dispatch(x, sf), self.qi)
+        # Communication FP8 bytes must not be requantized by the adapter.
+        actual_bytes = prepared.hidden_states.view_as(x).view(torch.uint8)
+        torch.testing.assert_close(actual_bytes[self.valid_mask()], x.view(torch.uint8)[self.valid_mask()])
+        self.assertEqual(actual_bytes[~self.valid_mask()].sum().item(), 0)
         actual = prepared.hidden_states_scale.view(4, 5)
         torch.testing.assert_close(actual[self.valid_mask()], sf[..., 0][self.valid_mask()])
         torch.testing.assert_close(actual[~self.valid_mask()], torch.ones_like(actual[~self.valid_mask()]))
