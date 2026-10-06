@@ -108,6 +108,26 @@ def graph_time(fn, tests):
     return out, statistics.median(samples)
 
 
+def graph_components(pipeline, tests):
+    """Separate instrumented graph; clean pipeline timing stays unmodified."""
+    marks = [torch.cuda.Event(enable_timing=True, external=True) for _ in range(4)]
+    pipeline(marks)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = pipeline(marks)
+    samples = []
+    for _ in range(3):
+        for _ in range(tests):
+            graph.replay()
+        torch.cuda.synchronize()
+        samples.append([marks[i].elapsed_time(marks[i + 1]) * 1000 for i in range(3)])
+    return out, dict(zip(
+        ("dispatch_hook_us", "adapter_humming_us", "combine_hook_us"),
+        [statistics.median([sample[i] for sample in samples]) for i in range(3)],
+    ))
+
+
 def local_tests(qi, args):
     records = []
     for capacity, active, count in ((8, 8, 8), (4, 16, 4), (2, 1, 1), (4, 0, 0)):
@@ -183,20 +203,28 @@ def distributed_tests(qi, args, rank, world):
             for carrier in ("bf16", "fp8"):
                 send = quantize(x) if carrier == "fp8" else x
 
-                def pipeline():
+                def pipeline(marks=None):
+                    if marks is not None:
+                        marks[0].record()
                     recv, counts, handle, event, hook = buffer.low_latency_dispatch(
                         send, ids, max_send, global_experts,
                         use_fp8=carrier == "fp8", use_per_token_scale=carrier == "fp8",
                         async_finish=False, return_recv_hook=True,
                     )
                     hook()
+                    if marks is not None:
+                        marks[1].record()
                     recv_x, recv_sf = recv if isinstance(recv, tuple) else (recv, None)
                     d = DeepEPLLDispatchOutput(recv_x, recv_sf, ids, weights, counts, 1)
                     out = runner.fused_experts_deepep_to_flashinfer_mxfp4(d, qi, CONFIG).hidden_states
+                    if marks is not None:
+                        marks[2].record()
                     combined, event, hook = buffer.low_latency_combine(
                         out, ids, weights, handle, async_finish=False, return_recv_hook=True,
                     )
                     hook()
+                    if marks is not None:
+                        marks[3].record()
                     return combined
 
                 # Compute a Standard EP reference over all input tokens, with
@@ -287,10 +315,20 @@ def distributed_tests(qi, args, rank, world):
                 out, us = graph_time(pipeline, args.tests)
                 torch.cuda.synchronize()
                 graph_err = errors(out, ref)
+                components = {}
+                if args.components:
+                    dist.barrier()
+                    profiled, components = graph_components(pipeline, args.tests)
+                    errors(profiled, ref)
+                    if carrier == "fp8":
+                        _, components["predispatch_quant_graph_us"] = graph_time(
+                            lambda: quantize(x), args.tests
+                        )
                 records.append({"carrier": carrier, "batch_per_rank": bs,
                                 "routing": routing, "rank": rank, "world": world,
                                 "capacity_per_expert": c, "pipeline_graph_us": us,
-                                "eager": eager_err, "graph": graph_err})
+                                "eager": eager_err, "graph": graph_err,
+                                "instrumented_components": components})
                 print("DISTRIBUTED", records[-1], flush=True)
                 dist.barrier()
     return records
@@ -302,6 +340,7 @@ def main():
     parser.add_argument("--batches", default="1,2,4,8")
     parser.add_argument("--tests", type=int, default=30)
     parser.add_argument("--diagnose", action="store_true")
+    parser.add_argument("--components", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     args.batches = [int(x) for x in args.batches.split(",")]
@@ -324,6 +363,7 @@ def main():
     payload = {"status": "PASS", "hardware": name, "rank": rank, "world": world,
                "shape": {"experts_per_rank": E, "hidden": H, "intermediate": I},
                "scope": "synthetic K3-shape MoE, not full-model accuracy or E2E",
+               "timing_scope": "clean graph: dispatch+adapter+Humming+combine; FP8 send quant excluded; components use separate external-event graph",
                "flashinfer_file": flashinfer.__file__, "flashinfer_version": flashinfer.__version__,
                "torch_version": torch.__version__, "timestamp": time.time(), "results": records}
     output = args.output.with_name(args.output.stem + (".rank%d" % rank if args.distributed else "") + ".json")
