@@ -30,13 +30,35 @@ def _env_flag(name: str, default: bool) -> bool:
     return value.lower() not in ("0", "false", "no", "off")
 
 
+def _read_nvfp4_min_seq_len() -> int:
+    if "SGLANG_NVFP4_ATTN_MAX_SEQ_LEN" in os.environ:
+        logger.warning(
+            "SGLANG_NVFP4_ATTN_MAX_SEQ_LEN is deprecated and ignored by "
+            "the MIN-routing backend. Use SGLANG_NVFP4_ATTN_MIN_SEQ_LEN "
+            "(default: 16384); this backend no longer imposes a maximum length."
+        )
+    value = os.getenv("SGLANG_NVFP4_ATTN_MIN_SEQ_LEN", "16384")
+    try:
+        min_seq_len = int(value)
+    except ValueError as exc:
+        raise ValueError(
+            "SGLANG_NVFP4_ATTN_MIN_SEQ_LEN must be a non-negative integer"
+        ) from exc
+    if min_seq_len < 0:
+        raise ValueError(
+            "SGLANG_NVFP4_ATTN_MIN_SEQ_LEN must be a non-negative integer"
+        )
+    return min_seq_len
+
+
 class NVFP4SM120AttnBackend(FlashInferAttnBackend):
     """Experimental dense NVFP4 prefill with a FlashInfer fallback.
 
     The NVFP4 kernel currently supports only square causal attention over
     freshly supplied Q/K/V. Equal-length requests in a fresh batch are
     bucketed into one dense kernel call; prefix/chunk/verify/decode paths
-    retain the normal FlashInfer behavior.
+    retain the normal FlashInfer behavior. If any request is shorter than
+    the configured minimum, the whole attention call uses FlashInfer.
     """
 
     def __init__(
@@ -79,9 +101,7 @@ class NVFP4SM120AttnBackend(FlashInferAttnBackend):
         self._nvfp4_per_block_mean = _env_flag(
             "SGLANG_NVFP4_ATTN_PER_BLOCK_MEAN", False
         )
-        self._nvfp4_max_seq_len = int(
-            os.getenv("SGLANG_NVFP4_ATTN_MAX_SEQ_LEN", "8192")
-        )
+        self._nvfp4_min_seq_len = _read_nvfp4_min_seq_len()
         self._nvfp4_log_interval = max(
             1, int(os.getenv("SGLANG_NVFP4_ATTN_LOG_INTERVAL", "10"))
         )
@@ -110,10 +130,10 @@ class NVFP4SM120AttnBackend(FlashInferAttnBackend):
         logger.info(
             "Initialized nvfp4_sm120 prefill experiment: "
             "native_gqa=True, head_dim=256, per_block_mean=%s, "
-            "max_seq_len=%d, equal_length_bucketing=True, profile=%s, "
+            "min_seq_len=%d, equal_length_bucketing=True, profile=%s, "
             "shadow_compare_calls=%d, draft_worker=%s",
             self._nvfp4_per_block_mean,
-            self._nvfp4_max_seq_len,
+            self._nvfp4_min_seq_len,
             self._nvfp4_profile,
             self._nvfp4_shadow_compare_limit,
             self._nvfp4_is_draft_worker,
@@ -214,8 +234,8 @@ class NVFP4SM120AttnBackend(FlashInferAttnBackend):
         seq_lens_int = [int(seq_len) for seq_len in seq_lens]
         if any(seq_len <= 0 for seq_len in seq_lens_int):
             return "empty_sequence"
-        if max(seq_lens_int) > self._nvfp4_max_seq_len:
-            return "sequence_too_long"
+        if min(seq_lens_int) < self._nvfp4_min_seq_len:
+            return "sequence_too_short"
         if sum(seq_lens_int) != q.shape[0]:
             return "token_count_mismatch"
         if save_kv_cache and forward_batch.out_cache_loc is None:
