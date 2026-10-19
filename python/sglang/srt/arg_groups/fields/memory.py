@@ -261,7 +261,13 @@ class Memory(msgspec.Struct):
         Optional[list[str]],
         Arg(
             help="Request events that export KV into FlexKV; None preserves terminal-event defaults.",
-            choices=["finish", "checkpoint_abort", "cancel_abort", "error_abort", "retract"],
+            choices=[
+                "finish",
+                "checkpoint_abort",
+                "cancel_abort",
+                "error_abort",
+                "retract",
+            ],
             nargs="+",
         ),
     ] = None

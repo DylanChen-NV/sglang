@@ -161,6 +161,9 @@ class FlexKVRadixCache(RadixCache):
             self.flexkv_connector.reset()
 
     def reset_local(self) -> None:
+        if hasattr(self, "flexkv_connector"):
+            self.wait_for_pending_stores(timeout=30.0)
+            self.flexkv_connector.reset(clear_store=False)
         super().reset()
         if hasattr(self, "_load_markers"):
             self._load_markers.clear()
@@ -514,7 +517,9 @@ class FlexKVRadixCache(RadixCache):
         if task_id < 0:
             success = True
         else:
-            success = self.flexkv_connector.wait_store(req.cache_request_handle, timeout=timeout)
+            success = self.flexkv_connector.wait_store(
+                req.cache_request_handle, timeout=timeout
+            )
         logger.info(
             "[FlexKV] Retract checkpoint rid=%s tokens=%d task_id=%d "
             "success=%s duration_s=%.6f",
@@ -580,12 +585,8 @@ class FlexKVRadixCache(RadixCache):
     # ------------------------------------------------------------------
 
     def release_aborted_request(self, handle: CacheRequestHandle) -> None:
-        """Clean up tracking for an aborted request without invoking FlexKV."""
+        """Drop lookup state; a previously launched store still owns its source pin."""
         self._load_markers.pop(handle, None)
-        with self._node_lock:
-            node = self._inflight_store_nodes.pop(handle, None)
-        if node is not None:
-            self.dec_lock_ref(node)
         self.flexkv_connector.release_pending(handle)
         self.flexkv_connector.cancel_prefetch(handle)
 

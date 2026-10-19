@@ -3751,7 +3751,7 @@ class Scheduler(
             )
             req.pending_bootstrap = False
         self._release_aborted_request(req)
-        release_kv_cache(req, self.tree_cache, checkpoint=False)
+        release_kv_cache(req, self.tree_cache, checkpoint=req.checkpoint_aborted_kv)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None

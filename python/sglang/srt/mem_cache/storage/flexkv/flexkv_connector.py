@@ -358,6 +358,8 @@ class FlexKVConnector:
             self._send_slot_mapping_to_remote(fkv_task_id, slot_mapping_cpu)
 
         n = slot_mapping_cpu.numel()
+        terminal = False
+        success = False
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             self.kv_manager.launch(
                 task_ids=[fkv_task_id],
@@ -365,19 +367,34 @@ class FlexKVConnector:
                 as_batch=True,
                 layerwise_transfer=False,
             )
-            resp = self.kv_manager.wait([fkv_task_id], timeout=30.0)
-            if not (
-                fkv_task_id in resp
-                and resp[fkv_task_id].status == KVResponseStatus.SUCCESS
-            ):
-                logger.warning(
-                    "[FlexKV] retrieve_kv: task %d failed/timed out",
-                    fkv_task_id,
+            self._launched_load_tids.append(fkv_task_id)
+            try:
+                resp = (
+                    self.kv_manager.wait([fkv_task_id], timeout=30.0, completely=True)
+                    or {}
                 )
-                n = 0
+                response = resp.get(fkv_task_id)
+                terminal = response is not None and response.status in {
+                    KVResponseStatus.SUCCESS,
+                    KVResponseStatus.FAILED,
+                    KVResponseStatus.CANCELLED,
+                    KVResponseStatus.NOTFOUND,
+                }
+                success = (
+                    response is not None and response.status == KVResponseStatus.SUCCESS
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[FlexKV] retrieve_kv wait: %s", exc)
         if self._sync_ctx.needs_sync:
-            self._sync_ctx.barrier()
-        return n
+            payload = self._sync_ctx.scatter({"terminal": terminal, "success": success})
+            terminal, success = payload["terminal"], payload["success"]
+        if not terminal:
+            raise TimeoutError(
+                f"FlexKV load {fkv_task_id} is not drained; GPU slots must remain owned"
+            )
+        if self._sync_ctx.is_sync_leader:
+            self._launched_load_tids.remove(fkv_task_id)
+        return n if success else 0
 
     def start_load_kv_layerwise(
         self,
@@ -449,10 +466,26 @@ class FlexKVConnector:
         if len(self._launched_load_tids) < threshold:
             return
         try:
-            self.kv_manager.try_wait(task_ids=list(self._launched_load_tids))
+            completed = (
+                self.kv_manager.try_wait(task_ids=list(self._launched_load_tids)) or {}
+            )
         except Exception as exc:  # noqa: BLE001
             logger.debug("[FlexKV] drain_launched_loads try_wait: %s", exc)
-        self._launched_load_tids.clear()
+            return
+        terminal = {
+            task_id
+            for task_id, response in completed.items()
+            if response.status
+            in {
+                KVResponseStatus.SUCCESS,
+                KVResponseStatus.FAILED,
+                KVResponseStatus.CANCELLED,
+                KVResponseStatus.NOTFOUND,
+            }
+        }
+        self._launched_load_tids[:] = [
+            task_id for task_id in self._launched_load_tids if task_id not in terminal
+        ]
 
     # ------------------------------------------------------------------
     # Public API — store
@@ -554,9 +587,10 @@ class FlexKVConnector:
             if self._inflight_stores:
                 fk_to_handle = {v: k for k, v in self._inflight_stores.items()}
                 try:
-                    completed_dict = self.kv_manager.try_wait(
-                        task_ids=list(fk_to_handle.keys())
-                    ) or {}
+                    completed_dict = (
+                        self.kv_manager.try_wait(task_ids=list(fk_to_handle.keys()))
+                        or {}
+                    )
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("[FlexKV] check_completed_stores: %s", exc)
                     completed_dict = {}
@@ -586,22 +620,36 @@ class FlexKVConnector:
         if fkv_task_id < 0:
             return True
         success = False
+        terminal = False
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
-                resp = self.kv_manager.wait(
-                    [fkv_task_id], timeout=timeout, completely=True
-                ) or {}
+                resp = (
+                    self.kv_manager.wait(
+                        [fkv_task_id], timeout=timeout, completely=True
+                    )
+                    or {}
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[FlexKV] wait_store: %s", exc)
             else:
                 response = resp.get(fkv_task_id)
                 success = (
-                    response is not None
-                    and response.status == KVResponseStatus.SUCCESS
+                    response is not None and response.status == KVResponseStatus.SUCCESS
                 )
+                terminal = response is not None and response.status in {
+                    KVResponseStatus.SUCCESS,
+                    KVResponseStatus.FAILED,
+                    KVResponseStatus.CANCELLED,
+                    KVResponseStatus.NOTFOUND,
+                }
         if self._sync_ctx.needs_sync:
-            payload = self._sync_ctx.scatter({"success": success})
+            payload = self._sync_ctx.scatter({"success": success, "terminal": terminal})
             success = bool(payload["success"])
+            terminal = bool(payload["terminal"])
+        if not terminal:
+            raise TimeoutError(
+                f"FlexKV store {fkv_task_id} is not drained for {handle}; GPU KV must remain owned"
+            )
         self._inflight_stores.pop(handle, None)
         return success
 
@@ -675,27 +723,52 @@ class FlexKVConnector:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def reset(self) -> None:
+    def _drain_device_io(self, timeout: float = 30.0) -> None:
+        error = None
+        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+            tasks = set(self._inflight_stores.values())
+            tasks.update(self._inflight_loads.values())
+            tasks.update(self._launched_load_tids)
+            tasks = sorted(task_id for task_id in tasks if task_id >= 0)
+            if tasks:
+                try:
+                    completed = (
+                        self.kv_manager.wait(tasks, timeout=timeout, completely=True)
+                        or {}
+                    )
+                    terminal = {
+                        KVResponseStatus.SUCCESS,
+                        KVResponseStatus.FAILED,
+                        KVResponseStatus.CANCELLED,
+                        KVResponseStatus.NOTFOUND,
+                    }
+                    pending = [
+                        task_id
+                        for task_id in tasks
+                        if task_id not in completed
+                        or completed[task_id].status not in terminal
+                    ]
+                    if pending:
+                        error = f"device I/O remains in flight: {pending}"
+                except Exception as exc:  # noqa: BLE001
+                    error = f"device I/O drain failed: {exc}"
+        if self._sync_ctx.needs_sync:
+            error = self._sync_ctx.scatter({"error": error})["error"]
+        if error is not None:
+            raise TimeoutError(f"FlexKV cannot release device state: {error}")
+
+    def reset(self, *, clear_store: bool = True) -> None:
+        self._drain_device_io()
         # Drop pending lookups (cancel their held tasks on the leader).
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             pending = [tid for tid in self._pending_lookups.values() if tid >= 0]
             if pending:
-                try:
-                    self.kv_manager.cancel(pending)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("[FlexKV] reset cancel: %s", exc)
+                self.kv_manager.cancel(pending)
         self._pending_lookups.clear()
         self._ongoing_prefetches.clear()
         self._inflight_loads.clear()
         self._completed_layerwise.clear()
         self._launched_load_tids.clear()
-        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
-            for fk_tid in list(self._inflight_stores.values()):
-                if fk_tid >= 0:
-                    try:
-                        self.kv_manager.wait([fk_tid], timeout=20.0)
-                    except Exception:  # noqa: BLE001
-                        pass
         self._inflight_stores.clear()
         if self.layer_done_counter is not None:
             self.layer_done_counter.reset()
@@ -708,11 +781,12 @@ class FlexKVConnector:
         # bookkeeping above; without this the FlexKV CPU pool keeps stale data.
         # Only the sync leader holds the KVManager; do it last so in-flight
         # lookups are cancelled and in-flight stores drained before the drop.
-        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
-            try:
-                self.kv_manager.reset()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[FlexKV] kv_manager.reset: %s", exc)
+        if (
+            clear_store
+            and self._sync_ctx.is_sync_leader
+            and self.kv_manager is not None
+        ):
+            self.kv_manager.reset()
 
     def shutdown(self) -> None:
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
@@ -870,6 +944,7 @@ class FlexKVConnector:
         logger.info("[FlexKV] Registered KV caches to server %s", self._label)
 
     def before_device_sleep(self) -> None:
+        self._drain_device_io()
         released = self.tp_client.suspend_gpu_mappings()
         logger.info(
             "[FlexKV] Suspended GPU mappings before device sleep %s: released=%d",
@@ -883,9 +958,7 @@ class FlexKVConnector:
             self._indexer_buffers,
             resume=True,
         )
-        logger.info(
-            "[FlexKV] Restored GPU mappings after device wake %s", self._label
-        )
+        logger.info("[FlexKV] Restored GPU mappings after device wake %s", self._label)
 
     def _send_pp_put_meta(self, fkv_task_id: int, unmatched_mask) -> None:
         if not self._sync_ctx.is_pp_active:

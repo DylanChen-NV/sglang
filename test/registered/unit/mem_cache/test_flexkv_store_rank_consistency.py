@@ -1,3 +1,4 @@
+import threading
 import unittest
 from contextlib import nullcontext
 from http import HTTPStatus
@@ -17,9 +18,7 @@ from sglang.srt.mem_cache.storage.flexkv.flexkv_radix_cache import FlexKVRadixCa
 class TestFlexKVStoreRankConsistency(unittest.TestCase):
     def test_registration_distinguishes_physical_and_global_kv_heads(self):
         for physical_heads, global_heads in ((8, 32), (1, 4), (1, 1)):
-            with self.subTest(
-                physical_heads=physical_heads, global_heads=global_heads
-            ):
+            with self.subTest(physical_heads=physical_heads, global_heads=global_heads):
                 connector = FlexKVConnector.__new__(FlexKVConnector)
                 connector.model_config = SimpleNamespace(
                     kv_dim=2, num_kv_heads=global_heads
@@ -37,6 +36,8 @@ class TestFlexKVStoreRankConsistency(unittest.TestCase):
                 ]
                 self.assertEqual(layout.num_head, physical_heads)
                 self.assertEqual(layout.num_kv_heads, global_heads)
+
+
 class _Fanout:
     payload = None
 
@@ -68,9 +69,7 @@ class _KVManager:
 
     def try_wait(self, *, task_ids):
         completed = (
-            task_ids
-            if self.completed_task_ids is None
-            else self.completed_task_ids
+            task_ids if self.completed_task_ids is None else self.completed_task_ids
         )
         return {
             task_id: SimpleNamespace(status=self.status)
@@ -80,9 +79,7 @@ class _KVManager:
 
     def wait(self, task_ids, *, timeout, completely):
         assert completely
-        return {
-            task_id: SimpleNamespace(status=self.status) for task_id in task_ids
-        }
+        return {task_id: SimpleNamespace(status=self.status) for task_id in task_ids}
 
 
 def _connector(*, leader: bool, fanout: _Fanout, manager=None):
@@ -91,12 +88,93 @@ def _connector(*, leader: bool, fanout: _Fanout, manager=None):
     connector._sync_ctx = _SyncContext(leader=leader, fanout=fanout)
     connector.kv_manager = manager
     connector._inflight_stores = {}
+    connector._inflight_loads = {}
+    connector._launched_load_tids = []
+    connector._pending_lookups = {}
+    connector._ongoing_prefetches = {}
+    connector._completed_layerwise = []
+    connector.layer_done_counter = None
     connector._send_pp_put_meta = lambda *_args: None
     connector._send_slot_mapping_to_remote = lambda *_args: None
     return connector
 
 
 class TestFlexKVStoreOwnership(unittest.TestCase):
+    def test_incomplete_load_cannot_release_gpu_slots(self):
+        fanout = _Fanout()
+        manager = mock.MagicMock()
+        manager.wait.return_value = {}
+        leader = _connector(leader=True, fanout=fanout, manager=manager)
+        follower = _connector(leader=False, fanout=fanout)
+        handle = CacheRequestHandle("load", 0)
+        for connector in (leader, follower):
+            connector._pending_lookups[handle] = 41
+            connector._sync_ctx.should_send_slot_mapping_to_remote = False
+            with self.assertRaisesRegex(TimeoutError, "slots must remain owned"):
+                connector.retrieve_kv(handle, torch.tensor([1, 2]))
+        self.assertEqual(leader._launched_load_tids, [41])
+        manager.wait.assert_called_once_with([41], timeout=30.0, completely=True)
+
+    def test_failed_load_returns_same_result_on_all_ranks(self):
+        fanout = _Fanout()
+        manager = _KVManager(KVResponseStatus.FAILED)
+        manager.launch = mock.Mock()
+        leader = _connector(leader=True, fanout=fanout, manager=manager)
+        follower = _connector(leader=False, fanout=fanout)
+        handle = CacheRequestHandle("load", 0)
+        for connector in (leader, follower):
+            connector._pending_lookups[handle] = 41
+            connector._sync_ctx.should_send_slot_mapping_to_remote = False
+            self.assertEqual(connector.retrieve_kv(handle, torch.tensor([1, 2])), 0)
+        self.assertEqual(leader._launched_load_tids, [])
+
+    def test_pending_retract_store_keeps_ownership_on_every_rank(self):
+        fanout = _Fanout()
+        manager = _KVManager()
+        manager.wait = mock.Mock(return_value={})
+        leader = _connector(leader=True, fanout=fanout, manager=manager)
+        follower = _connector(leader=False, fanout=fanout)
+        handle = CacheRequestHandle("req", 0)
+        for connector in (leader, follower):
+            connector._inflight_stores[handle] = 41
+            with self.assertRaisesRegex(TimeoutError, "must remain owned"):
+                connector.wait_store(handle, timeout=0.0)
+            self.assertEqual(connector._inflight_stores, {handle: 41})
+
+    def test_sleep_does_not_unmap_pending_device_io(self):
+        manager = _KVManager()
+        manager.wait = mock.Mock(return_value={})
+        connector = _connector(leader=True, fanout=_Fanout(), manager=manager)
+        connector.tp_client = mock.Mock()
+        connector._launched_load_tids = [41]
+        with self.assertRaisesRegex(TimeoutError, "remains in flight"):
+            connector.before_device_sleep()
+        connector.tp_client.suspend_gpu_mappings.assert_not_called()
+        self.assertEqual(connector._launched_load_tids, [41])
+
+    def test_local_reset_does_not_reset_backing_store(self):
+        manager = _KVManager()
+        manager.reset = mock.Mock()
+        connector = _connector(leader=True, fanout=_Fanout(), manager=manager)
+        connector.reset(clear_store=False)
+        manager.reset.assert_not_called()
+        connector.reset()
+        manager.reset.assert_called_once()
+
+    def test_abort_cleanup_retains_store_pin(self):
+        handle = CacheRequestHandle("req", 0)
+        node = object()
+        cache = FlexKVRadixCache.__new__(FlexKVRadixCache)
+        cache._load_markers = {handle: object()}
+        cache._inflight_store_nodes = {handle: node}
+        cache._node_lock = threading.Lock()
+        cache.flexkv_connector = mock.Mock()
+        cache.dec_lock_ref = mock.Mock()
+        cache.release_aborted_request(handle)
+        self.assertEqual(cache._inflight_store_nodes, {handle: node})
+        cache.dec_lock_ref.assert_not_called()
+        cache.flexkv_connector.release_pending.assert_called_once_with(handle)
+
     def test_store_and_completion_are_rank_consistent(self):
         fanout = _Fanout()
         manager = _KVManager()
@@ -184,7 +262,9 @@ class TestFlexKVStoreOwnership(unittest.TestCase):
         self.assertEqual(store_call["handle"], req.cache_request_handle)
         self.assertEqual(store_call["token_ids"], [1, 2, 3])
         self.assertEqual(store_call["kv_indices"].tolist(), [10, 11, 12])
-        connector.wait_store.assert_called_once_with(req.cache_request_handle, timeout=7.0)
+        connector.wait_store.assert_called_once_with(
+            req.cache_request_handle, timeout=7.0
+        )
 
     def test_hybrid_ssm_is_rejected_before_cache_construction(self):
         ctx = SimpleNamespace(is_hybrid_ssm=True)
@@ -209,16 +289,12 @@ class TestFlexKVStoreOwnership(unittest.TestCase):
         )
 
         req.checkpoint_aborted_kv = False
-        self.assertEqual(
-            FlexKVRadixCache._finished_store_event(req), "cancel_abort"
-        )
+        self.assertEqual(FlexKVRadixCache._finished_store_event(req), "cancel_abort")
 
         req.finished_reason = reason(
             "abort", status_code=HTTPStatus.INTERNAL_SERVER_ERROR
         )
-        self.assertEqual(
-            FlexKVRadixCache._finished_store_event(req), "error_abort"
-        )
+        self.assertEqual(FlexKVRadixCache._finished_store_event(req), "error_abort")
 
     def test_abort_req_carries_checkpoint_intent(self):
         from sglang.srt.managers.io_struct import AbortReq
