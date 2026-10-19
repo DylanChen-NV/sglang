@@ -698,10 +698,10 @@ class FlexKVConnector:
         return done
 
     def cancel_prefetch(self, handle: CacheRequestHandle) -> None:
-        self._pending_lookups.pop(handle, None)
-        # FlexKV doesn't currently support prefetch cancellation, but
-        # we still drop our tracking entry.
-        self._ongoing_prefetches.pop(handle, None)
+        # FlexKV cannot cancel a launched prefetch. Keep it tracked so reset
+        # drains its CPU transfer before freeing the external pool. Held lookups
+        # are cancelled separately by release_pending().
+        return None
 
     # ------------------------------------------------------------------
     # Layerwise transfer hooks
@@ -729,6 +729,7 @@ class FlexKVConnector:
             tasks = set(self._inflight_stores.values())
             tasks.update(self._inflight_loads.values())
             tasks.update(self._launched_load_tids)
+            tasks.update(self._ongoing_prefetches.values())
             tasks = sorted(task_id for task_id in tasks if task_id >= 0)
             if tasks:
                 try:

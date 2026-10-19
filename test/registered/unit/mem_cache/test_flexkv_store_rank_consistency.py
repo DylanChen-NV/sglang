@@ -100,6 +100,19 @@ def _connector(*, leader: bool, fanout: _Fanout, manager=None):
 
 
 class TestFlexKVStoreOwnership(unittest.TestCase):
+    def test_aborted_prefetch_remains_tracked_until_reset_drains_it(self):
+        manager = _KVManager()
+        manager.reset = mock.Mock()
+        manager.wait = mock.Mock(return_value={})
+        connector = _connector(leader=True, fanout=_Fanout(), manager=manager)
+        handle = CacheRequestHandle("prefetch", 0)
+        connector._ongoing_prefetches[handle] = 41
+        connector.cancel_prefetch(handle)
+        with self.assertRaisesRegex(TimeoutError, "remains in flight"):
+            connector.reset()
+        manager.reset.assert_not_called()
+        self.assertEqual(connector._ongoing_prefetches, {handle: 41})
+
     def test_incomplete_load_cannot_release_gpu_slots(self):
         fanout = _Fanout()
         manager = mock.MagicMock()
