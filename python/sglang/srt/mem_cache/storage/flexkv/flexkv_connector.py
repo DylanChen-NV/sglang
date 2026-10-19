@@ -467,7 +467,10 @@ class FlexKVConnector:
             return
         try:
             completed = (
-                self.kv_manager.try_wait(task_ids=list(self._launched_load_tids)) or {}
+                self.kv_manager.wait(
+                    list(self._launched_load_tids), timeout=0.0, completely=True
+                )
+                or {}
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("[FlexKV] drain_launched_loads try_wait: %s", exc)
@@ -587,8 +590,12 @@ class FlexKVConnector:
             if self._inflight_stores:
                 fk_to_handle = {v: k for k, v in self._inflight_stores.items()}
                 try:
+                    # try_wait may acknowledge task_end before the full graph
+                    # and publication callbacks finish. Poll without blocking.
                     completed_dict = (
-                        self.kv_manager.try_wait(task_ids=list(fk_to_handle.keys()))
+                        self.kv_manager.wait(
+                            list(fk_to_handle), timeout=0.0, completely=True
+                        )
                         or {}
                     )
                 except Exception as exc:  # noqa: BLE001

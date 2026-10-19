@@ -8,6 +8,7 @@ from unittest import mock
 import numpy as np
 import torch
 from flexkv.common.request import KVResponseStatus
+from flexkv.kvtask import KVTaskEngine, TaskStatus, TaskType
 
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
@@ -79,7 +80,17 @@ class _KVManager:
 
     def wait(self, task_ids, *, timeout, completely):
         assert completely
-        return {task_id: SimpleNamespace(status=self.status) for task_id in task_ids}
+        return {
+            task_id: SimpleNamespace(
+                status=(
+                    self.status
+                    if self.completed_task_ids is None
+                    or task_id in self.completed_task_ids
+                    else KVResponseStatus.TIMEOUT
+                )
+            )
+            for task_id in task_ids
+        }
 
 
 def _connector(*, leader: bool, fanout: _Fanout, manager=None):
@@ -100,6 +111,49 @@ def _connector(*, leader: bool, fanout: _Fanout, manager=None):
 
 
 class TestFlexKVStoreOwnership(unittest.TestCase):
+    def test_real_backend_zero_timeout_wait_requires_complete_graph(self):
+        backend = KVTaskEngine.__new__(KVTaskEngine)
+        task = SimpleNamespace(
+            status=TaskStatus.RUNNING,
+            task_end_op_finished=True,
+            task_type=TaskType.PUT,
+            transfer_failed=False,
+            return_mask=None,
+        )
+        task.is_completed = lambda: task.status == TaskStatus.COMPLETED
+        backend.tasks = {41: task}
+        backend._update_tasks = lambda **_kwargs: None
+        backend._process_empty_graph = lambda _task_id: None
+        backend._release_task = mock.Mock()
+        self.assertTrue(backend.check_completed(41, completely=False))
+        self.assertEqual(
+            backend._wait_impl([41], timeout=0.0, completely=True)[41].status,
+            KVResponseStatus.TIMEOUT,
+        )
+        backend._release_task.assert_not_called()
+        task.status = TaskStatus.COMPLETED
+        self.assertEqual(
+            backend._wait_impl([41], timeout=0.0, completely=True)[41].status,
+            KVResponseStatus.SUCCESS,
+        )
+        backend._release_task.assert_called_once_with(41)
+
+    def test_poll_does_not_accept_an_early_task_end_acknowledgement(self):
+        manager = mock.MagicMock()
+        manager.try_wait.return_value = {
+            41: SimpleNamespace(status=KVResponseStatus.SUCCESS)
+        }
+        manager.wait.return_value = {
+            41: SimpleNamespace(status=KVResponseStatus.TIMEOUT)
+        }
+        connector = _connector(leader=True, fanout=_Fanout(), manager=manager)
+        handle = CacheRequestHandle("store", 0)
+        connector._inflight_stores[handle] = 41
+        self.assertEqual(connector.check_completed_stores(), [])
+        self.assertEqual(connector._inflight_stores, {handle: 41})
+        manager.wait.assert_called_once_with([41], timeout=0.0, completely=True)
+        manager.try_wait.assert_not_called()
+
     def test_aborted_prefetch_remains_tracked_until_reset_drains_it(self):
         manager = _KVManager()
         manager.reset = mock.Mock()
