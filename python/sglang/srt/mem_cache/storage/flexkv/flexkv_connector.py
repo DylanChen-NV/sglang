@@ -34,7 +34,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.storage.flexkv.flexkv_comm import (
     CMD_LAYERWISE,
@@ -259,11 +258,14 @@ class FlexKVConnector:
         token_ids: List[int],
         token_mask: torch.Tensor,
         handle: Optional[CacheRequestHandle] = None,
+        refresh_on_miss: bool = False,
     ) -> Tuple[int, int]:
         """Page-aligned prefix lookup against FlexKV.
 
         Args:
           token_ids: full token id sequence we'd like to check.
+          refresh_on_miss: consume a trusted checkpoint-retry hint; ask FlexKV
+            for one bounded distributed-index refresh if the prefix is missing.
           token_mask: 1-D bool tensor or array, True for "this token is
             *not* already on GPU and is a candidate for load-back".
           handle: if set and hit > 0, the held FlexKV task id is stashed
@@ -283,7 +285,10 @@ class FlexKVConnector:
             tids_np = np.asarray(token_ids, dtype=np.int64)
             mask_np = self._as_numpy_mask(token_mask)
             try:
-                res = self.kv_manager.get_match(token_ids=tids_np, token_mask=mask_np)
+                options = {"refresh_on_miss": True} if refresh_on_miss else {}
+                res = self.kv_manager.get_match(
+                    token_ids=tids_np, token_mask=mask_np, **options
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[FlexKV] get_match raised: %s", exc)
                 res = None

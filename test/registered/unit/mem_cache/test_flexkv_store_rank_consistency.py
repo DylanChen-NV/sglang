@@ -9,11 +9,53 @@ import numpy as np
 import torch
 from flexkv.common.request import KVResponseStatus
 from flexkv.kvtask import KVTaskEngine, TaskStatus, TaskType
-
+from sglang.srt.managers.kv_hints import decode_kv_hints_envelope
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
 from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import FlexKVConnector
 from sglang.srt.mem_cache.storage.flexkv.flexkv_radix_cache import FlexKVRadixCache
+
+
+class TestFlexKVRefreshHint(unittest.TestCase):
+    def test_only_supported_action_is_consumed_once(self):
+        for kind, version, expected in (
+            ("flexkv.refresh_on_miss", "1", True),
+            ("other.action", "1", False),
+            ("flexkv.refresh_on_miss", "2", False),
+        ):
+            req = SimpleNamespace(
+                kv_hints=decode_kv_hints_envelope(
+                    {
+                        "protocol_version": "1",
+                        "message_id": "retry",
+                        "actions": [
+                            {
+                                "action_id": "refresh",
+                                "action_type": kind,
+                                "action_version": version,
+                            }
+                        ],
+                    }
+                )
+            )
+            self.assertEqual(FlexKVRadixCache._consume_refresh_hint(req), expected)
+            self.assertFalse(FlexKVRadixCache._consume_refresh_hint(req))
+        self.assertFalse(FlexKVRadixCache._consume_refresh_hint(None))
+        self.assertFalse(FlexKVRadixCache._consume_refresh_hint(SimpleNamespace()))
+
+    def test_connector_only_forwards_opted_in_refresh(self):
+        connector = FlexKVConnector.__new__(FlexKVConnector)
+        connector.page_size = 1
+        connector._sync_ctx = SimpleNamespace(is_sync_leader=True, needs_sync=False)
+        connector.kv_manager = mock.Mock()
+        connector.kv_manager.get_match.return_value = (42, np.zeros(4, dtype=bool))
+        for enabled in (False, True):
+            connector.lookup_kv(
+                [1, 2, 3, 4], torch.ones(4, dtype=torch.bool), refresh_on_miss=enabled
+            )
+            options = connector.kv_manager.get_match.call_args.kwargs
+            self.assertEqual(options.get("refresh_on_miss", False), enabled)
+            self.assertEqual("refresh_on_miss" in options, enabled)
 
 
 class TestFlexKVStoreRankConsistency(unittest.TestCase):

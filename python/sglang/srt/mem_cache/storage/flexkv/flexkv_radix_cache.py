@@ -33,7 +33,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
-
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     EvictParams,
@@ -214,7 +213,24 @@ class FlexKVRadixCache(RadixCache):
             if params.req is None:
                 return base_res
             return self._mp_match_prefix(key, base_res, last_node, params.req)
-        return self._ip_match_prefix(key, base_res, last_node)
+        return self._ip_match_prefix(key, base_res, last_node, params.req)
+
+    @staticmethod
+    def _consume_refresh_hint(req: Optional[Req]) -> bool:
+        """A trusted orchestrator may request ONE fresh distributed lookup."""
+        if req is None or getattr(req, "_flexkv_refresh_hint_consumed", False):
+            return False
+        hints = getattr(req, "kv_hints", None)
+        if hints is None or hints.protocol_version != "1":
+            return False
+        for action in hints.actions:
+            if (
+                action.action_type == "flexkv.refresh_on_miss"
+                and action.action_version == "1"
+            ):
+                req._flexkv_refresh_hint_consumed = True
+                return True
+        return False
 
     def _mp_match_prefix(
         self,
@@ -236,7 +252,10 @@ class FlexKVRadixCache(RadixCache):
         token_mask[device_len:] = True
 
         fkv_task_id, hit = self.flexkv_connector.lookup_kv(
-            token_ids=token_ids, token_mask=token_mask, handle=req.cache_request_handle
+            token_ids=token_ids,
+            token_mask=token_mask,
+            handle=req.cache_request_handle,
+            **({"refresh_on_miss": True} if self._consume_refresh_hint(req) else {}),
         )
         if hit <= 0:
             return base_res
@@ -268,6 +287,7 @@ class FlexKVRadixCache(RadixCache):
         key: RadixKey,
         base_res: MatchResult,
         last_node: TreeNode,
+        req: Optional[Req] = None,
     ) -> MatchResult:
         """Layerwise path: allocate slots and fire ``start_load_kv_layerwise``
         immediately. Per-layer hook waits during forward."""
@@ -282,7 +302,10 @@ class FlexKVRadixCache(RadixCache):
         # No handle here — IP mode self-pops; pass a synthetic stable key.
         synthetic_handle = CacheRequestHandle(f"_ip_{id(key)}", 0)
         _, hit = self.flexkv_connector.lookup_kv(
-            token_ids=token_ids, token_mask=token_mask, handle=synthetic_handle
+            token_ids=token_ids,
+            token_mask=token_mask,
+            handle=synthetic_handle,
+            **({"refresh_on_miss": True} if self._consume_refresh_hint(req) else {}),
         )
         if hit <= 0:
             return base_res
