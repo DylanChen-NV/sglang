@@ -1183,17 +1183,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
                 if mm_input is None or rl_on_policy_target is not None:
                     # text only
-                    mrope_positions = torch.tensor(
-                        [
-                            [
-                                pos
-                                for pos in range(
-                                    extend_prefix_len,
-                                    extend_prefix_len + extend_seq_len,
-                                )
-                            ]
-                        ]
-                        * 3
+                    # Build positions directly to avoid Python integer lists and
+                    # recursive dtype inference for long text prefills. cat below
+                    # materializes the expanded rows before transfer to the device.
+                    mrope_positions = (
+                        torch.arange(
+                            extend_prefix_len,
+                            extend_prefix_len + extend_seq_len,
+                            dtype=torch.int64,
+                        )
+                        .unsqueeze(0)
+                        .expand(3, -1)
                     )
                 else:
                     mrope_positions = mm_input.mrope_positions[
