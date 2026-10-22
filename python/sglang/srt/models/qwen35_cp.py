@@ -24,6 +24,17 @@ def enabled():
     return getattr(get_server_args(), "enable_qwen35_cp_prefill", False)
 
 
+def uses_reference_kernels(batch):
+    """Cold CP owns kernel metadata; SGLang still owns the persistent pools."""
+    return (
+        enabled()
+        and batch.forward_mode.name == "EXTEND"
+        and batch.batch_size == 1
+        and batch.extend_prefix_lens_cpu == [0]
+        and not batch.return_logprob
+    )
+
+
 def split_rows(length, ratio=0.48, minimum=4096):
     if length < 1 or not 0 < ratio < 1:
         raise ValueError("invalid CP length or ratio")
