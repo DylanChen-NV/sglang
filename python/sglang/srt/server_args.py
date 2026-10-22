@@ -1105,6 +1105,11 @@ class ServerArgs:
         "Enable the replicated-weight two-GPU Qwen3.5 reference CP cold-prefill path (M2).",
         NS("exec"),
     ] = False
+    enable_qwen35_cp_prefix_cache: A[
+        bool,
+        "Enable native hybrid prefix caching for the Qwen3.5 CP executor (one active request).",
+        NS("exec"),
+    ] = False
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
@@ -5058,6 +5063,8 @@ class ServerArgs:
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
 
+        if self.enable_qwen35_cp_prefix_cache and not self.enable_qwen35_cp_prefill:
+            raise ValueError("CP prefix cache requires --enable-qwen35-cp-prefill")
         if self.enable_qwen35_cp_prefill:
             if model_arch not in ("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"):
                 raise ValueError("reference CP prefill is supported for Qwen3.5 MoE only")

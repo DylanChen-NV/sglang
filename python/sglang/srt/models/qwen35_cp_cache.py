@@ -1,0 +1,216 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Native hybrid-cache extension of the replicated-weight CP executor.
+
+Only request working/track slots are written here. The scheduler and native
+radix cache retain all ownership, COW, publication, locking and eviction.
+"""
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+
+
+def checkpoint_offset(prefix, length, track_seqlen, chunk_size):
+    offset = (track_seqlen - prefix) // chunk_size * chunk_size
+    if not 0 < offset <= length:
+        raise ValueError("CP checkpoint does not lie inside the new-token interval")
+    return offset
+
+
+def _gather_heads(tensor, ctx):
+    parts = [torch.empty_like(tensor), torch.empty_like(tensor)]
+    dist.all_gather(parts, tensor.contiguous(), group=ctx.group)
+    return parts
+
+
+def initialize(ctx, args):
+    if args.disable_radix_cache or not args.enable_mamba_extra_buffer():
+        raise ValueError("CP prefix reuse requires enabled radix cache and extra_buffer Mamba tracking")
+    pool = ctx.backend.req_to_token_pool
+    if pool.mamba_ckpt_pool is not None:
+        raise ValueError("CP prefix reuse requires unquantized FP32 checkpoints")
+    ctx.prefix = int(ctx.batch.extend_prefix_lens_cpu[0])
+    ctx.total = ctx.prefix + ctx.length
+    if ctx.prefix < 0 or ctx.total > args.context_length:
+        raise ValueError("CP prefix/new-token interval exceeds context capacity")
+    ctx.prefix_loc = pool.req_to_token[ctx.batch.req_pool_indices[0], :ctx.prefix].long()
+    ctx.initial_states = None
+    ctx.checkpoint_states, ctx.checkpoint_convs = [], []
+    ctx.track = 0
+    mask = ctx.batch.mamba_track_mask
+    if mask is not None and bool(mask[0].item()):
+        ctx.track = checkpoint_offset(ctx.prefix, ctx.length,
+            int(ctx.batch.mamba_track_seqlens[0].item()), args.mamba_cache_chunk_size)
+        ctx.track_owner = 0 if ctx.track <= ctx.rows[0][1] else 1
+        ctx.track_slot = pool.translate_mamba_indices(ctx.batch.mamba_track_indices[:1])
+        cut = ctx.track - ctx.start if ctx.rank == ctx.track_owner else 0
+        if 0 < cut < ctx.size:
+            if cut % 64:
+                raise ValueError("CP GDN checkpoint must align with the native 64-token kernel chunk")
+            ctx.checkpoint_count = ctx.size // cut
+            ctx.checkpoint_cu_starts = torch.tensor([0, ctx.checkpoint_count], dtype=torch.int32, device=ctx.loc.device)
+    if ctx.prefix:
+        mid = pool.translate_mamba_indices(pool.get_mamba_indices(ctx.batch.req_pool_indices))
+        cache = pool.mamba_pool.mamba_cache
+        # ModelRunner has completed deferred COW on this same forward stream.
+        states = _gather_heads(cache.temporal[:, mid[0]].contiguous(), ctx)
+        ctx.initial_states = torch.cat(states, dim=1)
+        convs = _gather_heads(cache.conv[0][:, mid[0]].contiguous(), ctx)
+        groups = [c.split((1024, 1024, 2048), dim=1) for c in convs]
+        ctx.convs.copy_(torch.cat([torch.cat([groups[r][g] for r in (0, 1)], dim=1)
+                                   for g in range(3)], dim=1))
+        ctx.has_initial.fill_(True)
+        ctx.seq_len.fill_(ctx.total)
+        ctx.cu_kv = torch.tensor([0, ctx.total], dtype=torch.int32, device=ctx.loc.device)
+
+
+def _conv_shard(convs, rank):
+    return torch.cat([g[:, rank*(g.shape[1]//2):(rank+1)*(g.shape[1]//2)]
+                      for g in convs.split((2048, 2048, 4096), dim=1)], dim=1).contiguous()
+
+
+def persist_checkpoint(ctx):
+    if not ctx.track:
+        return
+    if ctx.rank == ctx.track_owner:
+        full = torch.cat(ctx.checkpoint_states)
+        convs = torch.cat(ctx.checkpoint_convs)
+        local = full[:, ctx.rank*16:(ctx.rank+1)*16]
+        conv = _conv_shard(convs, ctx.rank)
+        ctx.exchange(send=full[:, (1-ctx.rank)*16:(2-ctx.rank)*16].contiguous())
+        ctx.exchange(send=_conv_shard(convs, 1-ctx.rank))
+    else:
+        local = torch.empty(30, 16, 128, 128, dtype=torch.float32, device=ctx.loc.device)
+        conv = torch.empty(30, 4096, 3, dtype=torch.bfloat16, device=ctx.loc.device)
+        ctx.exchange(recv=local)
+        ctx.exchange(recv=conv)
+    cache = ctx.backend.req_to_token_pool.mamba_pool.mamba_cache
+    cache.temporal[:, ctx.track_slot] = local[:, None]
+    cache.conv[0][:, ctx.track_slot] = conv[:, None]
+    ctx.checkpoint_states.clear()
+    ctx.checkpoint_convs.clear()
+
+
+def attention(layer, x, positions, ctx):
+    """Ulysses for new queries, attending to cached prefix plus new keys."""
+    import flashinfer
+    from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import fused_qk_gemma_rmsnorm_rope_gate
+    from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+    from sglang.srt.models.qwen35_cp import copy_rows
+    from sglang.srt.runtime_context import get_server_args
+
+    w, r, E, L, P = layer.weights, ctx.rank, ctx.size, ctx.length, ctx.prefix
+    bf = dict(dtype=torch.bfloat16, device=ctx.loc.device)
+    s, e = ctx.start, ctx.end
+    ps, pe = ctx.rows[1-r]
+    qa = torch.empty(L, 8, 256, **bf)
+    send = torch.empty(E, 2560, **bf)
+    if E:
+        qg, k, v = F.linear(x, w['qkv']).split([8192, 512, 512], -1)
+        q, k, gate = fused_qk_gemma_rmsnorm_rope_gate(qg, k, w['qn'], w['kn'],
+            ctx.rope, positions, 1e-6, 16, 2, 256, 64, has_gate=True)
+        q, k, v = q.view(E, 2, 8, 256), k.view(E, 2, 256), v.view(E, 2, 256)
+        copy_rows(qa[s:e], q[:, r])
+        copy_rows(ctx.kh[P+s:P+e, 0], k[:, r])
+        copy_rows(ctx.vh[P+s:P+e, 0], v[:, r])
+        copy_rows(send[:, :2048].view(E, 8, 256), q[:, 1-r])
+        copy_rows(send[:, 2048:2304], k[:, 1-r])
+        copy_rows(send[:, 2304:], v[:, 1-r])
+    recv = torch.empty(pe-ps, 2560, **bf)
+    ctx.exchange(send, recv)
+    if pe > ps:
+        copy_rows(qa[ps:pe], recv[:, :2048].view(-1, 8, 256))
+        copy_rows(ctx.kh[P+ps:P+pe, 0], recv[:, 2048:2304])
+        copy_rows(ctx.vh[P+ps:P+pe, 0], recv[:, 2304:])
+    pool = ctx.backend.token_to_kv_pool
+    ctx.kh[:P].copy_(pool.get_key_buffer(layer.layer_id)[ctx.prefix_loc])
+    ctx.vh[:P].copy_(pool.get_value_buffer(layer.layer_id)[ctx.prefix_loc])
+    pool.set_kv_buffer(layer, ctx.loc, ctx.kh[P:P+L], ctx.vh[P:P+L])
+    kc = ctx.kh.view(-1, 64, 1, 256).permute(0, 2, 1, 3)
+    vc = ctx.vh.view(-1, 64, 1, 256).permute(0, 2, 1, 3)
+    out = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+        query=qa, kv_cache=(kc, vc), workspace_buffer=ctx.workspace,
+        block_tables=ctx.page_table, seq_lens=ctx.seq_len, max_q_len=L,
+        max_kv_len=get_server_args().context_length, bmm1_scale=256**-0.5,
+        bmm2_scale=1.0, batch_size=1, cum_seq_lens_q=ctx.cu_full,
+        cum_seq_lens_kv=ctx.cu_kv, window_left=-1, out_dtype=torch.bfloat16)
+    combined = torch.empty(E, 2, 8, 256, **bf)
+    copy_rows(combined[:, r], out[s:e])
+    recv = torch.empty(E, 8, 256, **bf)
+    ctx.exchange(out[ps:pe], recv)
+    copy_rows(combined[:, 1-r], recv)
+    if not E:
+        return x
+    return F.linear(fused_sigmoid_mul(combined.reshape(E, 4096), gate, inplace=True), w['o'])
+
+
+def gdn(layer, x, ctx):
+    from flashinfer.gdn_prefill import chunk_gated_delta_rule
+    from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
+    from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+    from sglang.kernels.ops.attention.fla.layernorm_gated import layernorm_fn
+    from sglang.kernels.ops.attention.triton_gdn_fused_proj import fused_qkv_split_gdn_prefill
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_fn
+
+    w, E, r = layer.weights, ctx.size, ctx.rank
+    if not E:
+        return x
+    conv = ctx.convs[layer.linear_id:layer.linear_id+1]
+    if ctx.single:
+        qkvz = F.linear(x, layer._qkvz)
+        mixed, z = qkvz[:, :8192].contiguous(), qkvz[:, 8192:].reshape(E, 32, 128)
+    else:
+        mixed, z = F.linear(x, w['qkvw']), F.linear(x, w['zw']).view(E, 32, 128)
+    ba = F.linear(x, w['ba'])
+    b, a = ba[:, :32].contiguous(), ba[:, 32:].contiguous()
+    if not ctx.single:
+        halo = torch.empty(3, 8192, dtype=mixed.dtype, device=x.device)
+        ctx.exchange(mixed[-3:].contiguous() if r == 0 else None, halo if r == 1 else None)
+        if r == 1:
+            conv[0].copy_(halo.T)
+    cut = ctx.track - ctx.start if ctx.track and ctx.track_owner == r else 0
+    checkpoint_conv = None
+    if cut:
+        history = torch.cat([conv[0].T, mixed[:cut]], dim=0)
+        checkpoint_conv = history[-3:].T.contiguous()[None]
+    xc = causal_conv1d_fn(mixed.T, w['conv'], None, conv_states=conv,
+        query_start_loc=ctx.cu_local, seq_lens_cpu=[E], cache_indices=ctx.zero_slot,
+        has_initial_state=ctx.has_initial, activation='silu').T[:E]
+    q, k, v = fused_qkv_split_gdn_prefill(xc, 16, 16, 32, 128, 128, 128)
+    g, beta = fused_gdn_gating(w['A_log'], a, b, w['dt_bias'])
+    q, k, v = l2norm_fwd(q[0].contiguous()), l2norm_fwd(k[0].contiguous()), v[0].contiguous()
+    alpha, beta = torch.exp(g[0].float()), beta[0].float()
+
+    def run(values, initial):
+        options = {}
+        checkpoints = None
+        if 0 < cut < E:
+            checkpoints = torch.empty(ctx.checkpoint_count,32,128,128,dtype=torch.float32,device=x.device)
+            options = dict(state_checkpoints=checkpoints, checkpoint_cu_starts=ctx.checkpoint_cu_starts,
+                           checkpoint_every_n_tokens=cut)
+        out,state = chunk_gated_delta_rule(q=q, k=k, v=values, g=alpha, beta=beta,
+            scale=None, initial_state=initial, output_final_state=True, cu_seqlens=ctx.cu_local,
+            use_qk_l2norm_in_kernel=False, output_state=torch.empty_like(initial), **options)
+        checkpoint = checkpoints[:1].clone() if checkpoints is not None else (state if cut == E else None)
+        return out,state,checkpoint
+
+    initial = ctx.initial_states[layer.linear_id:layer.linear_id+1] if ctx.prefix and r == 0 else ctx.zero_state
+    out, state, checkpoint = run(v, initial)
+    if not ctx.single:
+        if r == 0:
+            ctx.exchange(send=state)
+        else:
+            u, transition, checkpoint_transition = run(ctx.zero_v[:E], ctx.eye)
+            previous = torch.empty_like(state)
+            ctx.exchange(recv=previous)
+            out.transpose(0, 1).baddbmm_(u.transpose(0, 1), previous[0].to(u.dtype).transpose(1, 2))
+            state = (torch.bmm(previous[0].float(), transition[0].float()) + state[0].float())[None]
+            if cut:
+                checkpoint = (torch.bmm(previous[0].float(), checkpoint_transition[0].float()) + checkpoint[0].float())[None]
+    if r == (0 if ctx.single else 1):
+        ctx.final_states.append(state)
+    if cut:
+        ctx.checkpoint_states.append(checkpoint)
+        ctx.checkpoint_convs.append(checkpoint_conv)
+    y = layernorm_fn(out.reshape(-1, 128), w['gnorm'], None, z=z.reshape(-1, 128),
+        eps=1e-6, group_size=None, norm_before_gate=True, is_rms_norm=True, activation='swish')
+    return F.linear(y.view(E, 4096), w['out'])

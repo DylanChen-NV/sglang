@@ -4,7 +4,7 @@
 Algorithm reference: AliceChenyy/qwen35-1p1d@d4cfed0,
 q35rt/prefill/{engine,cp}.py. Keep the reference operations and precision;
 SGLang owns request allocation, persistent pools, sampling and scheduling.
-This first implementation deliberately rejects nonzero prefixes.
+Native prefix reuse is opt-in through the CP prefix-cache extension.
 """
 
 import math
@@ -30,18 +30,22 @@ def uses_reference_kernels(batch):
         enabled()
         and batch.forward_mode.name == "EXTEND"
         and batch.batch_size == 1
-        and batch.extend_prefix_lens_cpu == [0]
+        and len(batch.extend_prefix_lens_cpu) == 1
+        and batch.extend_prefix_lens_cpu[0] >= 0
         and not batch.return_logprob
     )
 
 
-def split_rows(length, ratio=0.48, minimum=4096):
+def split_rows(length, ratio=0.48, minimum=4096, align_cut=False):
     if length < 1 or not 0 < ratio < 1:
         raise ValueError("invalid CP length or ratio")
     if length < minimum:
         return ((0, length), (length, length))
     n1 = int(length * ratio) // 64 * 64
-    rows = ((0, length - n1), (length - n1, length))
+    cut = length - n1
+    if align_cut:
+        cut = cut // 64 * 64
+    rows = ((0, cut), (cut, length))
     if max(b - a for a, b in rows) > 49152:
         raise ValueError("CP per-rank rows exceed the reference 49152 limit")
     return rows
@@ -95,9 +99,9 @@ class CPContext:
     def exchange(self, send=None, recv=None):
         peer = dist.get_global_rank(self.group, 1 - self.rank)
         ops = []
-        if send is not None:
+        if send is not None and send.numel():
             ops.append(dist.P2POp(dist.isend, send, peer, self.group))
-        if recv is not None:
+        if recv is not None and recv.numel():
             ops.append(dist.P2POp(dist.irecv, recv, peer, self.group))
         for work in dist.batch_isend_irecv(ops):
             work.wait()
@@ -125,7 +129,8 @@ def make_context(model, input_ids, batch):
     from sglang.srt.runtime_context import get_parallel, get_server_args
 
     args = get_server_args()
-    if not args.disable_radix_cache or args.chunked_prefill_size != -1:
+    reuse = getattr(args, "enable_qwen35_cp_prefix_cache", False)
+    if (not reuse and not args.disable_radix_cache) or args.chunked_prefill_size != -1:
         raise ValueError("M2 CP requires --disable-radix-cache --chunked-prefill-size -1")
     if args.mamba_ssm_dtype != "float32":
         raise ValueError("M2 CP requires --mamba-ssm-dtype float32 to retain reference state precision")
@@ -133,7 +138,7 @@ def make_context(model, input_ids, batch):
         raise ValueError("Qwen3.5 reference CP requires TP world 2 and PP 1")
     if batch.forward_mode.name != "EXTEND" or batch.batch_size != 1:
         raise ValueError("M2 CP supports one cold extend request only")
-    if batch.extend_prefix_lens_cpu != [0]:
+    if not reuse and batch.extend_prefix_lens_cpu != [0]:
         raise ValueError("M2 CP rejects prefix reuse")
     if batch.return_logprob:
         raise ValueError("M2 CP does not support prompt logprobs")
@@ -158,7 +163,7 @@ def make_context(model, input_ids, batch):
     model._cp_scratch["convs"].zero_()
     ctx = CPContext(length, get_parallel().tp_rank,
                     get_parallel().tp_group.device_group,
-                    split_rows(length), batch.out_cache_loc.long(), batch,
+                    split_rows(length, align_cut=reuse), batch.out_cache_loc.long(), batch,
                     **model._cp_scratch,
                     diagnostic_root=os.environ.get("Q35_CP_LAYER_DIAGNOSTICS"))
     batch.qwen35_cp_context = ctx
@@ -170,6 +175,11 @@ def make_context(model, input_ids, batch):
     ctx.cu_full = torch.tensor([0, length], dtype=torch.int32, device=dev)
     ctx.cu_local = torch.tensor([0, ctx.size], dtype=torch.int32, device=dev)
     ctx.has_initial = torch.tensor([not ctx.single and ctx.rank == 1], device=dev)
+    ctx.prefix = 0
+    ctx.reuse = reuse
+    if reuse:
+        from sglang.srt.models.qwen35_cp_cache import initialize
+        initialize(ctx, args)
     return ctx
 
 
@@ -198,11 +208,14 @@ def persist_states(ctx):
         ctx.exchange(recv=local_state)
         ctx.exchange(recv=local_conv)
     pool = ctx.backend.req_to_token_pool
-    mid = pool.get_mamba_indices(ctx.batch.req_pool_indices)
+    mid = pool.translate_mamba_indices(pool.get_mamba_indices(ctx.batch.req_pool_indices))
     cache = pool.mamba_pool.mamba_cache
     cache.temporal[:, mid] = local_state[:, None]
     cache.conv[0][:, mid] = local_conv[:, None]
     ctx.final_states.clear()
+    if ctx.reuse:
+        from sglang.srt.models.qwen35_cp_cache import persist_checkpoint
+        persist_checkpoint(ctx)
 
 
 def write_layer_probe(ctx, layer, kind, value):
@@ -331,6 +344,9 @@ class CPDecoderLayer(nn.Module):
         return out
 
     def attention(self, x, positions, ctx):
+        if ctx.prefix:
+            from sglang.srt.models.qwen35_cp_cache import attention
+            return attention(self, x, positions, ctx)
         import flashinfer
         from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import fused_qk_gemma_rmsnorm_rope_gate
         from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
@@ -404,6 +420,9 @@ class CPDecoderLayer(nn.Module):
         return F.linear(out, w["o"])
 
     def gdn(self, x, ctx):
+        if ctx.reuse:
+            from sglang.srt.models.qwen35_cp_cache import gdn
+            return gdn(self, x, ctx)
         from flashinfer.gdn_prefill import chunk_gated_delta_rule
         from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
         from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
@@ -524,7 +543,7 @@ def model_forward(model, input_ids, positions, batch, input_embeds=None):
     import sgl_kernel as sk
 
     ctx = make_context(model, input_ids, batch)
-    positions = torch.arange(ctx.start, ctx.end, dtype=torch.int64, device=input_ids.device)
+    positions = torch.arange(ctx.prefix + ctx.start, ctx.prefix + ctx.end, dtype=torch.int64, device=input_ids.device)
     hidden = model.embed_tokens(input_ids[ctx.start:ctx.end]) if input_embeds is None else input_embeds[ctx.start:ctx.end]
     residual, aux = None, []
     for layer in model.layers:
@@ -582,7 +601,7 @@ def materialize_draft(worker, hidden, cache_loc, positions):
     from sglang.srt.runtime_context import get_parallel
 
     rank = get_parallel().tp_rank
-    rows = split_rows(cache_loc.numel())
+    rows = split_rows(cache_loc.numel(), align_cut=getattr(worker.model_runner.server_args, "enable_qwen35_cp_prefix_cache", False))
     start, end = rows[rank]
     peer_start, peer_end = rows[1-rank]
     group = get_parallel().tp_group.device_group
