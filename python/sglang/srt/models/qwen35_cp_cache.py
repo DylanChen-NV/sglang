@@ -7,6 +7,48 @@ radix cache retain all ownership, COW, publication, locking and eviction.
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _affine_output_kernel(U, State, Out, E: tl.constexpr,
+                          BM: tl.constexpr = 32, BN: tl.constexpr = 64):
+    m = tl.program_id(0) * BM + tl.arange(0, BM)
+    n = tl.program_id(1) * BN + tl.arange(0, BN)
+    h = tl.program_id(2)
+    k = tl.arange(0, 32)
+    hi = tl.full((BM, BN), 0, tl.float32)
+    lo = tl.full((BM, BN), 0, tl.float32)
+    for start in range(0, 128, 32):
+        u = tl.load(U + (m[:, None] * 32 + h) * 128 + start + k[None, :],
+                    m[:, None] < E, other=0)
+        state = tl.load(State + (h * 128 + n[None, :]) * 128 + start + k[:, None])
+        upper = state.to(tl.bfloat16)
+        lower = (state - upper.to(tl.float32)).to(tl.bfloat16)
+        hi = tl.dot(u, upper, hi)
+        lo = tl.dot(u, lower, lo)
+    pointer = Out + (m[:, None] * 32 + h) * 128 + n[None, :]
+    original = tl.load(pointer, m[:, None] < E, other=0).to(tl.float32)
+    tl.store(pointer, original + (hi + lo), m[:, None] < E)
+
+
+def _affine_output(out, u, previous):
+    """FP32 accumulation with a two-part BF16 representation of FP32 state.
+
+    The low part retains the state bits lost by the original single BF16
+    cast. Fuse both dot products and the final add to avoid materializing
+    full-sequence FP32 input/output temporaries; persistent state stays FP32.
+    """
+    if (out.shape != u.shape or tuple(u.shape[1:]) != (32, 128)
+            or tuple(previous.shape) != (1, 32, 128, 128)
+            or out.dtype != torch.bfloat16 or u.dtype != torch.bfloat16
+            or previous.dtype != torch.float32
+            or not all(t.is_contiguous() for t in (out, u, previous))):
+        raise ValueError("CP affine correction requires contiguous BF16 outputs and FP32 state")
+    _affine_output_kernel[(triton.cdiv(len(u), 32), 2, 32)](
+        u, previous, out, len(u), num_warps=4)
+    return out
 
 
 def checkpoint_offset(prefix, length, track_seqlen, chunk_size):
@@ -212,8 +254,7 @@ def gdn(layer, x, ctx):
             # Retain the FP32 recurrent state during the affine output repair.
             # Rounding the restored state to BF16 here compounds prefix/cold
             # differences through the subsequent MoE layers.
-            correction = torch.bmm(u.transpose(0, 1).float(), previous[0].transpose(1, 2))
-            out = (out.float() + correction.transpose(0, 1)).to(out.dtype)
+            out = _affine_output(out, u, previous)
             state = (torch.bmm(previous[0].float(), transition[0].float()) + state[0].float())[None]
             if cut:
                 checkpoint = (torch.bmm(previous[0].float(), checkpoint_transition[0].float()) + checkpoint[0].float())[None]
