@@ -33,8 +33,8 @@ def _affine_output_kernel(U, State, Out, E: tl.constexpr,
     tl.store(pointer, original + (hi + lo), m[:, None] < E)
 
 
-def _affine_output(out, u, previous):
-    """FP32 accumulation with a two-part BF16 representation of FP32 state.
+def _affine_output(out, u, previous, mode="two-bf16"):
+    """Repair the second CP shard using the selected arithmetic policy.
 
     The low part retains the state bits lost by the original single BF16
     cast. Fuse both dot products and the final add to avoid materializing
@@ -46,6 +46,18 @@ def _affine_output(out, u, previous):
             or previous.dtype != torch.float32
             or not all(t.is_contiguous() for t in (out, u, previous))):
         raise ValueError("CP affine correction requires contiguous BF16 outputs and FP32 state")
+    if mode == "fp32":
+        # Do not let a global TF32 setting silently reduce this control's
+        # mantissa precision. Both operands, the dot and the add stay FP32;
+        # only the completed result is rounded back to the model dtype.
+        if torch.backends.cuda.matmul.allow_tf32:
+            raise ValueError("FP32 CP affine correction requires TF32 matmul disabled")
+        correction = torch.bmm(
+            u.transpose(0, 1).float(), previous[0].transpose(1, 2)
+        ).transpose(0, 1)
+        return (out.float() + correction).to(out.dtype)
+    if mode != "two-bf16":
+        raise ValueError(f"Unknown CP affine mode: {mode}")
     _affine_output_kernel[(triton.cdiv(len(u), 32), 2, 32)](
         u, previous, out, len(u), num_warps=4)
     return out
@@ -65,6 +77,7 @@ def _gather_heads(tensor, ctx):
 
 
 def initialize(ctx, args):
+    ctx.affine_mode = args.qwen35_cp_affine_mode
     if args.disable_radix_cache or not args.enable_mamba_extra_buffer():
         raise ValueError("CP prefix reuse requires enabled radix cache and extra_buffer Mamba tracking")
     pool = ctx.backend.req_to_token_pool
@@ -254,7 +267,7 @@ def gdn(layer, x, ctx):
             # Retain the FP32 recurrent state during the affine output repair.
             # Rounding the restored state to BF16 here compounds prefix/cold
             # differences through the subsequent MoE layers.
-            out = _affine_output(out, u, previous)
+            out = _affine_output(out, u, previous, mode=ctx.affine_mode)
             state = (torch.bmm(previous[0].float(), transition[0].float()) + state[0].float())[None]
             if cut:
                 checkpoint = (torch.bmm(previous[0].float(), checkpoint_transition[0].float()) + checkpoint[0].float())[None]

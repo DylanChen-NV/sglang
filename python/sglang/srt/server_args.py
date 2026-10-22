@@ -1110,6 +1110,15 @@ class ServerArgs:
         "Enable native hybrid prefix caching for the Qwen3.5 CP executor (one active request).",
         NS("exec"),
     ] = False
+    qwen35_cp_affine_mode: A[
+        str,
+        Arg(
+            help="Affine output repair arithmetic for the Qwen3.5 CP prefix-cache executor. "
+            "fp32 uses IEEE FP32 matmul and add before rounding to BF16.",
+            choices=("two-bf16", "fp32"),
+        ),
+        NS("exec"),
+    ] = "two-bf16"
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
@@ -5065,6 +5074,11 @@ class ServerArgs:
 
         if self.enable_qwen35_cp_prefix_cache and not self.enable_qwen35_cp_prefill:
             raise ValueError("CP prefix cache requires --enable-qwen35-cp-prefill")
+        if self.qwen35_cp_affine_mode == "fp32":
+            if not self.enable_qwen35_cp_prefix_cache:
+                raise ValueError("FP32 CP affine correction requires --enable-qwen35-cp-prefix-cache")
+            if self.enable_tf32_matmul:
+                raise ValueError("FP32 CP affine correction is incompatible with --enable-tf32-matmul")
         if self.enable_qwen35_cp_prefill:
             if model_arch not in ("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"):
                 raise ValueError("reference CP prefill is supported for Qwen3.5 MoE only")
