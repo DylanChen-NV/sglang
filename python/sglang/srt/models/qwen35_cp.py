@@ -356,8 +356,8 @@ class CPDecoderLayer(nn.Module):
             copy_rows(ctx.vh[ps:pe, 0], recv[:, 2304:])
             local_k, local_v = ctx.kh[:L], ctx.vh[:L]
         pool = ctx.backend.token_to_kv_pool
-        pool.get_key_buffer(self.layer_id).index_copy_(0, ctx.loc, local_k)
-        pool.get_value_buffer(self.layer_id).index_copy_(0, ctx.loc, local_v)
+        # Keep pool-managed physical-slot translation and fuse the K/V store.
+        pool.set_kv_buffer(self, ctx.loc, local_k, local_v)
         if not E:
             return x
         if ctx.single:
@@ -585,7 +585,10 @@ def materialize_draft(worker, hidden, cache_loc, positions):
         projected = torch.mm(context, weights.projection).view(local_len, 6, 2048)
         dk, dv = _fused_norm_rope_stacked(projected, weights.kn, weights.eps,
                                          weights.rope, positions[start:end], 8, 128, 128)
-        local = torch.stack([dk[:, :, rank*4:(rank+1)*4], dv[:, :, rank*4:(rank+1)*4]])
+        # The native writer accepts a strided source row. Avoid copying the
+        # local head shard into another packed tensor just to scatter it.
+        local_k = dk[:, :, rank*4:(rank+1)*4]
+        local_v = dv[:, :, rank*4:(rank+1)*4]
         send = torch.stack([dk[:, :, (1-rank)*4:(2-rank)*4], dv[:, :, (1-rank)*4:(2-rank)*4]])
     receive = torch.empty(2, 6, peer_end-peer_start, 4, 128, **bf)
     ops = []
@@ -596,10 +599,12 @@ def materialize_draft(worker, hidden, cache_loc, positions):
     for work in dist.batch_isend_irecv(ops):
         work.wait()
     pool = worker.draft_model_runner.token_to_kv_pool
+    local_loc = cache_loc[start:end]
+    peer_loc = cache_loc[peer_start:peer_end]
     for layer in range(6):
-        for kind, getter in enumerate((pool.get_key_buffer, pool.get_value_buffer)):
-            buf = getter(layer)
-            if local_len:
-                buf.index_copy_(0, cache_loc[start:end].long(), local[kind, layer])
-            if peer_end > peer_start:
-                buf.index_copy_(0, cache_loc[peer_start:peer_end].long(), receive[kind, layer])
+        if local_len:
+            pool.set_kv_buffer(None, local_loc, local_k[layer], local_v[layer],
+                               layer_id_override=layer)
+        if peer_end > peer_start:
+            pool.set_kv_buffer(None, peer_loc, receive[0, layer], receive[1, layer],
+                               layer_id_override=layer)
