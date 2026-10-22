@@ -1024,6 +1024,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         positions: torch.Tensor,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
+        positions_are_local: bool = False,
     ) -> None:
         """Materialize target context features into the draft KV cache at explicit slots.
 
@@ -1035,7 +1036,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         if enabled():
             if cache_loc_2d is not None or commit_lens is not None:
                 raise ValueError("M2 CP does not support speculative verify")
-            return materialize_draft(self, target_hidden, cache_loc, positions)
+            return materialize_draft(
+                self, target_hidden, cache_loc, positions,
+                positions_are_local=positions_are_local,
+            )
         if target_hidden is None:
             raise RuntimeError("DFLASH missing target hidden context features.")
         if target_hidden.numel() == 0:
@@ -1422,30 +1426,36 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
-            device = next_token_ids.device
-            ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-            draft_seq_lens = torch.tensor(
-                batch.prefix_lens, dtype=torch.int32, device=device
-            )
-
             if batch.out_cache_loc is None:
                 raise RuntimeError(
                     "DFLASH prefill expected out_cache_loc, but got None."
                 )
-            positions, _ = compute_position(
-                self.model_runner.server_args.attention_backend,
-                draft_seq_lens,
-                ctx_lens,
-                int(sum(batch.extend_lens)),
-            )
+            cp_positions = getattr(logits_output, "qwen35_cp_positions", None)
+            if cp_positions is not None:
+                positions = cp_positions
+            else:
+                device = next_token_ids.device
+                ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
+                draft_seq_lens = torch.tensor(
+                    batch.prefix_lens, dtype=torch.int32, device=device
+                )
+                positions, _ = compute_position(
+                    self.model_runner.server_args.attention_backend,
+                    draft_seq_lens,
+                    ctx_lens,
+                    int(sum(batch.extend_lens)),
+                )
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,
                 cache_loc=batch.out_cache_loc,
                 positions=positions,
+                positions_are_local=cp_positions is not None,
             )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
             logits_output.hidden_states = None
+            if cp_positions is not None:
+                logits_output.qwen35_cp_positions = None
 
             batch_output.next_draft_input = self._make_next_draft_input_prefill(
                 bonus_tokens=next_token_ids,

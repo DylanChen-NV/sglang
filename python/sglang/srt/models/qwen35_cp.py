@@ -525,6 +525,7 @@ def model_forward(model, input_ids, positions, batch, input_embeds=None):
 
     ctx = make_context(model, input_ids, batch)
     positions = torch.arange(ctx.start, ctx.end, dtype=torch.int64, device=input_ids.device)
+    ctx.positions = positions
     hidden = model.embed_tokens(input_ids[ctx.start:ctx.end]) if input_embeds is None else input_embeds[ctx.start:ctx.end]
     residual, aux = None, []
     for layer in model.layers:
@@ -550,8 +551,12 @@ def logits_output(model, input_ids, positions, batch, input_embeds=None):
     if ctx.rank == owner:
         logits.copy_(F.linear(last, model.lm_head.weight)[:, :model.config.vocab_size])
     ctx.share_from(logits, owner)
-    return LogitsProcessorOutput(next_token_logits=logits.float(),
-                                 hidden_states=torch.cat(aux, -1) if aux else None)
+    output = LogitsProcessorOutput(next_token_logits=logits.float(),
+                                   hidden_states=torch.cat(aux, -1) if aux else None)
+    # The draft consumes the same local token rows. Carry the request-scoped
+    # positions through the native worker result instead of rebuilding them.
+    output.qwen35_cp_positions = ctx.positions
+    return output
 
 
 class CPDraftWeights(nn.Module):
@@ -576,7 +581,7 @@ class CPDraftWeights(nn.Module):
             self.kn.data[number].copy_(value)
 
 
-def materialize_draft(worker, hidden, cache_loc, positions):
+def materialize_draft(worker, hidden, cache_loc, positions, *, positions_are_local=False):
     import sgl_kernel as sk
     from sglang.kernels.ops.speculative.fused_kv_materialize import _fused_norm_rope_stacked
     from sglang.srt.runtime_context import get_parallel
@@ -598,8 +603,11 @@ def materialize_draft(worker, hidden, cache_loc, positions):
     if local_len:
         context = sk.rmsnorm(F.linear(hidden, draft.fc.weight), draft.hidden_norm.weight, 1e-6)
         projected = torch.mm(context, weights.projection).view(local_len, 6, 2048)
+        local_positions = positions if positions_are_local else positions[start:end]
+        if local_positions.numel() != local_len:
+            raise ValueError("CP draft positions must match its local token rows")
         dk, dv = _fused_norm_rope_stacked(projected, weights.kn, weights.eps,
-                                         weights.rope, positions[start:end], 8, 128, 128)
+                                         weights.rope, local_positions, 8, 128, 128)
         # The native writer accepts a strided source row. Avoid copying the
         # local head shard into another packed tensor just to scatter it.
         local_k = dk[:, :, rank*4:(rank+1)*4]
