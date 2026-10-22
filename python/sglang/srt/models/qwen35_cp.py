@@ -113,6 +113,14 @@ def rope_cache(dim, max_pos, device):
     return torch.cat([f.cos(), f.sin()], -1).contiguous()
 
 
+def attention_metadata(ctx):
+    return ctx.seq_len, ctx.cu_full, ctx.cu_full
+
+
+def gdn_metadata(ctx):
+    return ctx.cu_local, ctx.has_initial
+
+
 def make_context(model, input_ids, batch):
     from sglang.srt.runtime_context import get_parallel, get_server_args
 
@@ -155,6 +163,13 @@ def make_context(model, input_ids, batch):
                     diagnostic_root=os.environ.get("Q35_CP_LAYER_DIAGNOSTICS"))
     batch.qwen35_cp_context = ctx
     ctx.final_states = []
+    # These values are identical across the ten attention / thirty GDN layers.
+    # Construct once before launching model work instead of repeating tiny
+    # synchronous host-to-device transfers between layers.
+    ctx.seq_len = torch.tensor([length], dtype=torch.int32, device=dev)
+    ctx.cu_full = torch.tensor([0, length], dtype=torch.int32, device=dev)
+    ctx.cu_local = torch.tensor([0, ctx.size], dtype=torch.int32, device=dev)
+    ctx.has_initial = torch.tensor([not ctx.single and ctx.rank == 1], device=dev)
     return ctx
 
 
@@ -371,13 +386,13 @@ class CPDecoderLayer(nn.Module):
         heads = kk.shape[1]
         kc = kk.view(-1, 64, heads, 256).permute(0, 2, 1, 3)
         vc = vv.view(-1, 64, heads, 256).permute(0, 2, 1, 3)
-        i32 = lambda values: torch.tensor(values, dtype=torch.int32, device=x.device)
+        seq_len, cu_q, cu_kv = attention_metadata(ctx)
         out = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
             query=query, kv_cache=(kc, vc), workspace_buffer=ctx.workspace,
-            block_tables=ctx.page_table, seq_lens=i32([L]), max_q_len=L,
+            block_tables=ctx.page_table, seq_lens=seq_len, max_q_len=L,
             max_kv_len=get_server_args().context_length, bmm1_scale=256 ** -0.5,
-            bmm2_scale=1.0, batch_size=1, cum_seq_lens_q=i32([0, L]),
-            cum_seq_lens_kv=i32([0, L]), window_left=-1, out_dtype=torch.bfloat16)
+            bmm2_scale=1.0, batch_size=1, cum_seq_lens_q=cu_q,
+            cum_seq_lens_kv=cu_kv, window_left=-1, out_dtype=torch.bfloat16)
         if not ctx.single:
             combined = torch.empty(E, 2, 8, 256, **bf)
             copy_rows(combined[:, r], out[s:e])
@@ -414,12 +429,12 @@ class CPDecoderLayer(nn.Module):
                 ctx.exchange(mixed[-3:].contiguous() if r == 0 else None, halo if r == 1 else None)
                 if r == 1:
                     conv[0].copy_(halo.T)
-            cu = torch.tensor([0, E], dtype=torch.int32, device=dev)
+            cu, has_initial = gdn_metadata(ctx)
             xc = causal_conv1d_fn(
                 mixed.T, w["conv"], None, conv_states=conv,
                 query_start_loc=cu, seq_lens_cpu=[E],
                 cache_indices=ctx.zero_slot,
-                has_initial_state=torch.tensor([not ctx.single and r == 1], device=dev),
+                has_initial_state=has_initial,
                 activation="silu").T[:E]
             q, k, v = fused_qkv_split_gdn_prefill(xc, 16, 16, 32, 128, 128, 128)
             g, beta = fused_gdn_gating(w["A_log"], a, b, w["dt_bias"])
