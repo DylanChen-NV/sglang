@@ -68,6 +68,14 @@ def _conv_shard(convs, rank):
                       for g in convs.split((2048, 2048, 4096), dim=1)], dim=1).contiguous()
 
 
+def _checkpoint_conv(initial, mixed, count):
+    """Only the last three raw inputs belong to the conv checkpoint."""
+    if not 0 < count <= len(mixed):
+        raise ValueError("conv checkpoint outside the local new-token interval")
+    tail = mixed[count-3:count] if count >= 3 else torch.cat([initial[0].T, mixed[:count]])[-3:]
+    return tail.T.contiguous()[None]
+
+
 def persist_checkpoint(ctx):
     if not ctx.track:
         return
@@ -170,8 +178,7 @@ def gdn(layer, x, ctx):
     cut = ctx.track - ctx.start if ctx.track and ctx.track_owner == r else 0
     checkpoint_conv = None
     if cut:
-        history = torch.cat([conv[0].T, mixed[:cut]], dim=0)
-        checkpoint_conv = history[-3:].T.contiguous()[None]
+        checkpoint_conv = _checkpoint_conv(conv, mixed, cut)
     xc = causal_conv1d_fn(mixed.T, w['conv'], None, conv_states=conv,
         query_start_loc=ctx.cu_local, seq_lens_cpu=[E], cache_indices=ctx.zero_slot,
         has_initial_state=ctx.has_initial, activation='silu').T[:E]
@@ -202,7 +209,11 @@ def gdn(layer, x, ctx):
             u, transition, checkpoint_transition = run(ctx.zero_v[:E], ctx.eye)
             previous = torch.empty_like(state)
             ctx.exchange(recv=previous)
-            out.transpose(0, 1).baddbmm_(u.transpose(0, 1), previous[0].to(u.dtype).transpose(1, 2))
+            # Retain the FP32 recurrent state during the affine output repair.
+            # Rounding the restored state to BF16 here compounds prefix/cold
+            # differences through the subsequent MoE layers.
+            correction = torch.bmm(u.transpose(0, 1).float(), previous[0].transpose(1, 2))
+            out = (out.float() + correction.transpose(0, 1)).to(out.dtype)
             state = (torch.bmm(previous[0].float(), transition[0].float()) + state[0].float())[None]
             if cut:
                 checkpoint = (torch.bmm(previous[0].float(), checkpoint_transition[0].float()) + checkpoint[0].float())[None]
