@@ -83,6 +83,7 @@ from sglang.srt.models.qwen2_moe import (
     Qwen2MoeSparseMoeBlock,
     can_fuse_shared_expert,
 )
+from sglang.srt.models import qwen35_cp
 
 # Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
@@ -1339,6 +1340,23 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
 
+        if qwen35_cp.enabled():
+            self._reference_cp = True
+            if quant_config is not None:
+                raise ValueError("reference CP prefill requires BF16 weights")
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size,
+                org_num_embeddings=config.vocab_size, enable_tp=False,
+            )
+            self.layers = nn.ModuleList([
+                qwen35_cp.CPDecoderLayer(config, i)
+                for i in range(config.num_hidden_layers)
+            ])
+            self._start_layer, self._end_layer = 0, config.num_hidden_layers
+            self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.layers_to_capture = []
+            return
+
         if _is_hip:
             self._maybe_autodisable_shared_experts_fusion(config, quant_config)
 
@@ -1414,6 +1432,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        if qwen35_cp.enabled():
+            return qwen35_cp.model_forward(
+                self, input_ids, positions, forward_batch, input_embeds
+            )
         # Initialize hidden states
         if self.pp_group.is_first_rank:
             if input_embeds is None:
@@ -1567,6 +1589,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        if qwen35_cp.enabled():
+            return qwen35_cp.load_weights(self, weights)
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1989,6 +2013,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        if qwen35_cp.enabled():
+            return qwen35_cp.load_weights(self, weights)
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)

@@ -1031,6 +1031,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         `cache_loc_2d` plus `commit_lens`; the prefix-valid writer then commits
         only the live prefix rows without constructing masked/packed index tensors.
         """
+        from sglang.srt.models.qwen35_cp import enabled, materialize_draft
+        if enabled():
+            if cache_loc_2d is not None or commit_lens is not None:
+                raise ValueError("M2 CP does not support speculative verify")
+            return materialize_draft(self, target_hidden, cache_loc, positions)
         if target_hidden is None:
             raise RuntimeError("DFLASH missing target hidden context features.")
         if target_hidden.numel() == 0:

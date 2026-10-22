@@ -1100,6 +1100,11 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = None
+    enable_qwen35_cp_prefill: A[
+        bool,
+        "Enable the replicated-weight two-GPU Qwen3.5 reference CP cold-prefill path (M2).",
+        NS("exec"),
+    ] = False
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
@@ -5052,6 +5057,17 @@ class ServerArgs:
 
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
+
+        if self.enable_qwen35_cp_prefill:
+            if model_arch not in ("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"):
+                raise ValueError("reference CP prefill is supported for Qwen3.5 MoE only")
+            if self.tp_size != 2 or self.pp_size != 1 or self.enable_dp_attention:
+                raise ValueError("reference CP requires two collocated ranks without PP/DP attention")
+            # Native autotune constructs decode/verify-shaped dummy inputs.
+            # This backend is a cold-prefill executor; reference kernels use
+            # their own prefill heuristics and are warmed by real extend inputs.
+            self.disable_flashinfer_autotune = True
+            self.enforce_disable_flashinfer_allreduce_fusion = True
 
         if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
             raise ValueError(

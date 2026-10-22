@@ -74,6 +74,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                     org_num_embeddings=config.vocab_size,
                     prefix=add_prefix("lm_head", prefix),
                     use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                    enable_tp=not qwen3_5.qwen35_cp.enabled(),
                 )
         else:
             self.lm_head = PPMissingLayer()
@@ -121,6 +122,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         **kwargs,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        if qwen3_5.qwen35_cp.enabled():
+            return qwen3_5.qwen35_cp.logits_output(
+                self, input_ids, positions, forward_batch, input_embeds
+            )
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
@@ -144,6 +149,8 @@ class Qwen3_5ForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+        if qwen3_5.qwen35_cp.enabled():
+            return qwen3_5.qwen35_cp.load_weights(self, weights)
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
