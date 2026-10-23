@@ -216,6 +216,8 @@ def _affine_output(out, u, previous, mode="two-bf16", fuse_output=False,
         raise ValueError("FP32 affine optimization requires fp32 arithmetic")
     if fused_fp32 and (mode != "fp32" or fp32_optimization != "u-output"):
         raise ValueError("Fused FP32 affine requires FP32 u-output arithmetic")
+    if fused_fp32 and not (out.device == u.device == previous.device):
+        raise ValueError("Fused FP32 affine tensors must be on one device")
     if fuse_output and not fp32_local:
         raise ValueError("Fused CP affine output requires FP32 O_local")
     expected_out_dtype = torch.float32 if fp32_local else torch.bfloat16

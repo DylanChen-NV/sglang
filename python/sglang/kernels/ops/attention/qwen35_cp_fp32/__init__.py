@@ -67,9 +67,10 @@ def _load_kernel():
 
 
 def _launch(output, u32, state):
-    _, function, _ = _load_kernel()
-    status = function(output.data_ptr(), u32.data_ptr(), state.data_ptr(), len(u32),
-                      torch.cuda.current_stream(output.device).cuda_stream)
+    with torch.cuda.device(output.device):
+        _, function, _ = _load_kernel()
+        status = function(output.data_ptr(), u32.data_ptr(), state.data_ptr(), len(u32),
+                          torch.cuda.current_stream(output.device).cuda_stream)
     if status:
         raise RuntimeError("CUTLASS FP32 CP affine returned status %d" % status)
     return output
