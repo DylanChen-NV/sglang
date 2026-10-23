@@ -201,6 +201,51 @@ class FP32AffineWorkspace:
         return self._cached_views
 
 
+class U16AffineViews:
+    def __init__(self, workspace, rows):
+        self.rows = rows
+        self.u = workspace.u16[:rows * 32 * 128].view(rows, 32, 128)
+        self.previous = torch.empty(1, 32, 128, 128, dtype=torch.float32, device=workspace.device)
+
+
+class U16AffineWorkspace:
+    """BF16 producer/consumer storage; no full-sequence FP32 U or C buffer."""
+    def __init__(self, device):
+        self.device = torch.device(device)
+        self.capacity = 0
+        self.u16 = None
+        self._cached_views = None
+
+    def reserve(self, rows):
+        if rows > self.capacity:
+            self.u16 = torch.empty(rows * 32 * 128, dtype=torch.bfloat16, device=self.device)
+            self.capacity = rows
+            self._cached_views = None
+
+    def cached_views(self, rows):
+        if rows < 1:
+            raise ValueError("U16 affine views require positive rows")
+        self.reserve(rows)
+        if self._cached_views is None or self._cached_views.rows != rows:
+            self._cached_views = U16AffineViews(self, rows)
+        return self._cached_views
+
+
+def _affine_output_u16(out, u, previous, workspace, views):
+    if (out.shape != u.shape or tuple(u.shape[1:]) != (32, 128)
+            or tuple(previous.shape) != (1, 32, 128, 128)
+            or out.dtype != torch.bfloat16 or u.dtype != torch.bfloat16
+            or previous.dtype != torch.float32
+            or not (out.device == u.device == previous.device == workspace.device)
+            or not all(t.is_contiguous() for t in (out, u, previous))):
+        raise ValueError("U16 FP32 affine requires contiguous BF16 output/U and FP32 state on one device")
+    if (workspace._cached_views is not views or len(out) != views.rows
+            or u.data_ptr() != views.u.data_ptr()
+            or previous.data_ptr() != views.previous.data_ptr()):
+        raise ValueError("U16 cached affine views do not match the active request")
+    return _fp32_affine_fused(out, u, previous)
+
+
 def _affine_output(out, u, previous, mode="two-bf16", fuse_output=False,
                    fp32_optimization="none", workspace=None, cached_views=None, fused_fp32=False):
     """Repair the second CP shard using the selected arithmetic policy.
@@ -309,11 +354,13 @@ def initialize(ctx, args):
     ctx.fp32_affine_checked = False
     if ctx.fp32_optimization in ("workspace", "u-output") and not ctx.single and ctx.rank == 1:
         backend = ctx.backend
-        if not hasattr(backend, "_qwen35_cp_fp32_workspace"):
-            backend._qwen35_cp_fp32_workspace = FP32AffineWorkspace(ctx.loc.device)
-        ctx.fp32_workspace = backend._qwen35_cp_fp32_workspace
+        u16 = ctx.fp32_refinement == "u16-fused-gemm"
+        key = "_qwen35_cp_u16_workspace" if u16 else "_qwen35_cp_fp32_workspace"
+        if not hasattr(backend, key):
+            setattr(backend, key, (U16AffineWorkspace if u16 else FP32AffineWorkspace)(ctx.loc.device))
+        ctx.fp32_workspace = getattr(backend, key)
         ctx.fp32_workspace.reserve(ctx.size)
-        if ctx.fp32_refinement in ("host-cache", "fused-gemm"):
+        if ctx.fp32_refinement in ("host-cache", "fused-gemm", "u16-fused-gemm"):
             ctx.fp32_views = ctx.fp32_workspace.cached_views(ctx.size)
     if args.disable_radix_cache or not args.enable_mamba_extra_buffer():
         raise ValueError("CP prefix reuse requires enabled radix cache and extra_buffer Mamba tracking")
@@ -482,11 +529,11 @@ def gdn(layer, x, ctx):
     # Post only after the conv halo. Local output and U/transition do not
     # depend on the previous shard's state and can run before the final wait.
     pending_state = None
-    if not ctx.single and r == 1 and ctx.fp32_refinement in ("overlap", "host-cache", "fused-gemm"):
+    if not ctx.single and r == 1 and ctx.fp32_refinement in ("overlap", "host-cache", "fused-gemm", "u16-fused-gemm"):
         pending_state = PendingCPStateReceive(ctx, ctx.zero_state,
             buffer=ctx.fp32_views.previous if ctx.fp32_views is not None else None)
 
-    def run(values, initial, fp32_output=False, rounded_output=False):
+    def run(values, initial, fp32_output=False, rounded_output=False, bf16_output=False):
         options = {}
         checkpoints = None
         if 0 < cut < E:
@@ -494,6 +541,8 @@ def gdn(layer, x, ctx):
             options = dict(state_checkpoints=checkpoints, checkpoint_cu_starts=ctx.checkpoint_cu_starts,
                            checkpoint_every_n_tokens=cut)
         kernel = chunk_gated_delta_rule
+        if bf16_output:
+            options["output"] = ctx.fp32_views.u
         if fp32_output or rounded_output:
             from sglang.kernels.ops.attention.qwen35_gdn_fp32 import chunk_gated_delta_rule_fp32_output
             kernel = chunk_gated_delta_rule_fp32_output
@@ -516,8 +565,10 @@ def gdn(layer, x, ctx):
         if r == 0:
             ctx.exchange(send=state)
         else:
+            u16 = ctx.fp32_refinement == "u16-fused-gemm"
             u, transition, checkpoint_transition = run(ctx.zero_v[:E], ctx.eye,
-                rounded_output=(ctx.fp32_optimization == "u-output"))
+                rounded_output=(ctx.fp32_optimization == "u-output" and not u16),
+                bf16_output=u16)
             if pending_state is not None:
                 previous = pending_state.wait()
             else:
@@ -527,8 +578,11 @@ def gdn(layer, x, ctx):
             # Rounding the restored state to BF16 here compounds prefix/cold
             # differences through the subsequent MoE layers.
             if ctx.fp32_views is not None and ctx.fp32_affine_checked:
-                out = (_fp32_affine_fused(out, u, previous) if ctx.fp32_refinement == "fused-gemm"
+                out = (_fp32_affine_fused(out, u, previous) if ctx.fp32_refinement in ("fused-gemm", "u16-fused-gemm")
                        else _fp32_affine_cached(out, ctx.fp32_views))
+            elif u16:
+                out = _affine_output_u16(out, u, previous, ctx.fp32_workspace, ctx.fp32_views)
+                ctx.fp32_affine_checked = True
             else:
                 out = _affine_output(out, u, previous, mode=ctx.affine_mode,
                                      fuse_output=ctx.affine_fuse_output,
