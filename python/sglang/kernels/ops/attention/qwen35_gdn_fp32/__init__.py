@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Pinned SM100 GDN with a pre-rounding FP32 output side channel.
+"""Pinned SM100 GDN with an FP32 output side channel.
 
-Only the CP rank-1 local output uses this path. The original BF16 epilogue
-remains available for a bitwise regression check; internal arithmetic, state
-and checkpoint storage follow the archived FlashInfer 0.7.1 implementation.
+The CP rank-1 local output may preserve the pre-rounding accumulator. The
+optional U producer instead stores FP32(BF16(acc)) in caller-owned scratch,
+preserving the original response values. The stock BF16 epilogue remains for
+bitwise regression; state/checkpoints follow the archived FlashInfer 0.7.1.
 """
 from functools import lru_cache
 import hashlib
@@ -32,7 +33,8 @@ def chunk_gated_delta_rule_fp32_output(*, q, k, v, g, beta, scale=None,
         initial_state, output_final_state=True, cu_seqlens,
         use_qk_l2norm_in_kernel=False, output_state, state_checkpoints=None,
         checkpoint_cu_starts=None, checkpoint_every_n_tokens=0,
-        return_bf16_output=False):
+        return_bf16_output=False, output_fp32_buffer=None,
+        round_output_to_bf16=False):
     _check_runtime()
     if (torch.cuda.get_device_capability(q.device)[0] != 10
             or q.dtype != torch.bfloat16 or k.dtype != q.dtype or v.dtype != q.dtype
@@ -42,7 +44,12 @@ def chunk_gated_delta_rule_fp32_output(*, q, k, v, g, beta, scale=None,
             or not all(t.is_contiguous() for t in (q,k,v,g,beta,initial_state,output_state))):
         raise ValueError("FP32 local GDN requires contiguous SM100 BF16 inputs and FP32 state")
     out16 = torch.empty_like(v)
-    out32 = torch.empty(v.shape, dtype=torch.float32, device=v.device)
+    out32 = output_fp32_buffer
+    if out32 is None:
+        out32 = torch.empty(v.shape, dtype=torch.float32, device=v.device)
+    elif (out32.shape != v.shape or out32.dtype != torch.float32
+            or out32.device != v.device or not out32.is_contiguous()):
+        raise ValueError("FP32 GDN output buffer must be separate contiguous FP32 storage with V shape/device")
     from flashinfer.utils import get_device_sm_count, get_device_name
     from flashinfer.gdn_kernels.delta_rule_dsl.varlen_helper import should_use_cp_host
     use_cp = should_use_cp_host((len(cu_seqlens)-1)*32,
@@ -53,13 +60,15 @@ def chunk_gated_delta_rule_fp32_output(*, q, k, v, g, beta, scale=None,
         cp_delta_rule_dsl_sm100(out16,output_state,q,k,v,g,beta,cu_seqlens,
             scale or 128**-0.5,output_fp32=out32,initial_state=initial_state,
             state_checkpoints=state_checkpoints,checkpoint_cu_starts=checkpoint_cu_starts,
-            checkpoint_every_n_tokens=checkpoint_every_n_tokens,max_seqlen=len(q))
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,max_seqlen=len(q),
+            round_output_to_bf16=round_output_to_bf16)
     else:
         from .gdn_prefill import chunk_gated_delta_rule_sm100
         chunk_gated_delta_rule_sm100(q,k,v,g,beta,out16,out32,cu_seqlens,
             initial_state,output_state,scale or 128**-0.5,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-            cu_checkpoints=checkpoint_cu_starts,output_checkpoints=state_checkpoints)
+            cu_checkpoints=checkpoint_cu_starts,output_checkpoints=state_checkpoints,
+            round_output_to_bf16=round_output_to_bf16)
     if return_bf16_output:
         return out32,output_state,out16
     return out32,output_state

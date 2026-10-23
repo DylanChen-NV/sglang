@@ -176,8 +176,10 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         is_persistent: bool = True,
         cu_seqlens_dtype: Type[cutlass.Numeric] = cutlass.Int32,
         checkpoint_cu_starts_dtype: Type[cutlass.Numeric] | None = None,
+        round_output_to_bf16: bool = False,
     ):
         self.io_dtype = io_dtype
+        self.round_output_to_bf16 = round_output_to_bf16
         self.cu_seqlens_dtype = cu_seqlens_dtype
         self.checkpoint_cu_starts_dtype = checkpoint_cu_starts_dtype
         self.acc_dtype = acc_dtype
@@ -277,6 +279,7 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         )
         self.manual_cache_key(
             "io_dtype",
+            "round_output_to_bf16",
             "cu_seqlens_dtype",
             "checkpoint_cu_starts_dtype",
             "acc_dtype",
@@ -3295,7 +3298,10 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
             coord = tTR_tOcO[i]
             row = chunk_iter * self.b_t + coord[1]
             if row < seqlen_b:
-                mO_fp32[chunk_start + row, head_idx, coord[0]] = tTR_tOrO[i]
+                value = tTR_tOrO[i]
+                if cutlass.const_expr(self.round_output_to_bf16):
+                    value = value.to(self.io_dtype).to(self.acc_dtype)
+                mO_fp32[chunk_start + row, head_idx, coord[0]] = value
         tTR_rO_out.store(tTR_tOrO.load().to(self.io_dtype))
         cute.copy(
             tiled_o_r2s,

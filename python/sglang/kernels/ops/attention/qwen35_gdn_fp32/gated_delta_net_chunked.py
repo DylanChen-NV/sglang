@@ -211,8 +211,10 @@ class GatedDeltaNetChunkedKernel:
         store_final_state: bool = True,
         enable_checkpoints: bool = False,
         is_persistent: bool = True,
+        round_output_to_bf16: bool = False,
     ):
         self.io_dtype = io_dtype
+        self.round_output_to_bf16 = round_output_to_bf16
         self.acc_dtype = acc_dtype
         self.state_dtype = state_dtype
         self.mma_tiler_qk = mma_tiler_qk
@@ -4621,7 +4623,10 @@ class GatedDeltaNetChunkedKernel:
             coord = tTR_tOcO[i]
             row = chunk_iter * self.b_t + coord[1]
             if row < seqlen_b:
-                mO_fp32[batch_start + row, head_idx, coord[0]] = tTR_tOrO[i]
+                value = tTR_tOrO[i]
+                if cutlass.const_expr(self.round_output_to_bf16):
+                    value = value.to(self.io_dtype).to(self.acc_dtype)
+                mO_fp32[batch_start + row, head_idx, coord[0]] = value
         tTR_rO_out.store(tTR_tOrO.load().to(self.io_dtype))
         cute.copy(
             tiled_o_r2s,

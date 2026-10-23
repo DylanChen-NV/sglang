@@ -81,6 +81,7 @@ def _prefill_kernel_name(
     cu_checkpoints_dtype_str: str,
     initial_state_inner_strides,
     output_state_inner_strides,
+    round_output_to_bf16: bool,
 ) -> str:
     """Specialization name within the gdn_blackwell_prefill module.
 
@@ -104,6 +105,7 @@ def _prefill_kernel_name(
         cu_checkpoints_dtype_str,
         initial_state_inner_strides,
         output_state_inner_strides,
+        round_output_to_bf16,
     )
 
 
@@ -125,6 +127,7 @@ def _get_compiled_cache(
     cu_checkpoints_dtype_str: str,
     initial_state_inner_strides: tuple[int, ...] | None,
     output_state_inner_strides: tuple[int, ...] | None,
+    round_output_to_bf16: bool,
 ):
     """Return a mutable dict that lazily stores the compiled kernel.
 
@@ -218,6 +221,7 @@ def chunk_gated_delta_rule_sm100(
     cu_checkpoints: Optional[torch.Tensor] = None,
     output_checkpoints: Optional[torch.Tensor] = None,
     state_indices: Optional[torch.Tensor] = None,
+    round_output_to_bf16: bool = False,
 ) -> None:
     """Execute the Blackwell chunked GDN prefill kernel.
 
@@ -290,6 +294,7 @@ def chunk_gated_delta_rule_sm100(
             if use_state_indices and output_state is not None
             else None
         ),
+        round_output_to_bf16,
     )
     cache = _get_compiled_cache(*cache_key)
 
@@ -316,6 +321,7 @@ def chunk_gated_delta_rule_sm100(
             store_final_state=store_final_state,
             enable_checkpoints=enable_checkpoints,
             is_persistent=True,
+            round_output_to_bf16=round_output_to_bf16,
         )
 
         # Convert PyTorch tensors to CuTe tensors for compilation.

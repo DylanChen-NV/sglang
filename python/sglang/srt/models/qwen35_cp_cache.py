@@ -136,19 +136,20 @@ def _affine_output(out, u, previous, mode="two-bf16", fuse_output=False,
     full-sequence FP32 input/output temporaries; persistent state stays FP32.
     """
     fp32_local = mode in ("bf16-fp32-local", "two-bf16-fp32-local")
-    if fp32_optimization not in ("none", "epilogue", "workspace"):
+    if fp32_optimization not in ("none", "epilogue", "workspace", "u-output"):
         raise ValueError(f"Unknown FP32 affine optimization: {fp32_optimization}")
     if fp32_optimization != "none" and mode != "fp32":
         raise ValueError("FP32 affine optimization requires fp32 arithmetic")
     if fuse_output and not fp32_local:
         raise ValueError("Fused CP affine output requires FP32 O_local")
     expected_out_dtype = torch.float32 if fp32_local else torch.bfloat16
+    expected_u_dtype = torch.float32 if fp32_optimization == "u-output" else torch.bfloat16
     if (out.shape != u.shape or tuple(u.shape[1:]) != (32, 128)
             or tuple(previous.shape) != (1, 32, 128, 128)
-            or out.dtype != expected_out_dtype or u.dtype != torch.bfloat16
+            or out.dtype != expected_out_dtype or u.dtype != expected_u_dtype
             or previous.dtype != torch.float32
             or not all(t.is_contiguous() for t in (out, u, previous))):
-        raise ValueError("CP affine correction requires contiguous outputs with the selected dtype, BF16 U and FP32 state")
+        raise ValueError("CP affine correction requires contiguous output/U with the selected dtypes and FP32 state")
     if mode in ("single-bf16", "bf16-fp32-local", "two-bf16-fp32-local"):
         if fuse_output:
             return _affine_output_bf16_fused(out,u,previous,
@@ -164,12 +165,16 @@ def _affine_output(out, u, previous, mode="two-bf16", fuse_output=False,
         # only the completed result is rounded back to the model dtype.
         if torch.backends.cuda.matmul.allow_tf32:
             raise ValueError("FP32 CP affine correction requires TF32 matmul disabled")
-        if fp32_optimization == "workspace":
+        if fp32_optimization in ("workspace", "u-output"):
             if workspace is None or workspace.device != out.device:
                 raise ValueError("FP32 affine workspace must belong to this model device")
             workspace.reserve(len(u))
-            u32 = workspace.u_view(len(u))
-            u32.copy_(u)
+            if fp32_optimization == "u-output":
+                # GDN has already written FP32(BF16(acc)), not raw acc32.
+                u32 = u
+            else:
+                u32 = workspace.u_view(len(u))
+                u32.copy_(u)
             correction = workspace.c_view(len(u))
             # Preserve the original noncontiguous input and contiguous output
             # layouts exactly, even after a preceding longer request.
@@ -179,7 +184,7 @@ def _affine_output(out, u, previous, mode="two-bf16", fuse_output=False,
             correction = torch.bmm(
                 u.transpose(0, 1).float(), previous[0].transpose(1, 2)
             ).transpose(0, 1)
-        if fp32_optimization in ("epilogue", "workspace"):
+        if fp32_optimization in ("epilogue", "workspace", "u-output"):
             _fp32_affine_epilogue_kernel[(triton.cdiv(out.numel(), 1024),)](
                 out, correction, len(out), BLOCK=1024)
             return out
@@ -209,7 +214,7 @@ def initialize(ctx, args):
     ctx.affine_fuse_output = args.qwen35_cp_affine_fuse_output
     ctx.fp32_optimization = args.qwen35_cp_fp32_optimization
     ctx.fp32_workspace = None
-    if ctx.fp32_optimization == "workspace" and not ctx.single and ctx.rank == 1:
+    if ctx.fp32_optimization in ("workspace", "u-output") and not ctx.single and ctx.rank == 1:
         backend = ctx.backend
         if not hasattr(backend, "_qwen35_cp_fp32_workspace"):
             backend._qwen35_cp_fp32_workspace = FP32AffineWorkspace(ctx.loc.device)
@@ -379,7 +384,7 @@ def gdn(layer, x, ctx):
     q, k, v = l2norm_fwd(q[0].contiguous()), l2norm_fwd(k[0].contiguous()), v[0].contiguous()
     alpha, beta = torch.exp(g[0].float()), beta[0].float()
 
-    def run(values, initial, fp32_output=False):
+    def run(values, initial, fp32_output=False, rounded_output=False):
         options = {}
         checkpoints = None
         if 0 < cut < E:
@@ -387,9 +392,12 @@ def gdn(layer, x, ctx):
             options = dict(state_checkpoints=checkpoints, checkpoint_cu_starts=ctx.checkpoint_cu_starts,
                            checkpoint_every_n_tokens=cut)
         kernel = chunk_gated_delta_rule
-        if fp32_output:
+        if fp32_output or rounded_output:
             from sglang.kernels.ops.attention.qwen35_gdn_fp32 import chunk_gated_delta_rule_fp32_output
             kernel = chunk_gated_delta_rule_fp32_output
+            if rounded_output:
+                options.update(output_fp32_buffer=ctx.fp32_workspace.u_view(E),
+                               round_output_to_bf16=True)
         out,state = kernel(q=q, k=k, v=values, g=alpha, beta=beta,
             scale=None, initial_state=initial, output_final_state=True, cu_seqlens=ctx.cu_local,
             use_qk_l2norm_in_kernel=False, output_state=torch.empty_like(initial), **options)
@@ -404,7 +412,8 @@ def gdn(layer, x, ctx):
         if r == 0:
             ctx.exchange(send=state)
         else:
-            u, transition, checkpoint_transition = run(ctx.zero_v[:E], ctx.eye)
+            u, transition, checkpoint_transition = run(ctx.zero_v[:E], ctx.eye,
+                rounded_output=(ctx.fp32_optimization == "u-output"))
             previous = torch.empty_like(state)
             ctx.exchange(recv=previous)
             # Retain the FP32 recurrent state during the affine output repair.
