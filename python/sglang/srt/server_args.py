@@ -1120,6 +1120,11 @@ class ServerArgs:
         ),
         NS("exec"),
     ] = "two-bf16"
+    qwen35_cp_affine_fuse_output: A[
+        bool,
+        "Fuse BF16 CP affine FP32 accumulation, FP32 local-output addition and final BF16 store.",
+        NS("exec"),
+    ] = False
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
@@ -5077,6 +5082,9 @@ class ServerArgs:
             raise ValueError("CP prefix cache requires --enable-qwen35-cp-prefill")
         if self.qwen35_cp_affine_mode != "two-bf16" and not self.enable_qwen35_cp_prefix_cache:
             raise ValueError("Selected CP affine mode requires --enable-qwen35-cp-prefix-cache")
+        if self.qwen35_cp_affine_fuse_output and self.qwen35_cp_affine_mode not in (
+                "bf16-fp32-local", "two-bf16-fp32-local"):
+            raise ValueError("Fused CP affine output requires an FP32-local BF16 mode")
         if self.qwen35_cp_affine_mode == "fp32":
             if not self.enable_qwen35_cp_prefix_cache:
                 raise ValueError("FP32 CP affine correction requires --enable-qwen35-cp-prefix-cache")

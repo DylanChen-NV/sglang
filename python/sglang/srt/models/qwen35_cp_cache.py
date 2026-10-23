@@ -34,8 +34,9 @@ def _affine_output_kernel(U, State, Out, E: tl.constexpr,
 
 
 @triton.jit
-def _bf16_correction_kernel(U, State, Correction, E: tl.constexpr,
+def _bf16_correction_kernel(U, State, Correction, Local, Final, E: tl.constexpr,
                             SPLIT_STATE: tl.constexpr,
+                            FUSE_FINAL: tl.constexpr = False,
                             BM: tl.constexpr = 32, BN: tl.constexpr = 64):
     m = tl.program_id(0) * BM + tl.arange(0, BM)
     n = tl.program_id(1) * BN + tl.arange(0, BN)
@@ -55,18 +56,35 @@ def _bf16_correction_kernel(U, State, Correction, E: tl.constexpr,
     value = hi
     if SPLIT_STATE:
         value = hi + lo
-    tl.store(Correction + (m[:, None] * 32 + h) * 128 + n[None, :],
-             value, m[:, None] < E)
+    offset = (m[:, None] * 32 + h) * 128 + n[None, :]
+    if FUSE_FINAL:
+        original = tl.load(Local + offset, m[:, None] < E, other=0).to(tl.float32)
+        tl.store(Final + offset, original + value, m[:, None] < E)
+    else:
+        tl.store(Correction + offset, value, m[:, None] < E)
 
 
 def _bf16_correction(u, previous, split_state=False):
     correction = torch.empty(u.shape, dtype=torch.float32, device=u.device)
     _bf16_correction_kernel[(triton.cdiv(len(u), 32), 2, 32)](
-        u, previous, correction, len(u), split_state, num_warps=4)
+        u, previous, correction, correction, correction, len(u), split_state, num_warps=4)
     return correction
 
 
-def _affine_output(out, u, previous, mode="two-bf16"):
+def _affine_output_bf16_fused(out, u, previous, split_state=False):
+    """Keep correction in FP32 registers, add O_local32, then store BF16."""
+    if (out.dtype != torch.float32 or u.dtype != torch.bfloat16
+            or previous.dtype != torch.float32 or out.shape != u.shape
+            or tuple(u.shape[1:]) != (32,128) or tuple(previous.shape) != (1,32,128,128)
+            or not all(t.is_contiguous() for t in (out,u,previous))):
+        raise ValueError("Fused BF16 affine requires contiguous FP32 local/state and BF16 U")
+    final = torch.empty(u.shape,dtype=torch.bfloat16,device=u.device)
+    _bf16_correction_kernel[(triton.cdiv(len(u),32),2,32)](
+        u,previous,final,out,final,len(u),split_state,True,num_warps=4)
+    return final
+
+
+def _affine_output(out, u, previous, mode="two-bf16", fuse_output=False):
     """Repair the second CP shard using the selected arithmetic policy.
 
     The low part retains the state bits lost by the original single BF16
@@ -74,6 +92,8 @@ def _affine_output(out, u, previous, mode="two-bf16"):
     full-sequence FP32 input/output temporaries; persistent state stays FP32.
     """
     fp32_local = mode in ("bf16-fp32-local", "two-bf16-fp32-local")
+    if fuse_output and not fp32_local:
+        raise ValueError("Fused CP affine output requires FP32 O_local")
     expected_out_dtype = torch.float32 if fp32_local else torch.bfloat16
     if (out.shape != u.shape or tuple(u.shape[1:]) != (32, 128)
             or tuple(previous.shape) != (1, 32, 128, 128)
@@ -82,6 +102,9 @@ def _affine_output(out, u, previous, mode="two-bf16"):
             or not all(t.is_contiguous() for t in (out, u, previous))):
         raise ValueError("CP affine correction requires contiguous outputs with the selected dtype, BF16 U and FP32 state")
     if mode in ("single-bf16", "bf16-fp32-local", "two-bf16-fp32-local"):
+        if fuse_output:
+            return _affine_output_bf16_fused(out,u,previous,
+                split_state=(mode == "two-bf16-fp32-local"))
         correction = _bf16_correction(u, previous,
             split_state=(mode == "two-bf16-fp32-local"))
         # Complete the BF16 dot in FP32 before adding O_local. The FP32-local
@@ -119,6 +142,7 @@ def _gather_heads(tensor, ctx):
 
 def initialize(ctx, args):
     ctx.affine_mode = args.qwen35_cp_affine_mode
+    ctx.affine_fuse_output = args.qwen35_cp_affine_fuse_output
     if args.disable_radix_cache or not args.enable_mamba_extra_buffer():
         raise ValueError("CP prefix reuse requires enabled radix cache and extra_buffer Mamba tracking")
     pool = ctx.backend.req_to_token_pool
@@ -314,7 +338,8 @@ def gdn(layer, x, ctx):
             # Retain the FP32 recurrent state during the affine output repair.
             # Rounding the restored state to BF16 here compounds prefix/cold
             # differences through the subsequent MoE layers.
-            out = _affine_output(out, u, previous, mode=ctx.affine_mode)
+            out = _affine_output(out, u, previous, mode=ctx.affine_mode,
+                                 fuse_output=ctx.affine_fuse_output)
             state = (torch.bmm(previous[0].float(), transition[0].float()) + state[0].float())[None]
             if cut:
                 checkpoint = (torch.bmm(previous[0].float(), checkpoint_transition[0].float()) + checkpoint[0].float())[None]
