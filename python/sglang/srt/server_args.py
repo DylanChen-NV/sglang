@@ -1129,7 +1129,7 @@ class ServerArgs:
         str,
         Arg(
             help="Optional arithmetic-preserving optimization of FP32 CP affine repair.",
-            choices=("none", "epilogue"),
+            choices=("none", "epilogue", "workspace"),
         ),
         NS("exec"),
     ] = "none"
@@ -5100,6 +5100,9 @@ class ServerArgs:
                 raise ValueError("FP32 CP affine correction is incompatible with --enable-tf32-matmul")
         if self.qwen35_cp_fp32_optimization != "none" and self.qwen35_cp_affine_mode != "fp32":
             raise ValueError("FP32 CP optimization requires --qwen35-cp-affine-mode fp32")
+        if self.qwen35_cp_fp32_optimization == "workspace" and (
+                self.max_running_requests != 1 or not self.disable_overlap_schedule):
+            raise ValueError("FP32 CP workspace requires one active request and disabled overlap scheduling")
         if self.enable_qwen35_cp_prefill:
             if model_arch not in ("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"):
                 raise ValueError("reference CP prefill is supported for Qwen3.5 MoE only")

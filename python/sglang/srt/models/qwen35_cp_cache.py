@@ -101,8 +101,34 @@ def _fp32_affine_epilogue_kernel(Out, Correction, E: tl.constexpr,
     tl.store(Out + index, original + correction, mask)
 
 
+class FP32AffineWorkspace:
+    """Per-backend scratch, never a prefix state or a graph/stream-global cache.
+
+    The CP executor serializes single-request forwards. Views use the current
+    token count, including the cuBLAS batch stride, rather than the capacity.
+    """
+
+    def __init__(self, device):
+        self.device = torch.device(device)
+        self.capacity = 0
+        self.u32 = self.c32 = None
+
+    def reserve(self, rows):
+        if rows > self.capacity:
+            count = rows * 32 * 128
+            self.u32 = torch.empty(count, dtype=torch.float32, device=self.device)
+            self.c32 = torch.empty(count, dtype=torch.float32, device=self.device)
+            self.capacity = rows
+
+    def u_view(self, rows):
+        return self.u32[:rows * 32 * 128].view(rows, 32, 128)
+
+    def c_view(self, rows):
+        return self.c32[:rows * 32 * 128].view(32, rows, 128)
+
+
 def _affine_output(out, u, previous, mode="two-bf16", fuse_output=False,
-                   fp32_optimization="none"):
+                   fp32_optimization="none", workspace=None):
     """Repair the second CP shard using the selected arithmetic policy.
 
     The low part retains the state bits lost by the original single BF16
@@ -110,7 +136,7 @@ def _affine_output(out, u, previous, mode="two-bf16", fuse_output=False,
     full-sequence FP32 input/output temporaries; persistent state stays FP32.
     """
     fp32_local = mode in ("bf16-fp32-local", "two-bf16-fp32-local")
-    if fp32_optimization not in ("none", "epilogue"):
+    if fp32_optimization not in ("none", "epilogue", "workspace"):
         raise ValueError(f"Unknown FP32 affine optimization: {fp32_optimization}")
     if fp32_optimization != "none" and mode != "fp32":
         raise ValueError("FP32 affine optimization requires fp32 arithmetic")
@@ -138,10 +164,22 @@ def _affine_output(out, u, previous, mode="two-bf16", fuse_output=False,
         # only the completed result is rounded back to the model dtype.
         if torch.backends.cuda.matmul.allow_tf32:
             raise ValueError("FP32 CP affine correction requires TF32 matmul disabled")
-        correction = torch.bmm(
-            u.transpose(0, 1).float(), previous[0].transpose(1, 2)
-        ).transpose(0, 1)
-        if fp32_optimization == "epilogue":
+        if fp32_optimization == "workspace":
+            if workspace is None or workspace.device != out.device:
+                raise ValueError("FP32 affine workspace must belong to this model device")
+            workspace.reserve(len(u))
+            u32 = workspace.u_view(len(u))
+            u32.copy_(u)
+            correction = workspace.c_view(len(u))
+            # Preserve the original noncontiguous input and contiguous output
+            # layouts exactly, even after a preceding longer request.
+            torch.bmm(u32.transpose(0, 1), previous[0].transpose(1, 2), out=correction)
+            correction = correction.transpose(0, 1)
+        else:
+            correction = torch.bmm(
+                u.transpose(0, 1).float(), previous[0].transpose(1, 2)
+            ).transpose(0, 1)
+        if fp32_optimization in ("epilogue", "workspace"):
             _fp32_affine_epilogue_kernel[(triton.cdiv(out.numel(), 1024),)](
                 out, correction, len(out), BLOCK=1024)
             return out
@@ -170,6 +208,13 @@ def initialize(ctx, args):
     ctx.affine_mode = args.qwen35_cp_affine_mode
     ctx.affine_fuse_output = args.qwen35_cp_affine_fuse_output
     ctx.fp32_optimization = args.qwen35_cp_fp32_optimization
+    ctx.fp32_workspace = None
+    if ctx.fp32_optimization == "workspace" and not ctx.single and ctx.rank == 1:
+        backend = ctx.backend
+        if not hasattr(backend, "_qwen35_cp_fp32_workspace"):
+            backend._qwen35_cp_fp32_workspace = FP32AffineWorkspace(ctx.loc.device)
+        ctx.fp32_workspace = backend._qwen35_cp_fp32_workspace
+        ctx.fp32_workspace.reserve(ctx.size)
     if args.disable_radix_cache or not args.enable_mamba_extra_buffer():
         raise ValueError("CP prefix reuse requires enabled radix cache and extra_buffer Mamba tracking")
     pool = ctx.backend.req_to_token_pool
@@ -367,7 +412,8 @@ def gdn(layer, x, ctx):
             # differences through the subsequent MoE layers.
             out = _affine_output(out, u, previous, mode=ctx.affine_mode,
                                  fuse_output=ctx.affine_fuse_output,
-                                 fp32_optimization=ctx.fp32_optimization)
+                                 fp32_optimization=ctx.fp32_optimization,
+                                 workspace=ctx.fp32_workspace)
             state = (torch.bmm(previous[0].float(), transition[0].float()) + state[0].float())[None]
             if cut:
                 checkpoint = (torch.bmm(previous[0].float(), checkpoint_transition[0].float()) + checkpoint[0].float())[None]
