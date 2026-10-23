@@ -109,10 +109,15 @@ class PendingCPStateReceive:
     use the same peer/group ordering and must never be posted in reverse.
     """
 
-    def __init__(self, ctx, like):
+    def __init__(self, ctx, like, buffer=None):
         if ctx.rank != 1 or like.dtype != torch.float32 or not like.is_contiguous():
             raise ValueError("CP state prefetch requires rank 1 and contiguous FP32 state")
-        self.value = torch.empty_like(like)
+        if buffer is not None and (buffer.shape != like.shape or buffer.dtype != like.dtype
+                or buffer.device != like.device or not buffer.is_contiguous()):
+            raise ValueError("CP state receive scratch must match its state")
+        # NCCL records the current stream at posting. Reusing this allocation
+        # in the next layer therefore waits for its previous compute readers.
+        self.value = torch.empty_like(like) if buffer is None else buffer
         peer = dist.get_global_rank(ctx.group, 0)
         self.works = dist.batch_isend_irecv([
             dist.P2POp(dist.irecv, self.value, peer, ctx.group)
@@ -123,6 +128,34 @@ class PendingCPStateReceive:
             work.wait()
         self.works = ()
         return self.value
+
+
+class FP32AffineViews:
+    """One active length only; old views keep old storage alive on growth."""
+
+    def __init__(self, workspace, rows):
+        self.rows = rows
+        self.u = workspace.u_view(rows)
+        self.ut = self.u.transpose(0, 1)
+        self.c = workspace.c_view(rows)
+        self.ct = self.c.transpose(0, 1)
+        self.previous = torch.empty(1, 32, 128, 128, dtype=torch.float32, device=workspace.device)
+        self.previous_t = self.previous[0].transpose(1, 2)
+
+
+def _fp32_affine_cached(out, views):
+    """Internal fixed-model path, after this request's first full validation.
+
+    GDN writes exactly views.u, and PendingCPStateReceive writes exactly
+    views.previous. Both addresses and tensor metadata remain fixed for all
+    GDN layers in the request. Keep the live TF32 guard even on this path.
+    """
+    if torch.backends.cuda.matmul.allow_tf32:
+        raise ValueError("FP32 CP affine correction requires TF32 matmul disabled")
+    torch.bmm(views.ut, views.previous_t, out=views.c)
+    _fp32_affine_epilogue_kernel[(triton.cdiv(out.numel(), 1024),)](
+        out, views.ct, views.rows, BLOCK=1024)
+    return out
 
 
 class FP32AffineWorkspace:
@@ -136,6 +169,7 @@ class FP32AffineWorkspace:
         self.device = torch.device(device)
         self.capacity = 0
         self.u32 = self.c32 = None
+        self._cached_views = None
 
     def reserve(self, rows):
         if rows > self.capacity:
@@ -143,6 +177,7 @@ class FP32AffineWorkspace:
             self.u32 = torch.empty(count, dtype=torch.float32, device=self.device)
             self.c32 = torch.empty(count, dtype=torch.float32, device=self.device)
             self.capacity = rows
+            self._cached_views = None
 
     def u_view(self, rows):
         return self.u32[:rows * 32 * 128].view(rows, 32, 128)
@@ -150,9 +185,17 @@ class FP32AffineWorkspace:
     def c_view(self, rows):
         return self.c32[:rows * 32 * 128].view(32, rows, 128)
 
+    def cached_views(self, rows):
+        if rows < 1:
+            raise ValueError("FP32 affine views require positive rows")
+        self.reserve(rows)
+        if self._cached_views is None or self._cached_views.rows != rows:
+            self._cached_views = FP32AffineViews(self, rows)
+        return self._cached_views
+
 
 def _affine_output(out, u, previous, mode="two-bf16", fuse_output=False,
-                   fp32_optimization="none", workspace=None):
+                   fp32_optimization="none", workspace=None, cached_views=None):
     """Repair the second CP shard using the selected arithmetic policy.
 
     The low part retains the state bits lost by the original single BF16
@@ -189,6 +232,14 @@ def _affine_output(out, u, previous, mode="two-bf16", fuse_output=False,
         # only the completed result is rounded back to the model dtype.
         if torch.backends.cuda.matmul.allow_tf32:
             raise ValueError("FP32 CP affine correction requires TF32 matmul disabled")
+        if cached_views is not None:
+            if (fp32_optimization != "u-output" or workspace is None
+                    or workspace._cached_views is not cached_views
+                    or len(out) != cached_views.rows
+                    or u.data_ptr() != cached_views.u.data_ptr()
+                    or previous.data_ptr() != cached_views.previous.data_ptr()):
+                raise ValueError("FP32 cached affine views do not match the active request")
+            return _fp32_affine_cached(out, cached_views)
         if fp32_optimization in ("workspace", "u-output"):
             if workspace is None or workspace.device != out.device:
                 raise ValueError("FP32 affine workspace must belong to this model device")
@@ -239,12 +290,16 @@ def initialize(ctx, args):
     ctx.fp32_optimization = args.qwen35_cp_fp32_optimization
     ctx.fp32_refinement = args.qwen35_cp_fp32_refinement
     ctx.fp32_workspace = None
+    ctx.fp32_views = None
+    ctx.fp32_affine_checked = False
     if ctx.fp32_optimization in ("workspace", "u-output") and not ctx.single and ctx.rank == 1:
         backend = ctx.backend
         if not hasattr(backend, "_qwen35_cp_fp32_workspace"):
             backend._qwen35_cp_fp32_workspace = FP32AffineWorkspace(ctx.loc.device)
         ctx.fp32_workspace = backend._qwen35_cp_fp32_workspace
         ctx.fp32_workspace.reserve(ctx.size)
+        if ctx.fp32_refinement == "host-cache":
+            ctx.fp32_views = ctx.fp32_workspace.cached_views(ctx.size)
     if args.disable_radix_cache or not args.enable_mamba_extra_buffer():
         raise ValueError("CP prefix reuse requires enabled radix cache and extra_buffer Mamba tracking")
     pool = ctx.backend.req_to_token_pool
@@ -412,8 +467,9 @@ def gdn(layer, x, ctx):
     # Post only after the conv halo. Local output and U/transition do not
     # depend on the previous shard's state and can run before the final wait.
     pending_state = None
-    if not ctx.single and r == 1 and ctx.fp32_refinement == "overlap":
-        pending_state = PendingCPStateReceive(ctx, ctx.zero_state)
+    if not ctx.single and r == 1 and ctx.fp32_refinement in ("overlap", "host-cache"):
+        pending_state = PendingCPStateReceive(ctx, ctx.zero_state,
+            buffer=ctx.fp32_views.previous if ctx.fp32_views is not None else None)
 
     def run(values, initial, fp32_output=False, rounded_output=False):
         options = {}
@@ -427,7 +483,8 @@ def gdn(layer, x, ctx):
             from sglang.kernels.ops.attention.qwen35_gdn_fp32 import chunk_gated_delta_rule_fp32_output
             kernel = chunk_gated_delta_rule_fp32_output
             if rounded_output:
-                options.update(output_fp32_buffer=ctx.fp32_workspace.u_view(E),
+                options.update(output_fp32_buffer=(ctx.fp32_views.u if ctx.fp32_views is not None
+                                                  else ctx.fp32_workspace.u_view(E)),
                                round_output_to_bf16=True,
                                emit_bf16_output=(ctx.fp32_refinement == "none"))
         out,state = kernel(q=q, k=k, v=values, g=alpha, beta=beta,
@@ -454,10 +511,14 @@ def gdn(layer, x, ctx):
             # Retain the FP32 recurrent state during the affine output repair.
             # Rounding the restored state to BF16 here compounds prefix/cold
             # differences through the subsequent MoE layers.
-            out = _affine_output(out, u, previous, mode=ctx.affine_mode,
-                                 fuse_output=ctx.affine_fuse_output,
-                                 fp32_optimization=ctx.fp32_optimization,
-                                 workspace=ctx.fp32_workspace)
+            if ctx.fp32_views is not None and ctx.fp32_affine_checked:
+                out = _fp32_affine_cached(out, ctx.fp32_views)
+            else:
+                out = _affine_output(out, u, previous, mode=ctx.affine_mode,
+                                     fuse_output=ctx.affine_fuse_output,
+                                     fp32_optimization=ctx.fp32_optimization,
+                                     workspace=ctx.fp32_workspace, cached_views=ctx.fp32_views)
+                ctx.fp32_affine_checked = ctx.fp32_views is not None
             state = (torch.bmm(previous[0].float(), transition[0].float()) + state[0].float())[None]
             if cut:
                 checkpoint = (torch.bmm(previous[0].float(), checkpoint_transition[0].float()) + checkpoint[0].float())[None]
