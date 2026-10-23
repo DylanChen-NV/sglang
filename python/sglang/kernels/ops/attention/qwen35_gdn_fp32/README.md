@@ -24,3 +24,9 @@ The rounding policy belongs to both CP and non-CP compilation cache keys.
 The BF16 epilogue is retained for bitwise checks; persistent caches and state
 formats are unchanged. The two output policies must never share a compiled
 specialization that omits the rounding flag.
+
+The optional `emit_bf16_output=False` policy removes the unused BF16 side
+allocation, shared-memory staging and global stores, while retaining pipeline
+acquire/commit/wait/release and the BF16 rounding inside the FP32 output policy.
+It uses V only as a descriptor placeholder and never writes it. Both kernel
+caches distinguish this flag; requesting the disabled BF16 return is rejected.

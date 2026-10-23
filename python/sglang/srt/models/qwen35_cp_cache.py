@@ -213,6 +213,7 @@ def initialize(ctx, args):
     ctx.affine_mode = args.qwen35_cp_affine_mode
     ctx.affine_fuse_output = args.qwen35_cp_affine_fuse_output
     ctx.fp32_optimization = args.qwen35_cp_fp32_optimization
+    ctx.fp32_refinement = args.qwen35_cp_fp32_refinement
     ctx.fp32_workspace = None
     if ctx.fp32_optimization in ("workspace", "u-output") and not ctx.single and ctx.rank == 1:
         backend = ctx.backend
@@ -397,7 +398,8 @@ def gdn(layer, x, ctx):
             kernel = chunk_gated_delta_rule_fp32_output
             if rounded_output:
                 options.update(output_fp32_buffer=ctx.fp32_workspace.u_view(E),
-                               round_output_to_bf16=True)
+                               round_output_to_bf16=True,
+                               emit_bf16_output=(ctx.fp32_refinement == "none"))
         out,state = kernel(q=q, k=k, v=values, g=alpha, beta=beta,
             scale=None, initial_state=initial, output_final_state=True, cu_seqlens=ctx.cu_local,
             use_qk_l2norm_in_kernel=False, output_state=torch.empty_like(initial), **options)

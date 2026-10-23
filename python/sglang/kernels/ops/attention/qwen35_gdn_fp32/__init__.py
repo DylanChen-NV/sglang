@@ -34,7 +34,7 @@ def chunk_gated_delta_rule_fp32_output(*, q, k, v, g, beta, scale=None,
         use_qk_l2norm_in_kernel=False, output_state, state_checkpoints=None,
         checkpoint_cu_starts=None, checkpoint_every_n_tokens=0,
         return_bf16_output=False, output_fp32_buffer=None,
-        round_output_to_bf16=False):
+        round_output_to_bf16=False, emit_bf16_output=True):
     _check_runtime()
     if (torch.cuda.get_device_capability(q.device)[0] != 10
             or q.dtype != torch.bfloat16 or k.dtype != q.dtype or v.dtype != q.dtype
@@ -43,7 +43,11 @@ def chunk_gated_delta_rule_fp32_output(*, q, k, v, g, beta, scale=None,
             or use_qk_l2norm_in_kernel or not output_final_state
             or not all(t.is_contiguous() for t in (q,k,v,g,beta,initial_state,output_state))):
         raise ValueError("FP32 local GDN requires contiguous SM100 BF16 inputs and FP32 state")
-    out16 = torch.empty_like(v)
+    if return_bf16_output and not emit_bf16_output:
+        raise ValueError("Cannot return the disabled BF16 side output")
+    # The descriptor still needs the original shape. With stores disabled,
+    # V is a read-only placeholder; no BF16 output allocation is needed.
+    out16 = torch.empty_like(v) if emit_bf16_output else v
     out32 = output_fp32_buffer
     if out32 is None:
         out32 = torch.empty(v.shape, dtype=torch.float32, device=v.device)
@@ -61,14 +65,16 @@ def chunk_gated_delta_rule_fp32_output(*, q, k, v, g, beta, scale=None,
             scale or 128**-0.5,output_fp32=out32,initial_state=initial_state,
             state_checkpoints=state_checkpoints,checkpoint_cu_starts=checkpoint_cu_starts,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,max_seqlen=len(q),
-            round_output_to_bf16=round_output_to_bf16)
+            round_output_to_bf16=round_output_to_bf16,
+            emit_bf16_output=emit_bf16_output)
     else:
         from .gdn_prefill import chunk_gated_delta_rule_sm100
         chunk_gated_delta_rule_sm100(q,k,v,g,beta,out16,out32,cu_seqlens,
             initial_state,output_state,scale or 128**-0.5,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             cu_checkpoints=checkpoint_cu_starts,output_checkpoints=state_checkpoints,
-            round_output_to_bf16=round_output_to_bf16)
+            round_output_to_bf16=round_output_to_bf16,
+            emit_bf16_output=emit_bf16_output)
     if return_bf16_output:
         return out32,output_state,out16
     return out32,output_state

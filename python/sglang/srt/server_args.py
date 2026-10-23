@@ -1133,6 +1133,11 @@ class ServerArgs:
         ),
         NS("exec"),
     ] = "none"
+    qwen35_cp_fp32_refinement: A[
+        str,
+        Arg(help="Opt-in refinement of the FP32 u-output path.", choices=("none", "u32-only")),
+        NS("exec"),
+    ] = "none"
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
@@ -5100,6 +5105,8 @@ class ServerArgs:
                 raise ValueError("FP32 CP affine correction is incompatible with --enable-tf32-matmul")
         if self.qwen35_cp_fp32_optimization != "none" and self.qwen35_cp_affine_mode != "fp32":
             raise ValueError("FP32 CP optimization requires --qwen35-cp-affine-mode fp32")
+        if self.qwen35_cp_fp32_refinement != "none" and self.qwen35_cp_fp32_optimization != "u-output":
+            raise ValueError("FP32 CP refinement requires --qwen35-cp-fp32-optimization u-output")
         if self.qwen35_cp_fp32_optimization in ("workspace", "u-output") and (
                 self.max_running_requests != 1 or not self.disable_overlap_schedule):
             raise ValueError("FP32 CP workspace requires one active request and disabled overlap scheduling")

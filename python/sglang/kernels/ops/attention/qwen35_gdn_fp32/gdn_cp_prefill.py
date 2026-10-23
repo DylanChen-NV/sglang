@@ -669,6 +669,7 @@ def _get_prefill_kernel(
     cu_seqlens_dtype,
     checkpoint_cu_starts_dtype,
     round_output_to_bf16=False,
+    emit_bf16_output=True,
 ):
     return CPDeltaRulePrefillTcgen05Sm100(
         io_dtype=kernel_dtype,
@@ -690,6 +691,7 @@ def _get_prefill_kernel(
         cu_seqlens_dtype=cu_seqlens_dtype,
         checkpoint_cu_starts_dtype=checkpoint_cu_starts_dtype,
         round_output_to_bf16=round_output_to_bf16,
+        emit_bf16_output=emit_bf16_output,
     )
 
 
@@ -714,6 +716,7 @@ def cp_delta_rule_prefill_dsl_sm100(
     *,
     output_fp32: torch.Tensor,
     round_output_to_bf16: bool = False,
+    emit_bf16_output: bool = True,
     _skip_check: bool = False,
     _device=None,
     _stream=None,
@@ -915,6 +918,7 @@ def cp_delta_rule_prefill_dsl_sm100(
         _cu_seqlens_dtype(cu_seqlens.dtype),
         (_cu_seqlens_dtype(checkpoint_cu_starts.dtype) if enable_checkpoints else None),
         round_output_to_bf16,
+        emit_bf16_output,
     )
     compile_options = _blackwell_compile_options(device)
     workspace_size = (
@@ -1010,6 +1014,7 @@ def cp_delta_rule_dsl_sm100(
     *,
     output_fp32: torch.Tensor,
     round_output_to_bf16: bool = False,
+    emit_bf16_output: bool = True,
     initial_state: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     state_checkpoints: torch.Tensor | None = None,
@@ -1249,6 +1254,7 @@ def cp_delta_rule_dsl_sm100(
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             output_fp32=output_fp32,
             round_output_to_bf16=round_output_to_bf16,
+            emit_bf16_output=emit_bf16_output,
             _skip_check=True,
             _device=device,
             _stream=stream,

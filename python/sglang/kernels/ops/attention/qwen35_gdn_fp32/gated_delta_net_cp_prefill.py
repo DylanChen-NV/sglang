@@ -177,9 +177,11 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         cu_seqlens_dtype: Type[cutlass.Numeric] = cutlass.Int32,
         checkpoint_cu_starts_dtype: Type[cutlass.Numeric] | None = None,
         round_output_to_bf16: bool = False,
+        emit_bf16_output: bool = True,
     ):
         self.io_dtype = io_dtype
         self.round_output_to_bf16 = round_output_to_bf16
+        self.emit_bf16_output = emit_bf16_output
         self.cu_seqlens_dtype = cu_seqlens_dtype
         self.checkpoint_cu_starts_dtype = checkpoint_cu_starts_dtype
         self.acc_dtype = acc_dtype
@@ -280,6 +282,7 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         self.manual_cache_key(
             "io_dtype",
             "round_output_to_bf16",
+            "emit_bf16_output",
             "cu_seqlens_dtype",
             "checkpoint_cu_starts_dtype",
             "acc_dtype",
@@ -3302,13 +3305,14 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
                 if cutlass.const_expr(self.round_output_to_bf16):
                     value = value.to(self.io_dtype).to(self.acc_dtype)
                 mO_fp32[chunk_start + row, head_idx, coord[0]] = value
-        tTR_rO_out.store(tTR_tOrO.load().to(self.io_dtype))
-        cute.copy(
-            tiled_o_r2s,
-            tRS_tOrO,
-            tCsO[None, None, None, o_handle.index],
-        )
-        cute.arch.fence_view_async_shared()
+        if cutlass.const_expr(self.emit_bf16_output):
+            tTR_rO_out.store(tTR_tOrO.load().to(self.io_dtype))
+            cute.copy(
+                tiled_o_r2s,
+                tRS_tOrO,
+                tCsO[None, None, None, o_handle.index],
+            )
+            cute.arch.fence_view_async_shared()
         o_qs_handle.release()
         o_handle.commit()
 
@@ -3376,18 +3380,17 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         )
 
         # TMA bulk store SMEM -> GMEM using the descriptor updated per work tile
-        cute.copy(
-            tma_o.atom,
-            tOsO[(None, o_handle.index)],
-            tOgO[(None, 0, 0)],
-            tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
-                tensormap_o_ptr, cute.AddressSpace.generic
-            ),
-        )
-
-        # Wait for the store to complete before releasing the SMEM slot
-        cute.arch.cp_async_bulk_commit_group()
-        cute.arch.cp_async_bulk_wait_group(0)
+        if cutlass.const_expr(self.emit_bf16_output):
+            cute.copy(
+                tma_o.atom,
+                tOsO[(None, o_handle.index)],
+                tOgO[(None, 0, 0)],
+                tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
+                    tensormap_o_ptr, cute.AddressSpace.generic
+                ),
+            )
+            cute.arch.cp_async_bulk_commit_group()
+            cute.arch.cp_async_bulk_wait_group(0)
 
         o_handle.release()
 
