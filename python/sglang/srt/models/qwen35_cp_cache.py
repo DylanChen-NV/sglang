@@ -84,7 +84,25 @@ def _affine_output_bf16_fused(out, u, previous, split_state=False):
     return final
 
 
-def _affine_output(out, u, previous, mode="two-bf16", fuse_output=False):
+@triton.jit
+def _fp32_affine_epilogue_kernel(Out, Correction, E: tl.constexpr,
+                                 BLOCK: tl.constexpr):
+    """Add the completed cuBLAS dot, then perform the original BF16 rounding."""
+    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = index < E * 32 * 128
+    token = index // (32 * 128)
+    head = (index // 128) % 32
+    dim = index % 128
+    # torch.bmm writes contiguous [head, token, value], whereas Out is
+    # contiguous [token, head, value]. The transpose is only a view.
+    correction_index = (head * E + token) * 128 + dim
+    original = tl.load(Out + index, mask, other=0).to(tl.float32)
+    correction = tl.load(Correction + correction_index, mask, other=0)
+    tl.store(Out + index, original + correction, mask)
+
+
+def _affine_output(out, u, previous, mode="two-bf16", fuse_output=False,
+                   fp32_optimization="none"):
     """Repair the second CP shard using the selected arithmetic policy.
 
     The low part retains the state bits lost by the original single BF16
@@ -92,6 +110,10 @@ def _affine_output(out, u, previous, mode="two-bf16", fuse_output=False):
     full-sequence FP32 input/output temporaries; persistent state stays FP32.
     """
     fp32_local = mode in ("bf16-fp32-local", "two-bf16-fp32-local")
+    if fp32_optimization not in ("none", "epilogue"):
+        raise ValueError(f"Unknown FP32 affine optimization: {fp32_optimization}")
+    if fp32_optimization != "none" and mode != "fp32":
+        raise ValueError("FP32 affine optimization requires fp32 arithmetic")
     if fuse_output and not fp32_local:
         raise ValueError("Fused CP affine output requires FP32 O_local")
     expected_out_dtype = torch.float32 if fp32_local else torch.bfloat16
@@ -119,6 +141,10 @@ def _affine_output(out, u, previous, mode="two-bf16", fuse_output=False):
         correction = torch.bmm(
             u.transpose(0, 1).float(), previous[0].transpose(1, 2)
         ).transpose(0, 1)
+        if fp32_optimization == "epilogue":
+            _fp32_affine_epilogue_kernel[(triton.cdiv(out.numel(), 1024),)](
+                out, correction, len(out), BLOCK=1024)
+            return out
         return (out.float() + correction).to(out.dtype)
     if mode != "two-bf16":
         raise ValueError(f"Unknown CP affine mode: {mode}")
@@ -143,6 +169,7 @@ def _gather_heads(tensor, ctx):
 def initialize(ctx, args):
     ctx.affine_mode = args.qwen35_cp_affine_mode
     ctx.affine_fuse_output = args.qwen35_cp_affine_fuse_output
+    ctx.fp32_optimization = args.qwen35_cp_fp32_optimization
     if args.disable_radix_cache or not args.enable_mamba_extra_buffer():
         raise ValueError("CP prefix reuse requires enabled radix cache and extra_buffer Mamba tracking")
     pool = ctx.backend.req_to_token_pool
@@ -339,7 +366,8 @@ def gdn(layer, x, ctx):
             # Rounding the restored state to BF16 here compounds prefix/cold
             # differences through the subsequent MoE layers.
             out = _affine_output(out, u, previous, mode=ctx.affine_mode,
-                                 fuse_output=ctx.affine_fuse_output)
+                                 fuse_output=ctx.affine_fuse_output,
+                                 fp32_optimization=ctx.fp32_optimization)
             state = (torch.bmm(previous[0].float(), transition[0].float()) + state[0].float())[None]
             if cut:
                 checkpoint = (torch.bmm(previous[0].float(), checkpoint_transition[0].float()) + checkpoint[0].float())[None]

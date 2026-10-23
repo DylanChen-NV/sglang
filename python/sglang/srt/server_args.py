@@ -1125,6 +1125,14 @@ class ServerArgs:
         "Fuse BF16 CP affine FP32 accumulation, FP32 local-output addition and final BF16 store.",
         NS("exec"),
     ] = False
+    qwen35_cp_fp32_optimization: A[
+        str,
+        Arg(
+            help="Optional arithmetic-preserving optimization of FP32 CP affine repair.",
+            choices=("none", "epilogue"),
+        ),
+        NS("exec"),
+    ] = "none"
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
@@ -5090,6 +5098,8 @@ class ServerArgs:
                 raise ValueError("FP32 CP affine correction requires --enable-qwen35-cp-prefix-cache")
             if self.enable_tf32_matmul:
                 raise ValueError("FP32 CP affine correction is incompatible with --enable-tf32-matmul")
+        if self.qwen35_cp_fp32_optimization != "none" and self.qwen35_cp_affine_mode != "fp32":
+            raise ValueError("FP32 CP optimization requires --qwen35-cp-affine-mode fp32")
         if self.enable_qwen35_cp_prefill:
             if model_arch not in ("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"):
                 raise ValueError("reference CP prefill is supported for Qwen3.5 MoE only")
