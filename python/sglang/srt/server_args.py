@@ -1135,7 +1135,7 @@ class ServerArgs:
     ] = "none"
     qwen35_cp_fp32_refinement: A[
         str,
-        Arg(help="Opt-in refinement of the FP32 affine path; u16-fused-gemm stores U as BF16 and promotes it inside the FP32 kernel.", choices=("none", "u32-only", "overlap", "host-cache", "fused-gemm", "u16-fused-gemm")),
+        Arg(help="Opt-in refinement of the FP32 affine path; u16-fused-gemm stores U as BF16 and promotes it inside the FP32 kernel. Recurrent state is received on demand.", choices=("none", "u32-only", "host-cache", "fused-gemm", "u16-fused-gemm")),
         NS("exec"),
     ] = "none"
     enable_prefill_cp: A[
