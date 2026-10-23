@@ -1135,7 +1135,7 @@ class ServerArgs:
     ] = "none"
     qwen35_cp_fp32_refinement: A[
         str,
-        Arg(help="Opt-in refinement of the FP32 u-output path.", choices=("none", "u32-only")),
+        Arg(help="Opt-in refinement of the FP32 u-output path.", choices=("none", "u32-only", "overlap")),
         NS("exec"),
     ] = "none"
     enable_prefill_cp: A[

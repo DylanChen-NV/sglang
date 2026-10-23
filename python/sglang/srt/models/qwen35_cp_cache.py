@@ -101,6 +101,30 @@ def _fp32_affine_epilogue_kernel(Out, Correction, E: tl.constexpr,
     tl.store(Out + index, original + correction, mask)
 
 
+class PendingCPStateReceive:
+    """NCCL owns the communication stream; wait orders subsequent consumers.
+
+    Keep both the receive allocation and Work objects alive across the local
+    GDN/U launches. The halo must already have been exchanged: halo and state
+    use the same peer/group ordering and must never be posted in reverse.
+    """
+
+    def __init__(self, ctx, like):
+        if ctx.rank != 1 or like.dtype != torch.float32 or not like.is_contiguous():
+            raise ValueError("CP state prefetch requires rank 1 and contiguous FP32 state")
+        self.value = torch.empty_like(like)
+        peer = dist.get_global_rank(ctx.group, 0)
+        self.works = dist.batch_isend_irecv([
+            dist.P2POp(dist.irecv, self.value, peer, ctx.group)
+        ])
+
+    def wait(self):
+        for work in self.works:
+            work.wait()
+        self.works = ()
+        return self.value
+
+
 class FP32AffineWorkspace:
     """Per-backend scratch, never a prefix state or a graph/stream-global cache.
 
@@ -385,6 +409,12 @@ def gdn(layer, x, ctx):
     q, k, v = l2norm_fwd(q[0].contiguous()), l2norm_fwd(k[0].contiguous()), v[0].contiguous()
     alpha, beta = torch.exp(g[0].float()), beta[0].float()
 
+    # Post only after the conv halo. Local output and U/transition do not
+    # depend on the previous shard's state and can run before the final wait.
+    pending_state = None
+    if not ctx.single and r == 1 and ctx.fp32_refinement == "overlap":
+        pending_state = PendingCPStateReceive(ctx, ctx.zero_state)
+
     def run(values, initial, fp32_output=False, rounded_output=False):
         options = {}
         checkpoints = None
@@ -416,8 +446,11 @@ def gdn(layer, x, ctx):
         else:
             u, transition, checkpoint_transition = run(ctx.zero_v[:E], ctx.eye,
                 rounded_output=(ctx.fp32_optimization == "u-output"))
-            previous = torch.empty_like(state)
-            ctx.exchange(recv=previous)
+            if pending_state is not None:
+                previous = pending_state.wait()
+            else:
+                previous = torch.empty_like(state)
+                ctx.exchange(recv=previous)
             # Retain the FP32 recurrent state during the affine output repair.
             # Rounding the restored state to BF16 here compounds prefix/cold
             # differences through the subsequent MoE layers.
