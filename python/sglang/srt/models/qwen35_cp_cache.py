@@ -33,6 +33,39 @@ def _affine_output_kernel(U, State, Out, E: tl.constexpr,
     tl.store(pointer, original + (hi + lo), m[:, None] < E)
 
 
+@triton.jit
+def _bf16_correction_kernel(U, State, Correction, E: tl.constexpr,
+                            SPLIT_STATE: tl.constexpr,
+                            BM: tl.constexpr = 32, BN: tl.constexpr = 64):
+    m = tl.program_id(0) * BM + tl.arange(0, BM)
+    n = tl.program_id(1) * BN + tl.arange(0, BN)
+    h = tl.program_id(2)
+    k = tl.arange(0, 32)
+    hi = tl.full((BM, BN), 0, tl.float32)
+    lo = tl.full((BM, BN), 0, tl.float32)
+    for start in range(0, 128, 32):
+        u = tl.load(U + (m[:, None] * 32 + h) * 128 + start + k[None, :],
+                    m[:, None] < E, other=0)
+        state = tl.load(State + (h * 128 + n[None, :]) * 128 + start + k[:, None])
+        upper = state.to(tl.bfloat16)
+        hi = tl.dot(u, upper, hi)
+        if SPLIT_STATE:
+            lower = (state - upper.to(tl.float32)).to(tl.bfloat16)
+            lo = tl.dot(u, lower, lo)
+    value = hi
+    if SPLIT_STATE:
+        value = hi + lo
+    tl.store(Correction + (m[:, None] * 32 + h) * 128 + n[None, :],
+             value, m[:, None] < E)
+
+
+def _bf16_correction(u, previous, split_state=False):
+    correction = torch.empty(u.shape, dtype=torch.float32, device=u.device)
+    _bf16_correction_kernel[(triton.cdiv(len(u), 32), 2, 32)](
+        u, previous, correction, len(u), split_state, num_warps=4)
+    return correction
+
+
 def _affine_output(out, u, previous, mode="two-bf16"):
     """Repair the second CP shard using the selected arithmetic policy.
 
@@ -40,12 +73,20 @@ def _affine_output(out, u, previous, mode="two-bf16"):
     cast. Fuse both dot products and the final add to avoid materializing
     full-sequence FP32 input/output temporaries; persistent state stays FP32.
     """
+    fp32_local = mode in ("bf16-fp32-local", "two-bf16-fp32-local")
+    expected_out_dtype = torch.float32 if fp32_local else torch.bfloat16
     if (out.shape != u.shape or tuple(u.shape[1:]) != (32, 128)
             or tuple(previous.shape) != (1, 32, 128, 128)
-            or out.dtype != torch.bfloat16 or u.dtype != torch.bfloat16
+            or out.dtype != expected_out_dtype or u.dtype != torch.bfloat16
             or previous.dtype != torch.float32
             or not all(t.is_contiguous() for t in (out, u, previous))):
-        raise ValueError("CP affine correction requires contiguous BF16 outputs and FP32 state")
+        raise ValueError("CP affine correction requires contiguous outputs with the selected dtype, BF16 U and FP32 state")
+    if mode in ("single-bf16", "bf16-fp32-local", "two-bf16-fp32-local"):
+        correction = _bf16_correction(u, previous,
+            split_state=(mode == "two-bf16-fp32-local"))
+        # Complete the BF16 dot in FP32 before adding O_local. The FP32-local
+        # modes receive the actual pre-rounding GDN output, not BF16.float().
+        return (out.float() + correction).to(torch.bfloat16)
     if mode == "fp32":
         # Do not let a global TF32 setting silently reduce this control's
         # mantissa precision. Both operands, the dot and the add stay FP32;
@@ -242,21 +283,27 @@ def gdn(layer, x, ctx):
     q, k, v = l2norm_fwd(q[0].contiguous()), l2norm_fwd(k[0].contiguous()), v[0].contiguous()
     alpha, beta = torch.exp(g[0].float()), beta[0].float()
 
-    def run(values, initial):
+    def run(values, initial, fp32_output=False):
         options = {}
         checkpoints = None
         if 0 < cut < E:
             checkpoints = torch.empty(ctx.checkpoint_count,32,128,128,dtype=torch.float32,device=x.device)
             options = dict(state_checkpoints=checkpoints, checkpoint_cu_starts=ctx.checkpoint_cu_starts,
                            checkpoint_every_n_tokens=cut)
-        out,state = chunk_gated_delta_rule(q=q, k=k, v=values, g=alpha, beta=beta,
+        kernel = chunk_gated_delta_rule
+        if fp32_output:
+            from sglang.kernels.ops.attention.qwen35_gdn_fp32 import chunk_gated_delta_rule_fp32_output
+            kernel = chunk_gated_delta_rule_fp32_output
+        out,state = kernel(q=q, k=k, v=values, g=alpha, beta=beta,
             scale=None, initial_state=initial, output_final_state=True, cu_seqlens=ctx.cu_local,
             use_qk_l2norm_in_kernel=False, output_state=torch.empty_like(initial), **options)
         checkpoint = checkpoints[:1].clone() if checkpoints is not None else (state if cut == E else None)
         return out,state,checkpoint
 
     initial = ctx.initial_states[layer.linear_id:layer.linear_id+1] if ctx.prefix and r == 0 else ctx.zero_state
-    out, state, checkpoint = run(v, initial)
+    fp32_local = (not ctx.single and r == 1
+                  and ctx.affine_mode in ("bf16-fp32-local", "two-bf16-fp32-local"))
+    out, state, checkpoint = run(v, initial, fp32_output=fp32_local)
     if not ctx.single:
         if r == 0:
             ctx.exchange(send=state)

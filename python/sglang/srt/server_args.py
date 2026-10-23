@@ -1114,8 +1114,9 @@ class ServerArgs:
         str,
         Arg(
             help="Affine output repair arithmetic for the Qwen3.5 CP prefix-cache executor. "
-            "fp32 uses IEEE FP32 matmul and add before rounding to BF16.",
-            choices=("two-bf16", "fp32"),
+            "fp32 uses IEEE FP32 matmul. bf16-fp32-local preserves the local GDN "
+            "output in FP32 and uses a BF16 dot with FP32 accumulation.",
+            choices=("two-bf16", "fp32", "single-bf16", "bf16-fp32-local", "two-bf16-fp32-local"),
         ),
         NS("exec"),
     ] = "two-bf16"
@@ -5074,6 +5075,8 @@ class ServerArgs:
 
         if self.enable_qwen35_cp_prefix_cache and not self.enable_qwen35_cp_prefill:
             raise ValueError("CP prefix cache requires --enable-qwen35-cp-prefill")
+        if self.qwen35_cp_affine_mode != "two-bf16" and not self.enable_qwen35_cp_prefix_cache:
+            raise ValueError("Selected CP affine mode requires --enable-qwen35-cp-prefix-cache")
         if self.qwen35_cp_affine_mode == "fp32":
             if not self.enable_qwen35_cp_prefix_cache:
                 raise ValueError("FP32 CP affine correction requires --enable-qwen35-cp-prefix-cache")
