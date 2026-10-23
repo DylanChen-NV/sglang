@@ -158,6 +158,13 @@ def _fp32_affine_cached(out, views):
     return out
 
 
+def _fp32_affine_fused(out, u, previous):
+    if torch.backends.cuda.matmul.allow_tf32:
+        raise ValueError("FP32 CP affine correction requires TF32 matmul disabled")
+    from sglang.kernels.ops.attention.qwen35_cp_fp32 import _launch
+    return _launch(out, u, previous)
+
+
 class FP32AffineWorkspace:
     """Per-backend scratch, never a prefix state or a graph/stream-global cache.
 
@@ -195,7 +202,7 @@ class FP32AffineWorkspace:
 
 
 def _affine_output(out, u, previous, mode="two-bf16", fuse_output=False,
-                   fp32_optimization="none", workspace=None, cached_views=None):
+                   fp32_optimization="none", workspace=None, cached_views=None, fused_fp32=False):
     """Repair the second CP shard using the selected arithmetic policy.
 
     The low part retains the state bits lost by the original single BF16
@@ -207,6 +214,8 @@ def _affine_output(out, u, previous, mode="two-bf16", fuse_output=False,
         raise ValueError(f"Unknown FP32 affine optimization: {fp32_optimization}")
     if fp32_optimization != "none" and mode != "fp32":
         raise ValueError("FP32 affine optimization requires fp32 arithmetic")
+    if fused_fp32 and (mode != "fp32" or fp32_optimization != "u-output"):
+        raise ValueError("Fused FP32 affine requires FP32 u-output arithmetic")
     if fuse_output and not fp32_local:
         raise ValueError("Fused CP affine output requires FP32 O_local")
     expected_out_dtype = torch.float32 if fp32_local else torch.bfloat16
@@ -239,7 +248,11 @@ def _affine_output(out, u, previous, mode="two-bf16", fuse_output=False,
                     or u.data_ptr() != cached_views.u.data_ptr()
                     or previous.data_ptr() != cached_views.previous.data_ptr()):
                 raise ValueError("FP32 cached affine views do not match the active request")
+            if fused_fp32:
+                return _fp32_affine_fused(out, u, previous)
             return _fp32_affine_cached(out, cached_views)
+        if fused_fp32:
+            return _fp32_affine_fused(out, u, previous)
         if fp32_optimization in ("workspace", "u-output"):
             if workspace is None or workspace.device != out.device:
                 raise ValueError("FP32 affine workspace must belong to this model device")
@@ -298,7 +311,7 @@ def initialize(ctx, args):
             backend._qwen35_cp_fp32_workspace = FP32AffineWorkspace(ctx.loc.device)
         ctx.fp32_workspace = backend._qwen35_cp_fp32_workspace
         ctx.fp32_workspace.reserve(ctx.size)
-        if ctx.fp32_refinement == "host-cache":
+        if ctx.fp32_refinement in ("host-cache", "fused-gemm"):
             ctx.fp32_views = ctx.fp32_workspace.cached_views(ctx.size)
     if args.disable_radix_cache or not args.enable_mamba_extra_buffer():
         raise ValueError("CP prefix reuse requires enabled radix cache and extra_buffer Mamba tracking")
@@ -467,7 +480,7 @@ def gdn(layer, x, ctx):
     # Post only after the conv halo. Local output and U/transition do not
     # depend on the previous shard's state and can run before the final wait.
     pending_state = None
-    if not ctx.single and r == 1 and ctx.fp32_refinement in ("overlap", "host-cache"):
+    if not ctx.single and r == 1 and ctx.fp32_refinement in ("overlap", "host-cache", "fused-gemm"):
         pending_state = PendingCPStateReceive(ctx, ctx.zero_state,
             buffer=ctx.fp32_views.previous if ctx.fp32_views is not None else None)
 
@@ -512,12 +525,14 @@ def gdn(layer, x, ctx):
             # Rounding the restored state to BF16 here compounds prefix/cold
             # differences through the subsequent MoE layers.
             if ctx.fp32_views is not None and ctx.fp32_affine_checked:
-                out = _fp32_affine_cached(out, ctx.fp32_views)
+                out = (_fp32_affine_fused(out, u, previous) if ctx.fp32_refinement == "fused-gemm"
+                       else _fp32_affine_cached(out, ctx.fp32_views))
             else:
                 out = _affine_output(out, u, previous, mode=ctx.affine_mode,
                                      fuse_output=ctx.affine_fuse_output,
                                      fp32_optimization=ctx.fp32_optimization,
-                                     workspace=ctx.fp32_workspace, cached_views=ctx.fp32_views)
+                                     workspace=ctx.fp32_workspace, cached_views=ctx.fp32_views,
+                                     fused_fp32=(ctx.fp32_refinement == "fused-gemm"))
                 ctx.fp32_affine_checked = ctx.fp32_views is not None
             state = (torch.bmm(previous[0].float(), transition[0].float()) + state[0].float())[None]
             if cut:
