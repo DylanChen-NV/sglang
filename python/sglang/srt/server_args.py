@@ -3501,6 +3501,7 @@ class ServerArgs:
         self._resolved_overrides = []
 
         self._handle_return_hidden_states_mode()
+        self._handle_execution_policy_environment()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -5073,6 +5074,24 @@ class ServerArgs:
         from sglang.srt.arg_groups.hisparse_hook import validate_hisparse_kv_cache_dtype
 
         validate_hisparse_kv_cache_dtype(self)
+
+    def _handle_execution_policy_environment(self):
+        from sglang.srt.arg_groups.qwen35_cp_policy import (
+            FIRST_TOKEN_POLICY_ENV,
+            apply_first_token_policy,
+        )
+
+        policy = apply_first_token_policy(self)
+        if policy is not None:
+            logger.info(
+                "%s=%s: CP affine=%s, optimization=%s, refinement=%s; "
+                "restart with an empty cache when changing policy",
+                FIRST_TOKEN_POLICY_ENV,
+                policy,
+                self.qwen35_cp_affine_mode,
+                self.qwen35_cp_fp32_optimization,
+                self.qwen35_cp_fp32_refinement,
+            )
 
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import (

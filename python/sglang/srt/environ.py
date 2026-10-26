@@ -312,6 +312,9 @@ class Envs:
     IS_H200 = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_ENABLE_CP_V2 = EnvBool(False)
+    # Parsed strictly at startup by arg_groups.qwen35_cp_policy; unset retains
+    # explicit CLI arithmetic. 1=validated FP32/U16 policy, 0=two-BF16 policy.
+    SGLANG_QWEN35_CP_MATCH_FIRST_TOKEN = EnvStr(None)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_PROFILE_V2 = EnvBool(False)
