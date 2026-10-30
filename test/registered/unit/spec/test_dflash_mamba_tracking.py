@@ -15,7 +15,7 @@ class TestDflashMambaTracking(unittest.TestCase):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
             req_pool_indices=factory([1]),
-            reqs=[SimpleNamespace(mamba_next_track_idx=1)],
+            reqs=[SimpleNamespace(mamba_next_track_idx=1, req_pool_idx=1)],
             req_to_token_pool=SimpleNamespace(
                 req_index_to_mamba_ping_pong_track_buffer_mapping=factory([[9, 10], [15, 16]])
             ),
@@ -46,10 +46,16 @@ class TestDflashMambaTracking(unittest.TestCase):
              patch("sglang.srt.managers.schedule_batch.torch.tensor", side_effect=unpinned_tensor), \
              patch.object(ForwardBatch, "init_new", side_effect=init_forward):
             verify.prepare_for_verify(batch, target, defer_metadata_init=True)
+            # A later native slot donation must not change the destination of
+            # a verify that has already prepared its metadata.
+            batch.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[1, 1] = 99
+            self.assertEqual(batch.mamba_track_indices.tolist(), [16])
+            expected = 99
+            verify.prepare_for_verify(batch, target, defer_metadata_init=True)
             # Another retained request and a ping-pong swap invalidate the old
             # destination even when shape and tensor dtype remain unchanged.
             batch.req_pool_indices = factory([0])
-            batch.reqs = [SimpleNamespace(mamba_next_track_idx=0)]
+            batch.reqs = [SimpleNamespace(mamba_next_track_idx=0, req_pool_idx=0)]
             batch.mamba_track_mask = factory([True])
             batch.mamba_track_seqlens = factory([1024])
             expected = 9
