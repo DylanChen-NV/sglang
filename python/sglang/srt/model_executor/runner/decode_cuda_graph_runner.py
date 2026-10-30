@@ -810,6 +810,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
+        if getattr(self.model_runner.model, "q35rt_capture_fused_cycle", False):
+            # Capture the same current-iteration compute that the raw-greedy
+            # worker dispatches. Transformed sampling keeps an eager verify
+            # path; it must never replay this different graph variant.
+            forward_batch.q35rt_fused_cycle = True
 
         # Trip the coordinator so the hisparse code path is captured into the
         # graph; backends read it from self.model_runner.hisparse_coordinator.

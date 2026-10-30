@@ -337,6 +337,12 @@ class Q35rtForCausalLM(nn.Module):
         if fused_track not in ("0", "1"):
             raise ValueError("SGLANG_Q35RT_FUSED_TRACK_METADATA must be 0 or 1")
         self._fused_track_metadata = fused_track == "1"
+        fused_graph = os.environ.get("SGLANG_Q35RT_FUSED_CYCLE_GRAPH", "0")
+        if fused_graph not in ("0", "1"):
+            raise ValueError("SGLANG_Q35RT_FUSED_CYCLE_GRAPH must be 0 or 1")
+        if fused_graph == "1" and not self.engine.fused_cycle_enabled:
+            raise ValueError("q35rt fused graph requires the fused cycle implementation")
+        self.q35rt_capture_fused_cycle = fused_graph == "1"
         self._cycle_track_count = None
         self.q35rt_pd_stage_bytes_per_slot = (
             30 * 8192 * 3 * 2 if self._pd_staging else 0
