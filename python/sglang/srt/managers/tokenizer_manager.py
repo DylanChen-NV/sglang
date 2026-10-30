@@ -1141,6 +1141,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
+        if os.environ.get("SGLANG_Q35RT", "0") == "1" and isinstance(
+            obj, GenerateReqInput
+        ):
+            if obj.return_logprob:
+                raise ValueError("q35rt/DFLASH does not support return_logprob yet")
+            if getattr(obj, "input_embeds", None) is not None:
+                raise ValueError(
+                    "q35rt currently accepts token IDs or text, not input_embeds"
+                )
         # FIXME: unify the length validation logic with the one in the scheduler.
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0

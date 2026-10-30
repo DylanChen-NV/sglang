@@ -7,6 +7,7 @@
 import concurrent.futures
 import contextlib
 import logging
+import os
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type
 
 import torch
@@ -193,6 +194,25 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
 
 
 def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], str]:
+    if os.environ.get("SGLANG_Q35RT", "0") == "1":
+        from sglang.srt.models.qwen35_q35rt import (
+            Q35rtDFlashDraftModel,
+            Q35rtForCausalLM,
+        )
+
+        architectures = getattr(model_config.hf_config, "architectures", [])
+        expected = (
+            "DFlashDraftModel"
+            if model_config.is_draft_model
+            else "Qwen3_5MoeForConditionalGeneration"
+        )
+        if expected not in architectures:
+            raise ValueError(f"SGLANG_Q35RT=1 requires {expected}, got {architectures}")
+        cls = Q35rtDFlashDraftModel if model_config.is_draft_model else Q35rtForCausalLM
+        model_config._resolved_model_arch = cls.__name__
+        model_config._resolved_model_impl = _model_impl_from_architecture(cls.__name__)
+        return cls, cls.__name__
+
     from sglang.srt.models.registry import ModelRegistry
 
     architectures = getattr(model_config.hf_config, "architectures", [])

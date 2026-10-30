@@ -539,7 +539,11 @@ class NixlKVManager(CommonKVManager):
             lambda ptr, size: self._register_staging_memory(ptr, size, gpu_id),
             self.kv_args,
             count,
-            get_schedule().chunked_prefill_size,
+            (
+                self.server_args.context_length
+                if envs.SGLANG_Q35RT_PD.get()
+                else get_schedule().chunked_prefill_size
+            ),
         )
 
     def _init_staging_allocator(self):
@@ -1096,6 +1100,25 @@ class NixlKVManager(CommonKVManager):
                     "NIXL heterogeneous-TP direct-to-host KV transfer is not "
                     "implemented safely yet"
                 )
+            if envs.SGLANG_Q35RT_PD.get():
+                if (
+                    not self.enable_staging
+                    or self.attn_tp_size != 2
+                    or peer_info.decode_tp_size != 1
+                ):
+                    raise ValueError("q35rt native PD requires CP2 -> TP1 bulk staging")
+                if (
+                    len(self.kv_args.kv_item_lens) != 32
+                    or len(peer_info.dst_kv_item_lens) != 32
+                    or any(
+                        dst != 2 * src
+                        for src, dst in zip(
+                            self.kv_args.kv_item_lens, peer_info.dst_kv_item_lens
+                        )
+                    )
+                ):
+                    raise ValueError("q35rt target/draft PD region geometry differs")
+                return
             self._init_hetero_tp_prep_handle(
                 peer_info.agent_name,
                 peer_info,
@@ -1724,6 +1747,10 @@ class NixlKVManager(CommonKVManager):
         dst_kv_indices: npt.NDArray[np.int32],
         notif: str,
     ):
+        if envs.SGLANG_Q35RT_PD.get():
+            raise RuntimeError(
+                "q35rt mixed KV requires bulk staging; refusing unsafe slice fallback"
+            )
         # Prepped path: src dlist is shared per decode_tp_size; dst is per peer.
         assert self.prep_handle_slice_src is not None
         assert peer_name in self.prep_handles_slice_dst
@@ -1777,6 +1804,17 @@ class NixlKVManager(CommonKVManager):
         staging_buffer=None,
     ):
         """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
+        if envs.SGLANG_Q35RT_PD.get():
+            return self._send_q35rt_kvcache_staged(
+                peer_name,
+                prefill_kv_indices,
+                dst_staging_ptr,
+                dst_staging_size,
+                dst_gpu_id,
+                dst_attn_tp_size,
+                notif,
+                staging_buffer,
+            )
         from sglang.srt.disaggregation.common.staging_buffer import (
             compute_head_slice_params,
             compute_staging_layout,
@@ -1875,6 +1913,44 @@ class NixlKVManager(CommonKVManager):
             raise RuntimeError("[Staging] NIXL bulk transfer failed to post")
         return xfer_handle
 
+    def _send_q35rt_kvcache_staged(
+        self,
+        peer_name,
+        pages,
+        dst_ptr,
+        dst_size,
+        dst_gpu_id,
+        dst_tp_size,
+        notif,
+        staging_buffer,
+    ):
+        from sglang.srt.disaggregation.common.q35rt_staging import pack
+
+        if dst_tp_size != 1 or staging_buffer is None:
+            raise ValueError("q35rt native PD requires TP1 decode and a staging buffer")
+        rank_bytes = len(pages) * sum(self.kv_args.kv_item_lens)
+        if dst_size < 2 * rank_bytes:
+            raise ValueError("q35rt decode staging pool is too small for this prefix")
+        if pack(self, pages, staging_buffer, notif) != rank_bytes:
+            raise RuntimeError("q35rt packed KV byte count mismatch")
+        dst_write = dst_ptr + (self.kv_args.engine_rank % 2) * rank_bytes
+        source = self.agent.get_xfer_descs(
+            np.array(
+                [[staging_buffer.get_ptr(), rank_bytes, self.kv_args.gpu_id]],
+                dtype=np.int64,
+            ),
+            "VRAM",
+        )
+        destination = self.agent.get_xfer_descs(
+            np.array([[dst_write, rank_bytes, dst_gpu_id]], dtype=np.int64), "VRAM"
+        )
+        handle = self.agent.initialize_xfer(
+            "WRITE", source, destination, peer_name, notif.encode("ascii")
+        )
+        if not handle or self.agent.transfer(handle) == "ERR":
+            raise RuntimeError("q35rt native NIXL bulk transfer failed")
+        return handle
+
     def _try_create_staging_strategy(self, staging_buffer):
         """Create a per-worker PrefillStagingStrategy bound to ``staging_buffer``.
 
@@ -1917,6 +1993,13 @@ class NixlKVManager(CommonKVManager):
             instead of falling back to the slice path.
         """
         page_start = kv_chunk.index_slice.start
+        if envs.SGLANG_Q35RT_PD.get():
+            # Sender indices are relative to the delta; receiver req_to_token
+            # is indexed by the whole logical sequence, including its hit.
+            prefix = req.decode_prefix_len or 0
+            if prefix % self.kv_args.page_size:
+                raise ValueError("q35rt PD cached prefix must be page aligned")
+            page_start += prefix // self.kv_args.page_size
         num_pages = len(kv_chunk.prefill_kv_indices)
 
         ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
@@ -2025,6 +2108,11 @@ class NixlKVManager(CommonKVManager):
     ):
         """Transfer Mamba states via RDMA."""
         assert len(prefill_state_indices) == 1, "Mamba should have single state index"
+
+        if envs.SGLANG_Q35RT_PD.get():
+            from sglang.srt.disaggregation.common.q35rt_staging import capture_state
+
+            capture_state(self, prefill_state_indices[0], notif)
         assert len(dst_state_indices) == len(
             prefill_state_indices
         ), "State indices count mismatch between Prefill and Decode"
@@ -2101,6 +2189,11 @@ class NixlKVManager(CommonKVManager):
             f"Decode attn_tp_size={decode_tp_size}."
         )
         assert len(prefill_state_indices) == 1, "Mamba should have single state index"
+
+        if envs.SGLANG_Q35RT_PD.get():
+            from sglang.srt.disaggregation.common.q35rt_staging import capture_state
+
+            capture_state(self, prefill_state_indices[0], notif)
 
         if not src_state_dim_per_tensor or not dst_state_dim_per_tensor:
             return self._send_mamba_state(

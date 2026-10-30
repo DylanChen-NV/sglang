@@ -159,7 +159,12 @@ class PrefillBootstrapQueue:
             cps = server_args.chunked_prefill_size or 8192
             # Staging slices each send into a fixed page-aligned grid, so an
             # unbounded (-1) or non-page-aligned chunk size has no valid grid.
-            if cps <= 0 or cps % page_size != 0:
+            q35rt_full_prefill = (
+                envs.SGLANG_Q35RT_PD.get()
+                and server_args.enable_qwen35_cp_prefill
+                and server_args.chunked_prefill_size == -1
+            )
+            if (cps <= 0 or cps % page_size != 0) and not q35rt_full_prefill:
                 raise RuntimeError(
                     f"SGLANG_DISAGG_STAGING_BUFFER requires a positive "
                     f"chunked_prefill_size that is a multiple of page_size "
@@ -270,6 +275,8 @@ class PrefillBootstrapQueue:
             self.is_mla_backend,
         )
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
+        if envs.SGLANG_Q35RT_PD.get():
+            kv_manager.q35rt_mamba_cache = self.token_to_kv_pool.mamba_pool.mamba_cache
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
             and hasattr(kv_manager, "set_kv_buffer_tensors")

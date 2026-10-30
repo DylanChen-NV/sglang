@@ -1858,6 +1858,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         self._commit_hicache_local_restore_to_req(decode_req)
 
+        # Storage conversion runs only after native transfer completion and
+        # before admission to the decode queue. The receiver retains ownership
+        # and all existing abort/metadata validation paths above stay in force.
+        pool = self.scheduler.token_to_kv_pool_allocator.get_kvcache()
+        if hasattr(pool, "q35rt_import_received"):
+            pool.q35rt_import_received(decode_req.req, self.scheduler.req_to_token_pool)
+
         # Case 3: Success - commit the transfer
         # PD true-retraction rebootstrap: the prefill recomputed the prefix KV
         # under the current weights and sampled a fresh handoff token, but when

@@ -180,6 +180,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_num_layers=int(draft_num_layers) * kvc.server_args.dcp_size,
                 )
 
+        # Backend compute and canonical PD storage share the native allocator's
+        # token budget. Charge both formats and logical-position scratch.
+        if hasattr(kvc.model, "q35rt_kv_bytes_per_token"):
+            self._cell_size = kvc.model.q35rt_kv_bytes_per_token
+
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
         # args to config cell size

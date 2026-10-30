@@ -274,7 +274,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
-        self._use_fused_kv_materialize = is_cuda() or is_hip()
+        self._q35rt_direct_logits = getattr(
+            self.draft_model, "q35rt_direct_logits", False
+        )
+        self._use_fused_kv_materialize = (
+            is_cuda() or is_hip()
+        ) and not self._q35rt_direct_logits
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
@@ -331,11 +336,13 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         self._draft_worker.init_attention_backends()
-        self._need_mamba_verify_commit = mambaish_config(
-            self.model_runner.model_config
-        ) is not None and hasattr(
-            self.model_runner.attn_backend,
-            "update_mamba_state_after_mtp_verify",
+        self._need_mamba_verify_commit = (
+            not self._q35rt_direct_logits
+            and mambaish_config(self.model_runner.model_config) is not None
+            and hasattr(
+                self.model_runner.attn_backend,
+                "update_mamba_state_after_mtp_verify",
+            )
         )
 
     def init_cuda_graphs(self):
@@ -363,6 +370,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def _maybe_build_draft_sampler(self):
+        if self._q35rt_direct_logits:
+            return None
+
         def _eager(reason):
             if self.ps.tp_rank == 0:
                 logger.info("DFLASH draft greedy head kept eager (reason=%s).", reason)
@@ -1032,6 +1042,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         only the live prefix rows without constructing masked/packed index tensors.
         """
         from sglang.srt.models.qwen35_cp import enabled, materialize_draft
+
         if enabled():
             if cache_loc_2d is not None or commit_lens is not None:
                 raise ValueError("M2 CP does not support speculative verify")
@@ -1408,6 +1419,18 @@ class DFlashWorkerV2(BaseSpecWorker):
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
 
+            if getattr(
+                self.target_worker.model_runner.model,
+                "q35rt_prefill_materializes_context",
+                False,
+            ):
+                logits_output.hidden_states = None
+                batch_output.next_draft_input = self._make_next_draft_input_prefill(
+                    bonus_tokens=next_token_ids,
+                    seq_lens=batch.seq_lens,
+                )
+                return batch_output
+
             if logits_output.hidden_states is None:
                 raise RuntimeError(
                     "DFLASH requires target aux hidden capture for prefill, but got None. "
@@ -1495,7 +1518,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         target_model = self.target_worker.model_runner.model
         embed_module = target_model.get_input_embeddings()
         lm_head = getattr(target_model, "lm_head", None)
-        if lm_head is None or not hasattr(lm_head, "weight"):
+        if not self._q35rt_direct_logits and (
+            lm_head is None or not hasattr(lm_head, "weight")
+        ):
             raise RuntimeError(
                 "DFLASH requires the target model to expose `lm_head` with `weight`."
             )
@@ -1569,8 +1594,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
-        noise_embedding = embed_module(block_ids)
-        input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
+        if self._q35rt_direct_logits:
+            input_embeds = None
+        else:
+            noise_embedding = embed_module(block_ids)
+            input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
@@ -1633,7 +1661,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
-        if self._draft_sampler is not None and draft_out.can_run_graph:
+        if self._q35rt_direct_logits:
+            draft_next = draft_logits_output.next_token_logits.view(bs, block_size, -1)[
+                :, 1:
+            ].argmax(-1)
+        elif self._draft_sampler is not None and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
@@ -1840,7 +1872,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             # accept_len; recompute it from the forced commit_lens.
             new_seq_lens = None
 
-        if self._need_mamba_verify_commit:
+        if self._q35rt_direct_logits:
+            target_model.q35rt_commit(batch, commit_lens, bonus, prefix_lens)
+        elif self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
                 batch=batch,
@@ -1861,13 +1895,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         hidden = hidden.view(bs, int(self.block_size), -1)
 
-        self._append_target_hidden_to_draft_kv_by_loc(
-            target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=verify_out_cache_loc,
-            cache_loc_2d=verify_out_cache_loc_2d,
-            positions=positions,
-            commit_lens=commit_lens,
-        )
+        if not self._q35rt_direct_logits:
+            self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+                cache_loc=verify_out_cache_loc,
+                cache_loc_2d=verify_out_cache_loc_2d,
+                positions=positions,
+                commit_lens=commit_lens,
+            )
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
