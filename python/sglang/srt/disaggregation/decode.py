@@ -495,6 +495,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+        if self.enable_staging and hasattr(self.token_to_kv_pool, "q35rt_bind_pd_manager"):
+            self.token_to_kv_pool.q35rt_bind_pd_manager(kv_manager)
         # Staging buffer setup (only when heterogeneous TP staging is enabled)
         if self.enable_staging and not self.is_mla_backend:
             kv_pool_for_heads = self.token_to_kv_pool

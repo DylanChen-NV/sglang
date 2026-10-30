@@ -15,6 +15,7 @@ import os
 import torch
 from torch import nn
 
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
@@ -30,6 +31,32 @@ def enabled():
 
 
 _ENGINES = {}
+
+
+class Q35rtAttentionBackend(AttentionBackend):
+    """q35rt reads native pool maps directly, without MHA/GDN metadata.
+
+    Graph input loading, allocation, deferred Mamba clear/COW and checkpoint
+    ownership stay on the normal ModelRunner/Scheduler paths. Only metadata
+    consumed by native attention layers is absent: q35rt invokes none of them.
+    """
+
+    needs_cpu_seq_lens = False
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        if max_bs != 1 or max_num_tokens != 8:
+            raise ValueError("q35rt attention adapter requires the BS1/T8 graph")
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        return 1
+
+
+def build_q35rt_attention_backend():
+    # Keep the prior metadata path available for controlled A/B measurements.
+    value = os.environ.get("SGLANG_Q35RT_NATIVE_ATTN_METADATA", "0")
+    if value not in ("0", "1"):
+        raise ValueError("SGLANG_Q35RT_NATIVE_ATTN_METADATA must be 0 or 1")
+    return None if value == "1" else Q35rtAttentionBackend()
 
 
 class Q35rtNativeKVPool(MHATokenToKVPool):
@@ -94,6 +121,7 @@ class Q35rtHybridKVPool(HybridLinearKVPool):
         super().__init__(**kwargs)
         self._draft_pool = draft_pool
         self._conv_receive = None
+        self._direct_pd_slab = False
         if pd_staging:
             conv = self.mamba_pool.mamba_cache.conv[0]
             self._conv_receive = torch.zeros(
@@ -117,6 +145,17 @@ class Q35rtHybridKVPool(HybridLinearKVPool):
                     )
         return ptrs, lengths, items
 
+    def q35rt_bind_pd_manager(self, manager):
+        value = os.environ.get("SGLANG_Q35RT_DIRECT_PD_SLAB", "0")
+        if value not in ("0", "1"):
+            raise ValueError("SGLANG_Q35RT_DIRECT_PD_SLAB must be 0 or 1")
+        if value == "1":
+            manager.q35rt_slab_targets = (
+                self.full_kv_pool.slab_key, self.full_kv_pool.slab_value,
+                self._draft_pool.slab_key, self._draft_pool.slab_value,
+            )
+            self._direct_pd_slab = True
+
     def q35rt_import_received(self, req, req_pool):
         # Native receiver wrote only delta KV. Cached prefix slabs remain live;
         # their canonical transport buffers need not have been refreshed.
@@ -132,6 +171,11 @@ class Q35rtHybridKVPool(HybridLinearKVPool):
         if os.environ.get("Q35_PD_VERIFY_DIR"):
             from sglang.srt.disaggregation.common.q35rt_staging import verify_received
 
+            if self._direct_pd_slab:
+                # Debug-only independent export through the validated old
+                # layout converter; compare the actual slabs with P packets.
+                self.full_kv_pool.export_locations(locations)
+                self._draft_pool.export_locations(locations)
             verify_received(
                 req,
                 locations,
@@ -140,8 +184,9 @@ class Q35rtHybridKVPool(HybridLinearKVPool):
                 + self._draft_pool.k_buffer
                 + self._draft_pool.v_buffer,
             )
-        self.full_kv_pool.import_locations(locations)
-        self._draft_pool.import_locations(locations)
+        if not self._direct_pd_slab:
+            self.full_kv_pool.import_locations(locations)
+            self._draft_pool.import_locations(locations)
         if self._conv_receive is not None:
             slots = req_pool.translate_mamba_indices(
                 req_pool.req_index_to_mamba_index_mapping[
@@ -169,6 +214,7 @@ class Q35rtForCausalLM(nn.Module):
     """Opt-in leaf compute model driven by the native SGLang worker."""
 
     q35rt_direct_logits = True
+    q35rt_build_attention_backend = staticmethod(build_q35rt_attention_backend)
     q35rt_prefill_materializes_context = True
     # Shared native target/draft page ownership, explicit accepted-state
     # checkpoints and delta-only PD import satisfy UnifiedRadixCache's contract.
@@ -508,6 +554,7 @@ class Q35rtForCausalLM(nn.Module):
 
 class Q35rtDFlashDraftModel(nn.Module):
     q35rt_direct_logits = True
+    q35rt_build_attention_backend = staticmethod(build_q35rt_attention_backend)
     supports_fused_context_kv = False
 
     def __init__(self, config, quant_config=None, prefix=""):

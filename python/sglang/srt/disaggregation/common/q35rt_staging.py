@@ -149,6 +149,14 @@ def scatter(manager, staging_view, pages, prefill_tp):
     total = count * row_elements * 4
     if staging_view.numel() < total:
         raise ValueError("q35rt decode staging region is too small")
+    if hasattr(manager, "q35rt_slab_targets"):
+        from q35rt.cache_ops import scatter_packed_cp2_to_slabs
+
+        scatter_packed_cp2_to_slabs(
+            staging_view[:total], pages, *manager.q35rt_slab_targets,
+            manager.kv_args.page_size,
+        )
+        return
     _scatter[(len(widths), 2, triton.cdiv(count * max(widths), 1024))](
         *values,
         pages,
