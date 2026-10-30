@@ -353,6 +353,8 @@ class CPDecoderLayer(nn.Module):
             return attention(self, x, positions, ctx)
         import flashinfer
         from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import fused_qk_gemma_rmsnorm_rope_gate
+        from sglang.kernels.ops.attention.qwen35_cp_qk_pack import norm_pack
+        from sglang.kernels.ops.attention.qwen35_cp_pack import unpack, combine
         from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
         from sglang.srt.runtime_context import get_server_args
 
@@ -360,10 +362,16 @@ class CPDecoderLayer(nn.Module):
         bf = dict(dtype=torch.bfloat16, device=ctx.loc.device)
         if E:
             qg, k, v = F.linear(x, w["qkv"]).split([8192, 512, 512], -1)
-            q, k, gate = fused_qk_gemma_rmsnorm_rope_gate(
-                qg, k, w["qn"], w["kn"], ctx.rope, positions, 1e-6,
-                16, 2, 256, 64, has_gate=True)
-            q, k, v = q.view(E, 2, 8, 256), k.view(E, 2, 256), v.view(E, 2, 256)
+            if ctx.single:
+                q, k, gate = fused_qk_gemma_rmsnorm_rope_gate(
+                    qg, k, w["qn"], w["kn"], ctx.rope, positions, 1e-6,
+                    16, 2, 256, 64, has_gate=True)
+                q, k, v = q.view(E, 2, 8, 256), k.view(E, 2, 256), v.view(E, 2, 256)
+            else:
+                qa = torch.empty(L, 8, 256, **bf)
+                send = torch.empty(E, 2560, **bf)
+                gate = norm_pack(qg, k, v, w["qn"], w["kn"], ctx.rope, positions,
+                                 qa, ctx.kh, ctx.vh, send, r, ctx.start)
         if ctx.single:
             if r == 0:
                 local_k, local_v = k[:, :1].contiguous(), v[:, :1].contiguous()
@@ -376,19 +384,9 @@ class CPDecoderLayer(nn.Module):
         else:
             s, e = ctx.start, ctx.end
             ps, pe = ctx.rows[1 - r]
-            qa = torch.empty(L, 8, 256, **bf)
-            copy_rows(qa[s:e], q[:, r])
-            copy_rows(ctx.kh[s:e, 0], k[:, r])
-            copy_rows(ctx.vh[s:e, 0], v[:, r])
-            send = torch.empty(E, 2560, **bf)
-            copy_rows(send[:, :2048].view(E, 8, 256), q[:, 1-r])
-            copy_rows(send[:, 2048:2304], k[:, 1-r])
-            copy_rows(send[:, 2304:], v[:, 1-r])
             recv = torch.empty(pe-ps, 2560, **bf)
             ctx.exchange(send, recv)
-            copy_rows(qa[ps:pe], recv[:, :2048].view(-1, 8, 256))
-            copy_rows(ctx.kh[ps:pe, 0], recv[:, 2048:2304])
-            copy_rows(ctx.vh[ps:pe, 0], recv[:, 2304:])
+            unpack(recv, qa, ctx.kh, ctx.vh, ps)
             local_k, local_v = ctx.kh[:L], ctx.vh[:L]
         pool = ctx.backend.token_to_kv_pool
         # Keep pool-managed physical-slot translation and fuse the K/V store.
@@ -415,10 +413,9 @@ class CPDecoderLayer(nn.Module):
             cum_seq_lens_kv=cu_kv, window_left=-1, out_dtype=torch.bfloat16)
         if not ctx.single:
             combined = torch.empty(E, 2, 8, 256, **bf)
-            copy_rows(combined[:, r], out[s:e])
             recv = torch.empty(E, 8, 256, **bf)
             ctx.exchange(out[ps:pe], recv)
-            copy_rows(combined[:, 1-r], recv)
+            combine(out[s:e], recv, combined, r)
             out = combined
         out = fused_sigmoid_mul(out.reshape(E, 4096), gate, inplace=True)
         return F.linear(out, w["o"])

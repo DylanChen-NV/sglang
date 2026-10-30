@@ -411,9 +411,9 @@ def persist_checkpoint(ctx):
 def attention(layer, x, positions, ctx):
     """Ulysses for new queries, attending to cached prefix plus new keys."""
     import flashinfer
-    from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import fused_qk_gemma_rmsnorm_rope_gate
+    from sglang.kernels.ops.attention.qwen35_cp_qk_pack import norm_pack
+    from sglang.kernels.ops.attention.qwen35_cp_pack import unpack, combine
     from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
-    from sglang.srt.models.qwen35_cp import copy_rows
     from sglang.srt.runtime_context import get_server_args
 
     w, r, E, L, P = layer.weights, ctx.rank, ctx.size, ctx.length, ctx.prefix
@@ -424,21 +424,12 @@ def attention(layer, x, positions, ctx):
     send = torch.empty(E, 2560, **bf)
     if E:
         qg, k, v = F.linear(x, w['qkv']).split([8192, 512, 512], -1)
-        q, k, gate = fused_qk_gemma_rmsnorm_rope_gate(qg, k, w['qn'], w['kn'],
-            ctx.rope, positions, 1e-6, 16, 2, 256, 64, has_gate=True)
-        q, k, v = q.view(E, 2, 8, 256), k.view(E, 2, 256), v.view(E, 2, 256)
-        copy_rows(qa[s:e], q[:, r])
-        copy_rows(ctx.kh[P+s:P+e, 0], k[:, r])
-        copy_rows(ctx.vh[P+s:P+e, 0], v[:, r])
-        copy_rows(send[:, :2048].view(E, 8, 256), q[:, 1-r])
-        copy_rows(send[:, 2048:2304], k[:, 1-r])
-        copy_rows(send[:, 2304:], v[:, 1-r])
+        gate = norm_pack(qg, k, v, w['qn'], w['kn'], ctx.rope, positions,
+                         qa, ctx.kh, ctx.vh, send, r, s, P)
     recv = torch.empty(pe-ps, 2560, **bf)
     ctx.exchange(send, recv)
     if pe > ps:
-        copy_rows(qa[ps:pe], recv[:, :2048].view(-1, 8, 256))
-        copy_rows(ctx.kh[P+ps:P+pe, 0], recv[:, 2048:2304])
-        copy_rows(ctx.vh[P+ps:P+pe, 0], recv[:, 2304:])
+        unpack(recv, qa, ctx.kh, ctx.vh, ps, P)
     pool = ctx.backend.token_to_kv_pool
     ctx.kh[:P].copy_(pool.get_key_buffer(layer.layer_id)[ctx.prefix_loc])
     ctx.vh[:P].copy_(pool.get_value_buffer(layer.layer_id)[ctx.prefix_loc])
@@ -452,10 +443,9 @@ def attention(layer, x, positions, ctx):
         bmm2_scale=1.0, batch_size=1, cum_seq_lens_q=ctx.cu_full,
         cum_seq_lens_kv=ctx.cu_kv, window_left=-1, out_dtype=torch.bfloat16)
     combined = torch.empty(E, 2, 8, 256, **bf)
-    copy_rows(combined[:, r], out[s:e])
     recv = torch.empty(E, 8, 256, **bf)
     ctx.exchange(out[ps:pe], recv)
-    copy_rows(combined[:, 1-r], recv)
+    combine(out[s:e], recv, combined, r)
     if not E:
         return x
     return F.linear(fused_sigmoid_mul(combined.reshape(E, 4096), gate, inplace=True), w['o'])
