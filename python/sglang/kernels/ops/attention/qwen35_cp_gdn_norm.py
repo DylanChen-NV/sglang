@@ -40,9 +40,7 @@ def _split_norm(X, Q, K, V, ST: tl.constexpr, SD: tl.constexpr):
     variance = tl.sum(x * x, axis=1)
     normalized = x / tl.sqrt(variance + 1e-6)[:, None]
     output = tl.where(family == 0, Q, K) + token * 2048
-    out = tl.make_block_ptr(
-        output, (16, 128), (128, 1), (0, 0), (16, 128), (1, 0)
-    )
+    out = tl.make_block_ptr(output, (16, 128), (128, 1), (0, 0), (16, 128), (1, 0))
     tl.store(out, normalized.to(out.dtype.element_ty))
     head = tl.arange(0, 16)
     col = tl.arange(0, 128)
