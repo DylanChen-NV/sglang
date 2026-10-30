@@ -30,6 +30,13 @@ def enabled():
     return os.environ.get("SGLANG_Q35RT", "0") == "1"
 
 
+def recurrent_state_layout():
+    value = os.environ.get("SGLANG_Q35RT_SSM_LAYOUT", "vk")
+    if value not in ("vk", "chunked_kv"):
+        raise ValueError("SGLANG_Q35RT_SSM_LAYOUT must be vk or chunked_kv")
+    return value
+
+
 _ENGINES = {}
 
 
@@ -122,6 +129,7 @@ class Q35rtHybridKVPool(HybridLinearKVPool):
         self._draft_pool = draft_pool
         self._conv_receive = None
         self._direct_pd_slab = False
+        self._ssm_layout = recurrent_state_layout()
         if pd_staging:
             conv = self.mamba_pool.mamba_cache.conv[0]
             self._conv_receive = torch.zeros(
@@ -187,12 +195,13 @@ class Q35rtHybridKVPool(HybridLinearKVPool):
         if not self._direct_pd_slab:
             self.full_kv_pool.import_locations(locations)
             self._draft_pool.import_locations(locations)
-        if self._conv_receive is not None:
+        if self._conv_receive is not None or self._ssm_layout == "chunked_kv":
             slots = req_pool.translate_mamba_indices(
                 req_pool.req_index_to_mamba_index_mapping[
                     req.req_pool_idx : req.req_pool_idx + 1
                 ]
             )
+        if self._conv_receive is not None:
             if os.environ.get("Q35_PD_VERIFY_DIR"):
                 from sglang.srt.disaggregation.common.q35rt_staging import verify_state
 
@@ -204,6 +213,13 @@ class Q35rtHybridKVPool(HybridLinearKVPool):
             self.mamba_pool.mamba_cache.conv[0][:, slots] = self._conv_receive[
                 :, slots
             ].float()
+        if self._ssm_layout == "chunked_kv":
+            from q35rt.cache_ops import transpose_native_ssm_inplace
+
+            # NIXL always receives the standard VK wire format. Cache COW,
+            # checkpoints and offload copy whole opaque slots; only q35rt
+            # compute reads the chunked physical encoding after admission.
+            transpose_native_ssm_inplace(self.mamba_pool.mamba_cache.temporal, slots)
         # PD supplies the terminal recurrent state, superseding the deferred
         # cold clear / matched-prefix COW used by local extend forwards.
         req.mamba_needs_clear = False
@@ -411,13 +427,14 @@ class Q35rtForCausalLM(nn.Module):
         import hashlib
         import json
 
-        from q35rt.cache_ops import gather
+        from q35rt.cache_ops import convert_ssm_layout, gather
 
         pool = self.adapter.req_to_token_pool
         req = int(batch.req_pool_indices[0])
         slot = int(pool.req_index_to_mamba_index_mapping[req])
         state = pool.mamba_pool.mamba_cache
-        tensors = {"ssm": state.temporal[:, slot], "conv": state.conv[0][:, slot]}
+        tensors = {"ssm": convert_ssm_layout(state.temporal[:, slot],
+                    self.engine.recurrent_state_layout, "vk"), "conv": state.conv[0][:, slot]}
         if length:
             loc = pool.req_to_token[req, :length].to(torch.int64)
             tensors.update(
@@ -435,7 +452,8 @@ class Q35rtForCausalLM(nn.Module):
             tracked = int(batch.mamba_track_indices[0])
             row["track_slot"] = tracked
             for name, value in (
-                ("track_ssm", state.temporal[:, tracked]),
+                ("track_ssm", convert_ssm_layout(state.temporal[:, tracked],
+                    self.engine.recurrent_state_layout, "vk")),
                 ("track_conv", state.conv[0][:, tracked]),
             ):
                 row[name] = hashlib.sha256(
@@ -666,6 +684,7 @@ class Q35rtComputeAdapter:
                 state.temporal,
                 state.conv[0],
                 req_to_token_pool.req_index_to_mamba_index_mapping,
+                state_layout=recurrent_state_layout(),
             )
 
     def _bind_request(self, req_pool_indices):
