@@ -740,8 +740,10 @@ class Q35rtComputeAdapter:
         result = self.engine.query_forward(
             forward_batch.input_ids, forward_batch.positions[:1]
         )
-        return LogitsProcessorOutput(next_token_logits=result.logits)
+        return LogitsProcessorOutput(next_token_logits=result.logits,
+            customized_info={"q35rt_draft_top1": result.top1} if result.top1 is not None else None)
 
     def forward_draft(self):
         result = self.engine.draft_forward()
-        return LogitsProcessorOutput(next_token_logits=result.logits)
+        return LogitsProcessorOutput(next_token_logits=result.logits,
+            customized_info={"q35rt_draft_top1": result.top1} if result.top1 is not None else None)

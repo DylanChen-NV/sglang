@@ -1667,9 +1667,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_logits_output = draft_out.logits_output
 
         if self._q35rt_direct_logits:
-            draft_next = draft_logits_output.next_token_logits.view(bs, block_size, -1)[
-                :, 1:
-            ].argmax(-1)
+            cached_top1 = (draft_logits_output.customized_info or {}).get("q35rt_draft_top1")
+            if cached_top1 is not None:
+                draft_next = cached_top1.view(bs, block_size)[:, 1:]
+            else:
+                draft_next = draft_logits_output.next_token_logits.view(bs, block_size, -1)[
+                    :, 1:
+                ].argmax(-1)
         elif self._draft_sampler is not None and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
