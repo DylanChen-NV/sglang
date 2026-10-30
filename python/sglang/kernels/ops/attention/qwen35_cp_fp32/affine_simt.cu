@@ -4,6 +4,7 @@
 #include "cutlass/gemm/device/gemm_batched.h"
 #include "cutlass/epilogue/thread/linear_combination.h"
 #include "paired_mma.cuh"
+#include "packed_prepare.cuh"
 
 template <class Dense>
 struct Qwen35ZeroSkippingGemm {
@@ -16,7 +17,8 @@ struct Qwen35ZeroSkippingGemm {
   };
   CUTLASS_DEVICE
   void operator()(Params const& params, SharedStorage& storage) {
-    if (params.flags[blockIdx.z * params.tiles + blockIdx.x]) {
+    int const* flags = params.flags + blockIdx.z * (params.tiles + 1);
+    if (flags[blockIdx.x] || !flags[params.tiles]) {
       Dense operation;
       operation(params.gemm, storage);
     }
@@ -56,7 +58,7 @@ extern "C" int qwen35_fp32_affine(void* output, const void* u, const void* state
 // Only global A loads use BF16; MmaPipelined's NumericArrayConverter promotes
 // each loaded fragment exactly once, before its FP32 shared-memory store.
 extern "C" int qwen35_fp32_affine_u16(void* output, const void* u, const void* state,
-                                    const int* flags, int rows, void* stream) {
+                                    int* flags, int rows, void* stream) {
   using BF = cutlass::bfloat16_t;
   using Reference = cutlass::gemm::device::GemmBatched<
       float, cutlass::layout::RowMajor, float, cutlass::layout::ColumnMajor,
@@ -87,6 +89,12 @@ extern "C" int qwen35_fp32_affine_u16(void* output, const void* u, const void* s
       Mma, typename Original::Epilogue, Swizzle>;
   using Kernel = Qwen35ZeroSkippingGemm<Dense>;
   if (rows <= 0) return -3;
+  int tiles = (rows + 63) / 64;
+  qwen35_cp::packed_prepare<<<32 * (tiles + 1), 256, 0,
+      static_cast<cudaStream_t>(stream)>>>(static_cast<std::uint16_t*>(output),
+      static_cast<std::uint16_t const*>(u), static_cast<unsigned const*>(state),
+      flags, rows, tiles);
+  if (cudaGetLastError() != cudaSuccess) return -6;
   cutlass::gemm::GemmCoord problem(rows, 128, 128);
   Swizzle swizzle;
   auto tiled = swizzle.get_tiled_shape(problem, {64, 128, 8}, 32);

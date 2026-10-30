@@ -32,6 +32,7 @@ def _load_kernel(u16=False):
         raise RuntimeError("Fused FP32 CP affine requires the CUDA nvcc compiler")
     fingerprint = hashlib.sha256(source.read_bytes())
     fingerprint.update(source.with_name("paired_mma.cuh").read_bytes())
+    fingerprint.update(source.with_name("packed_prepare.cuh").read_bytes())
     for name in ("cutlass/gemm/device/gemm_batched.h", "cutlass/gemm/kernel/default_gemm.h",
                  "cutlass/gemm/threadblock/default_mma_core_simt.h",
                  "cutlass/epilogue/thread/linear_combination.h",
@@ -75,9 +76,9 @@ def _launch(output, u32, state):
         _, function, _ = _load_kernel(u16)
         args = [output.data_ptr(), u32.data_ptr(), state.data_ptr()]
         if u16:
-            from .zero_mask import prepare
+            from .zero_mask import flags_for
 
-            args.append(prepare(output, u32, state).data_ptr())
+            args.append(flags_for(output.device, len(u32)).data_ptr())
         status = function(*args, len(u32), torch.cuda.current_stream(output.device).cuda_stream)
     if status:
         raise RuntimeError("CUTLASS FP32 CP affine returned status %d" % status)
