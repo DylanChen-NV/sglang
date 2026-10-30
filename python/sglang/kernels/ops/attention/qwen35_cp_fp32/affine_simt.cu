@@ -3,6 +3,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm_batched.h"
 #include "cutlass/epilogue/thread/linear_combination.h"
+#include "paired_mma.cuh"
 
 extern "C" int qwen35_fp32_affine(void* output, const void* u, const void* state,
                                 int rows, void* stream) {
@@ -54,10 +55,15 @@ extern "C" int qwen35_fp32_affine_u16(void* output, const void* u, const void* s
   using IteratorA = cutlass::transform::threadblock::PredicatedTileIterator<
       cutlass::MatrixShape<64, 8>, BF, cutlass::layout::RowMajor, 1,
       typename OldMma::IteratorA::ThreadMap, 1>;
+  using OldPolicy = typename OldMma::Policy;
+  using Policy = cutlass::gemm::threadblock::MmaPolicy<
+      qwen35_cp::PairedWarpMma<typename OldPolicy::Operator>,
+      typename OldPolicy::SmemPaddingA, typename OldPolicy::SmemPaddingB,
+      OldPolicy::kPartitionsK>;
   using Mma = cutlass::gemm::threadblock::MmaPipelined<
       typename OldMma::Shape, IteratorA, typename OldMma::SmemIteratorA,
       typename OldMma::IteratorB, typename OldMma::SmemIteratorB,
-      float, cutlass::layout::RowMajor, typename OldMma::Policy>;
+      float, cutlass::layout::RowMajor, Policy>;
   using Swizzle = typename Reference::ThreadblockSwizzle;
   using Kernel = cutlass::gemm::kernel::GemmBatched<
       Mma, typename Original::Epilogue, Swizzle>;

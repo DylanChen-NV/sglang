@@ -31,6 +31,7 @@ def _load_kernel(u16=False):
     if not Path(compiler).is_file():
         raise RuntimeError("Fused FP32 CP affine requires the CUDA nvcc compiler")
     fingerprint = hashlib.sha256(source.read_bytes())
+    fingerprint.update(source.with_name("paired_mma.cuh").read_bytes())
     for name in ("cutlass/gemm/device/gemm_batched.h", "cutlass/gemm/kernel/default_gemm.h",
                  "cutlass/gemm/threadblock/default_mma_core_simt.h",
                  "cutlass/epilogue/thread/linear_combination.h",
