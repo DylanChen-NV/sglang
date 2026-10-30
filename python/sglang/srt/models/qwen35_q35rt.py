@@ -707,6 +707,7 @@ class Q35rtComputeAdapter:
         return LogitsProcessorOutput(
             next_token_logits=result.logits,
             hidden_states=result.hidden_states,
+            customized_info={"q35rt_target_top1": result.top1} if result.top1 is not None else None,
         )
 
     def commit(

@@ -39,6 +39,7 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
+    get_dflash_greedy_target_top1,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
 )
@@ -1755,8 +1756,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 barrier=grammar_barrier,
             )
 
+        logits_modified = False
         if sampling_info is not None:
-            apply_dflash_verify_logits_adjustments(
+            logits_modified = apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=int(self.block_size),
@@ -1792,9 +1794,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             out_tokens[:, int(self.block_size) - 1].fill_(0)
             out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
         else:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-                bs, int(self.block_size)
-            )
+            target_predict = get_dflash_greedy_target_top1(
+                logits_output, logits_modified=logits_modified, grammar_mask=grammar_mask
+            ).view(bs, int(self.block_size))
             if self._use_triton_accept_bonus:
                 try:
                     (
