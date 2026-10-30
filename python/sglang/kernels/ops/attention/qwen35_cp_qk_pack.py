@@ -6,7 +6,17 @@ change; K programs also copy their corresponding V head as raw BF16 bits.
 import torch
 import triton
 import triton.language as tl
+import functools
+import hashlib
+from pathlib import Path
 from .fused_qk_rmsnorm_rope_gate import _ENABLE_PDL
+
+
+@functools.lru_cache(maxsize=1)
+def _check_reference():
+    source=Path(__file__).with_name('fused_qk_rmsnorm_rope_gate.py')
+    if hashlib.sha256(source.read_bytes()).hexdigest()!='d1972dffb4da33fab4410567f32359527bc5c32794c8d8015ffc39b9b9d80cc1':
+        raise RuntimeError('CP Q/K arithmetic reference changed; revalidate packet fusion')
 
 
 @triton.jit
@@ -57,6 +67,7 @@ def _norm_pack(QG,K,V,QA,KH,VH,Send,Gate,QW,KW,Rope,Positions,
 
 
 def norm_pack(qg,k,v,qw,kw,rope,positions,qa,kh,vh,send,rank,start,prefix=0):
+    _check_reference()
     n=len(qg)
     gate=torch.empty(n,16,256,dtype=qg.dtype,device=qg.device)
     if n:

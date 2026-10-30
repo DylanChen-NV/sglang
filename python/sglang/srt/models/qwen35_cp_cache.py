@@ -412,7 +412,7 @@ def attention(layer, x, positions, ctx):
     """Ulysses for new queries, attending to cached prefix plus new keys."""
     import flashinfer
     from sglang.kernels.ops.attention.qwen35_cp_qk_pack import norm_pack
-    from sglang.kernels.ops.attention.qwen35_cp_pack import unpack, combine
+    from sglang.kernels.ops.attention.qwen35_cp_pack import unpack, combine, copy_prefix
     from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
     from sglang.srt.runtime_context import get_server_args
 
@@ -431,8 +431,8 @@ def attention(layer, x, positions, ctx):
     if pe > ps:
         unpack(recv, qa, ctx.kh, ctx.vh, ps, P)
     pool = ctx.backend.token_to_kv_pool
-    ctx.kh[:P].copy_(pool.get_key_buffer(layer.layer_id)[ctx.prefix_loc])
-    ctx.vh[:P].copy_(pool.get_value_buffer(layer.layer_id)[ctx.prefix_loc])
+    copy_prefix(pool.get_key_buffer(layer.layer_id),pool.get_value_buffer(layer.layer_id),
+                ctx.prefix_loc,ctx.kh,ctx.vh)
     pool.set_kv_buffer(layer, ctx.loc, ctx.kh[P:P+L], ctx.vh[P:P+L])
     kc = ctx.kh.view(-1, 64, 1, 256).permute(0, 2, 1, 3)
     vc = ctx.vh.view(-1, 64, 1, 256).permute(0, 2, 1, 3)
