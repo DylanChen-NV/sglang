@@ -448,6 +448,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_cow_src_indices: Optional[torch.Tensor] = None
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
     mamba_clear_indices: Optional[torch.Tensor] = None
+    # q35rt still uses native allocation/COW/publication; its compute contains
+    # draft query, target verify, and draft context in one eager model forward.
+    q35rt_fused_cycle: bool = False
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None

@@ -37,6 +37,7 @@ from sglang.srt.speculative.dflash_utils import (
     apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
     can_dflash_use_fused_qkv_proj,
+    can_use_q35rt_fused_cycle,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
     get_dflash_greedy_target_top1,
@@ -1399,6 +1400,44 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
+    def _forward_q35rt_fused_cycle(self, batch, block_ids, positions, cache_locations,
+                                   prefix_lens, on_publish):
+        """Native allocation, ModelRunner preparation, commit, and result ownership."""
+        from q35rt.framework_ops import pack_fused_cycle
+
+        verify = DFlashVerifyInput(
+            draft_token=block_ids.reshape(-1), positions=positions,
+            draft_token_num=int(self.block_size), custom_mask=None,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+        )
+        batch.out_cache_loc = cache_locations
+        host_lens, host_sum = batch.seq_lens_cpu, batch.seq_lens_sum
+        if host_lens is not None:
+            batch.seq_lens_cpu = host_lens + int(self.block_size)
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+        forward_batch, _ = verify.prepare_for_verify(
+            batch, self.target_worker, defer_metadata_init=True
+        )
+        batch.seq_lens_cpu, batch.seq_lens_sum = host_lens, host_sum
+        forward_batch.q35rt_fused_cycle = True
+        result = self.target_worker.forward_batch_generation(
+            batch=None, forward_batch=forward_batch, is_verify=True,
+            skip_attn_backend_init=False,
+        )
+        accept, committed, bonus, output, lengths = self._next_accept_bonus_buffers(1)
+        model = self.target_worker.model_runner.model
+        pack_fused_cycle(model.engine, prefix_lens, accept, committed, bonus, output,
+                         lengths, candidates=block_ids)
+        model.q35rt_commit(batch, committed, bonus, prefix_lens, tokens_already_advanced=True)
+        if on_publish is not None:
+            on_publish(lengths)
+        return GenerationBatchResult(
+            logits_output=result.logits_output, next_token_ids=output.reshape(-1),
+            accept_lens=committed, can_run_cuda_graph=False,
+            next_draft_input=self._make_next_draft_input_decode(bonus_tokens=bonus, new_seq_lens=lengths),
+            speculative_num_draft_tokens=int(self.block_size), new_seq_lens=lengths,
+        )
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -1608,6 +1647,18 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
+
+        if (
+            self._q35rt_direct_logits and bs == 1 and SIMULATE_ACC_LEN <= 0
+            and getattr(target_model.engine, "fused_cycle_enabled", False)
+            and can_use_q35rt_fused_cycle(
+                batch.sampling_info, has_grammar=batch.has_grammar,
+                return_sampling_mask=any(getattr(req, "return_sampling_mask", False) for req in batch.reqs),
+            )
+        ):
+            return self._forward_q35rt_fused_cycle(
+                batch, block_ids, positions, verify_out_cache_loc, prefix_lens, on_publish
+            )
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         if self.use_compact_draft_cache:

@@ -1542,6 +1542,7 @@ class ModelRunner:
             )
             can_run_graph = bool(
                 mode_check()
+                and not getattr(forward_batch, "q35rt_fused_cycle", False)
                 and self.decode_cuda_graph_runner
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
             )
@@ -1614,6 +1615,13 @@ class ModelRunner:
                 ret = self.eager_runner.execute(
                     forward_batch, pp_proxy_tensors=pp_proxy_tensors
                 )
+                if getattr(forward_batch, "q35rt_fused_cycle", False):
+                    # The megakernel reads the native map throughout forward.
+                    # Publish its WAR fence after the eager launch, as replay
+                    # does for ordinary q35rt graphs.
+                    read_done = torch.get_device_module(self.device).Event()
+                    read_done.record()
+                    self.war_fastpath_read_done_event = read_done
 
             if (
                 forward_batch.global_num_tokens_cpu is not None

@@ -405,7 +405,7 @@ class Q35rtForCausalLM(nn.Module):
             pd_staging=self._pd_staging,
         )
 
-    def q35rt_commit(self, batch, commit_lens, bonus, prefix_lens):
+    def q35rt_commit(self, batch, commit_lens, bonus, prefix_lens, *, tokens_already_advanced=False):
         slot, count = None, None
         if batch.mamba_track_indices is not None:
             from sglang.srt.runtime_context import get_exec
@@ -419,9 +419,11 @@ class Q35rtForCausalLM(nn.Module):
             slot = self.adapter.req_to_token_pool.translate_mamba_indices(
                 batch.mamba_track_indices
             )
-        self.adapter.commit(commit_lens, bonus, batch.req_pool_indices, slot, count)
+        self.adapter.commit(commit_lens, bonus, batch.req_pool_indices, slot, count,
+                            tokens_already_advanced=tokens_already_advanced)
         # Context must be materialized before native radix publication.
-        self.adapter.forward_context(batch.req_pool_indices)
+        if not tokens_already_advanced:
+            self.adapter.forward_context(batch.req_pool_indices)
 
     def _debug_state(self, label, batch, length):
         import hashlib
@@ -466,6 +468,8 @@ class Q35rtForCausalLM(nn.Module):
         if forward_batch.forward_mode.is_idle():
             return LogitsProcessorOutput(next_token_logits=self.engine.t_logits[:0])
         if forward_batch.forward_mode.is_target_verify():
+            if forward_batch.q35rt_fused_cycle:
+                return self.adapter.forward_cycle(forward_batch)
             return self.adapter.forward_target(forward_batch)
         if not forward_batch.forward_mode.is_extend() or forward_batch.batch_size != 1:
             raise ValueError(
@@ -710,6 +714,16 @@ class Q35rtComputeAdapter:
             customized_info={"q35rt_target_top1": result.top1} if result.top1 is not None else None,
         )
 
+    def forward_cycle(self, forward_batch):
+        if forward_batch.batch_size != 1 or not forward_batch.forward_mode.is_target_verify():
+            raise ValueError("q35rt fused cycle requires native BS1 target verify")
+        self._bind_request(forward_batch.req_pool_indices)
+        stream = torch.cuda.current_stream(self.engine.dev)
+        for tensor in (forward_batch.req_pool_indices, forward_batch.input_ids, forward_batch.positions):
+            tensor.record_stream(stream)
+        self.engine.fused_cycle_forward(forward_batch.input_ids[:1], forward_batch.positions[:1])
+        return LogitsProcessorOutput(next_token_logits=None)
+
     def commit(
         self,
         accepted_input_count,
@@ -717,14 +731,14 @@ class Q35rtComputeAdapter:
         req_pool_indices=None,
         checkpoint_slot=None,
         checkpoint_count=None,
+        tokens_already_advanced=False,
     ):
         # Replays do not execute Python forward: never assume its last borrowed
         # request-index pointer still identifies the active ScheduleBatch.
         if req_pool_indices is not None:
             self._bind_request(req_pool_indices)
-        self.engine.commit(
-            accepted_input_count, bonus, checkpoint_slot, checkpoint_count
-        )
+        kwargs = {"tokens_already_advanced": True} if tokens_already_advanced else {}
+        self.engine.commit(accepted_input_count, bonus, checkpoint_slot, checkpoint_count, **kwargs)
 
     def forward_context(self, req_pool_indices=None):
         if req_pool_indices is not None:

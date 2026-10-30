@@ -213,6 +213,22 @@ def apply_dflash_verify_logits_adjustments(
     return bool(modified)
 
 
+def can_use_q35rt_fused_cycle(sampling_info, *, has_grammar, return_sampling_mask=False):
+    if has_grammar or return_sampling_mask:
+        return False
+    if sampling_info is None:
+        return True
+    penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+    return bool(
+        sampling_info.is_all_greedy
+        and not sampling_info.has_custom_logit_processor
+        and getattr(sampling_info, "acc_linear_penalties", None) is None
+        and getattr(sampling_info, "logit_bias", None) is None
+        and getattr(sampling_info, "grammar_mask", None) is None
+        and not (penalizer is not None and penalizer.is_required)
+    )
+
+
 def get_dflash_greedy_target_top1(logits_output, *, logits_modified, grammar_mask):
     cached = (logits_output.customized_info or {}).get("q35rt_target_top1")
     if cached is not None and not logits_modified and grammar_mask is None:

@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.speculative.dflash_utils import (
     apply_dflash_verify_logits_adjustments,
+    can_use_q35rt_fused_cycle,
     get_dflash_greedy_target_top1,
 )
 
@@ -17,6 +18,23 @@ class SamplingInfo(SimpleNamespace):
 
 
 class TestDflashCachedTop1(unittest.TestCase):
+    def test_fused_cycle_sampling_guards(self):
+        base = dict(is_all_greedy=True, has_custom_logit_processor=False,
+                    acc_linear_penalties=None, penalizer_orchestrator=None,
+                    grammar_mask=None, logit_bias=None)
+        self.assertTrue(can_use_q35rt_fused_cycle(SamplingInfo(**base), has_grammar=False))
+        for name, value in (
+            ('is_all_greedy', False), ('has_custom_logit_processor', True),
+            ('acc_linear_penalties', object()), ('grammar_mask', object()),
+            ('logit_bias', object()), ('penalizer_orchestrator', SimpleNamespace(is_required=True)),
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(can_use_q35rt_fused_cycle(
+                    SamplingInfo(**dict(base, **{name: value})), has_grammar=False))
+        self.assertFalse(can_use_q35rt_fused_cycle(SamplingInfo(**base), has_grammar=True))
+        self.assertFalse(can_use_q35rt_fused_cycle(
+            SamplingInfo(**base), has_grammar=False, return_sampling_mask=True))
+
     def run_case(self, *, adjustment=None, grammar=False):
         logits = torch.tensor([[1., 2., 3.], [3., 2., 1.]])
         raw = logits.argmax(-1)
