@@ -1918,6 +1918,13 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
+        if logits_output.customized_info and "q35rt_target_top1" in logits_output.customized_info:
+            # This borrowed GPU workspace is internal to verify. Do not expose
+            # it as client metadata or mutate the captured graph's shared dict.
+            logits_output.customized_info = {
+                key: value for key, value in logits_output.customized_info.items()
+                if key != "q35rt_target_top1"
+            } or None
 
         next_draft_input = self._make_next_draft_input_decode(
             bonus_tokens=bonus,
