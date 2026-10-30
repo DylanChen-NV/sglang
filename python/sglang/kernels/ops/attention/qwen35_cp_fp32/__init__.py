@@ -63,7 +63,7 @@ def _load_kernel(u16=False):
                 command=command, seconds=time.monotonic()-started), indent=2) + "\n")
     handle = ctypes.CDLL(str(library))
     function = handle.qwen35_fp32_affine_u16 if u16 else handle.qwen35_fp32_affine
-    function.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+    function.argtypes = [ctypes.c_void_p] * (4 if u16 else 3) + [ctypes.c_int, ctypes.c_void_p]
     function.restype = ctypes.c_int
     # Retain the library handle with the callable for the worker's lifetime.
     return handle, function, library
@@ -71,9 +71,14 @@ def _load_kernel(u16=False):
 
 def _launch(output, u32, state):
     with torch.cuda.device(output.device):
-        _, function, _ = _load_kernel(u32.dtype == torch.bfloat16)
-        status = function(output.data_ptr(), u32.data_ptr(), state.data_ptr(), len(u32),
-                          torch.cuda.current_stream(output.device).cuda_stream)
+        u16 = u32.dtype == torch.bfloat16
+        _, function, _ = _load_kernel(u16)
+        args = [output.data_ptr(), u32.data_ptr(), state.data_ptr()]
+        if u16:
+            from .zero_mask import prepare
+
+            args.append(prepare(output, u32, state).data_ptr())
+        status = function(*args, len(u32), torch.cuda.current_stream(output.device).cuda_stream)
     if status:
         raise RuntimeError("CUTLASS FP32 CP affine returned status %d" % status)
     return output

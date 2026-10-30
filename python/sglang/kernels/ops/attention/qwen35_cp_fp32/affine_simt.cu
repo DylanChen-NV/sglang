@@ -5,6 +5,24 @@
 #include "cutlass/epilogue/thread/linear_combination.h"
 #include "paired_mma.cuh"
 
+template <class Dense>
+struct Qwen35ZeroSkippingGemm {
+  using SharedStorage = typename Dense::SharedStorage;
+  static int const kThreadCount = Dense::kThreadCount;
+  struct Params {
+    typename Dense::Params gemm;
+    int const* flags;
+    int tiles;
+  };
+  CUTLASS_DEVICE
+  void operator()(Params const& params, SharedStorage& storage) {
+    if (params.flags[blockIdx.z * params.tiles + blockIdx.x]) {
+      Dense operation;
+      operation(params.gemm, storage);
+    }
+  }
+};
+
 extern "C" int qwen35_fp32_affine(void* output, const void* u, const void* state,
                                 int rows, void* stream) {
   using BF = cutlass::bfloat16_t;
@@ -34,11 +52,11 @@ extern "C" int qwen35_fp32_affine(void* output, const void* u, const void* state
   return static_cast<int>(operation(args, nullptr, static_cast<cudaStream_t>(stream)));
 }
 
-// Keep the original FP32 shared-memory iterators, warp MMA and epilogue.
+// Keep the original shared-memory iterators, FP32 reduction order and epilogue.
 // Only global A loads use BF16; MmaPipelined's NumericArrayConverter promotes
 // each loaded fragment exactly once, before its FP32 shared-memory store.
 extern "C" int qwen35_fp32_affine_u16(void* output, const void* u, const void* state,
-                                    int rows, void* stream) {
+                                    const int* flags, int rows, void* stream) {
   using BF = cutlass::bfloat16_t;
   using Reference = cutlass::gemm::device::GemmBatched<
       float, cutlass::layout::RowMajor, float, cutlass::layout::ColumnMajor,
@@ -65,18 +83,20 @@ extern "C" int qwen35_fp32_affine_u16(void* output, const void* u, const void* s
       typename OldMma::IteratorB, typename OldMma::SmemIteratorB,
       float, cutlass::layout::RowMajor, Policy>;
   using Swizzle = typename Reference::ThreadblockSwizzle;
-  using Kernel = cutlass::gemm::kernel::GemmBatched<
+  using Dense = cutlass::gemm::kernel::GemmBatched<
       Mma, typename Original::Epilogue, Swizzle>;
+  using Kernel = Qwen35ZeroSkippingGemm<Dense>;
   if (rows <= 0) return -3;
   cutlass::gemm::GemmCoord problem(rows, 128, 128);
   Swizzle swizzle;
   auto tiled = swizzle.get_tiled_shape(problem, {64, 128, 8}, 32);
-  typename Kernel::Params params{
+  typename Dense::Params dense{
       problem, tiled,
       {const_cast<BF*>(static_cast<const BF*>(u)), 4096}, 128,
       {const_cast<float*>(static_cast<const float*>(state)), 128}, 16384,
       {static_cast<BF*>(output), 4096}, 128,
       {static_cast<BF*>(output), 4096}, 128, {1.0f, 1.0f}, 32};
+  typename Kernel::Params params{dense, flags, (rows + 63) / 64};
   int smem = int(sizeof(typename Kernel::SharedStorage));
   if (smem >= (48 << 10)) {
     auto error = cudaFuncSetAttribute(cutlass::Kernel<Kernel>,
