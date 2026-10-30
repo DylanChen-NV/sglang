@@ -1,6 +1,7 @@
 """DFLASH spec-v2 overlap scheduling data structures."""
 
 import contextlib
+import os
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -140,6 +141,11 @@ class DFlashDraftInputV2(SpecInput):
                 f"DFLASH invalid speculative_num_draft_tokens={block_size}."
             )
         page_size = batch.token_to_kv_pool_allocator.page_size
+        reserve_pages = os.environ.get("SGLANG_Q35RT_PAGE_RESERVATIONS", "0")
+        if reserve_pages not in ("0", "1"):
+            raise ValueError("SGLANG_Q35RT_PAGE_RESERVATIONS must be 0 or 1")
+        reserve_pages = reserve_pages == "1"
+        mapping_capacity = batch.req_to_token_pool.req_to_token.shape[1]
         nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]
         committed_seq_lens_sum = 0
         reserved_seq_lens_sum = 0
@@ -152,6 +158,13 @@ class DFlashDraftInputV2(SpecInput):
             # Read the allocation watermark from the req object like EAGLE.
             cur_alloc_len = int(req.kv.kv_allocated_len)
             reserved_len = max(cur_alloc_len, committed_len + 2 * block_size)
+            if reserve_pages and page_size > 1:
+                # The allocator already owns the whole final physical page.
+                # Materialize its remaining logical map entries now, then
+                # avoid preparing another allocation until that page fills.
+                aligned = (reserved_len + page_size - 1) // page_size * page_size
+                if aligned <= mapping_capacity:
+                    reserved_len = aligned
             top_k = int(req.sampling_params.top_k)
 
             batch_seq_lens_cpu_t[i] = committed_len
@@ -172,34 +185,36 @@ class DFlashDraftInputV2(SpecInput):
         self.max_top_k = max(max_top_k, 1)
         self.uniform_top_k_value = uniform_top_k_value if uniform_top_k else None
 
+        needs_plan = not reserve_pages or num_needed_tokens > 0
         caller_stream = None
-        if plan_stream is not None:
+        if needs_plan and plan_stream is not None:
             caller_stream = torch.get_device_module(batch.device).current_stream()
 
-        with plan_stream_ctx:
-            if plan_stream is not None and caller_stream is not None:
-                # `batch.seq_lens`, `batch.req_pool_indices`, and related tensors may
-                # have just been rebuilt on the scheduler stream by filter/merge ops.
-                # The plan stream must wait for those writes before reading them.
-                plan_stream.wait_stream(caller_stream)
+        if needs_plan:
+            with plan_stream_ctx:
+                if plan_stream is not None and caller_stream is not None:
+                    # `batch.seq_lens`, `batch.req_pool_indices`, and related tensors may
+                    # have just been rebuilt on the scheduler stream by filter/merge ops.
+                    # The plan stream must wait for those writes before reading them.
+                    plan_stream.wait_stream(caller_stream)
 
-            cur_kv_lens = self._prepare_cur_kv_lens_gpu_buf[:bs]
-            nxt_kv_lens = self._prepare_nxt_kv_lens_gpu_buf[:bs]
-            cur_kv_lens.copy_(cur_kv_lens_cpu_t, non_blocking=True)
-            nxt_kv_lens.copy_(nxt_kv_lens_cpu_t, non_blocking=True)
+                cur_kv_lens = self._prepare_cur_kv_lens_gpu_buf[:bs]
+                nxt_kv_lens = self._prepare_nxt_kv_lens_gpu_buf[:bs]
+                cur_kv_lens.copy_(cur_kv_lens_cpu_t, non_blocking=True)
+                nxt_kv_lens.copy_(nxt_kv_lens_cpu_t, non_blocking=True)
 
-            alloc_for_spec_decode(
-                batch.tree_cache,
-                batch.req_to_token_pool,
-                reqs=batch.reqs,
-                req_pool_indices=batch.req_pool_indices,
-                cur_kv_lens=cur_kv_lens,
-                cur_kv_lens_cpu=cur_kv_lens_cpu_t,
-                nxt_kv_lens=nxt_kv_lens,
-                nxt_kv_lens_cpu=nxt_kv_lens_cpu_t,
-                num_needed_tokens=num_needed_tokens,
-                batch=batch,
-            )
+                alloc_for_spec_decode(
+                    batch.tree_cache,
+                    batch.req_to_token_pool,
+                    reqs=batch.reqs,
+                    req_pool_indices=batch.req_pool_indices,
+                    cur_kv_lens=cur_kv_lens,
+                    cur_kv_lens_cpu=cur_kv_lens_cpu_t,
+                    nxt_kv_lens=nxt_kv_lens,
+                    nxt_kv_lens_cpu=nxt_kv_lens_cpu_t,
+                    num_needed_tokens=num_needed_tokens,
+                    batch=batch,
+                )
         if caller_stream is not None:
             # Enqueue the dependency on the caller's stream, not inside the
             # plan-stream context, so forward work cannot observe partially
