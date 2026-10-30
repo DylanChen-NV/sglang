@@ -73,6 +73,7 @@ class CPContext:
     zero_v: torch.Tensor
     convs: torch.Tensor
     zero_slot: torch.Tensor
+    pynccl_comm: object = None
     diagnostic_root: str = None
 
     @property
@@ -97,6 +98,25 @@ class CPContext:
         return get_attn_backend()
 
     def exchange(self, send=None, recv=None):
+        has_send = send is not None and send.numel() > 0
+        has_recv = recv is not None and recv.numel() > 0
+        if not has_send and not has_recv:
+            return
+        if self.pynccl_comm is not None:
+            # The supported executor has one active request, no overlap
+            # scheduler, and allocates/consumes these buffers on this stream.
+            # No allocator lifetime crosses to a separate communication stream.
+            comm = self.pynccl_comm
+            with comm.change_state(enable=True):
+                comm.group_start()
+                try:
+                    if has_send:
+                        comm.send(send, 1 - self.rank)
+                    if has_recv:
+                        comm.recv(recv, 1 - self.rank)
+                finally:
+                    comm.group_end()
+            return
         peer = dist.get_global_rank(self.group, 1 - self.rank)
         ops = []
         if send is not None and send.numel():
@@ -123,6 +143,23 @@ def attention_metadata(ctx):
 
 def gdn_metadata(ctx):
     return ctx.cu_local, ctx.has_initial
+
+
+def p2p_communicator(group):
+    """Choose one backend collectively, once, before the first model forward.
+
+    Use SGLang's existing communicator; never fall back after a NCCL error.
+    Its send/recv API submits on the caller's current stream.
+    """
+    comm = group.pynccl_comm
+    available = comm is not None and comm.available
+    agreed = torch.tensor([int(available)], dtype=torch.int32, device="cpu")
+    dist.all_reduce(agreed, op=dist.ReduceOp.MIN, group=group.cpu_group)
+    if not agreed.item():
+        return None
+    if comm.world_size != 2 or comm.rank != group.rank_in_group:
+        raise RuntimeError("CP communicator does not match the TP group")
+    return comm
 
 
 def make_context(model, input_ids, batch):
@@ -159,6 +196,7 @@ def make_context(model, input_ids, batch):
             zero_v=torch.zeros(capacity, 32, 128, dtype=torch.bfloat16, device=dev),
             convs=torch.zeros(30, 8192, 3, dtype=torch.bfloat16, device=dev),
             zero_slot=torch.zeros(1, dtype=torch.int32, device=dev),
+            pynccl_comm=p2p_communicator(get_parallel().tp_group),
         )
     model._cp_scratch["convs"].zero_()
     ctx = CPContext(length, get_parallel().tp_rank,
