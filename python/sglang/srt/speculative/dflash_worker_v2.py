@@ -284,6 +284,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         if defer_verify not in ("0", "1"):
             raise ValueError("SGLANG_Q35RT_DEFER_VERIFY_METADATA must be 0 or 1")
         self._q35rt_defer_verify_metadata = self._q35rt_direct_logits and defer_verify == "1"
+        track_window = os.environ.get("SGLANG_Q35RT_TRACK_WINDOW", "0")
+        if track_window not in ("0", "1"):
+            raise ValueError("SGLANG_Q35RT_TRACK_WINDOW must be 0 or 1")
+        self._q35rt_track_window = self._q35rt_direct_logits and track_window == "1"
         self._use_fused_kv_materialize = (
             is_cuda() or is_hip()
         ) and not self._q35rt_direct_logits
@@ -1416,7 +1420,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             batch.seq_lens_cpu = host_lens + int(self.block_size)
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
         forward_batch, _ = verify.prepare_for_verify(
-            batch, self.target_worker, defer_metadata_init=True
+            batch, self.target_worker, defer_metadata_init=True,
+            mamba_track_window=int(self.block_size) if self._q35rt_track_window else 0,
         )
         batch.seq_lens_cpu, batch.seq_lens_sum = host_lens, host_sum
         forward_batch.q35rt_fused_cycle = True

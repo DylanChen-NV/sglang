@@ -439,7 +439,11 @@ class Q35rtForCausalLM(nn.Module):
             )
         audit = os.environ.get("SGLANG_Q35RT_DEBUG_STATE", "0") == "1"
         if audit:
+            from sglang.srt.runtime_context import get_exec
+
             details = dict(commit_count=int(commit_lens[0]),
+                           prefix_count=int(prefix_lens[0]),
+                           track_interval=get_exec().mamba.mamba_track_interval,
                            checkpoint_count=None if count is None else int(count[0]))
             self._debug_state("pre_commit", batch, 0, **details)
         self.adapter.commit(commit_lens, bonus, batch.req_pool_indices, slot, count,
@@ -476,8 +480,15 @@ class Q35rtForCausalLM(nn.Module):
             row[name] = hashlib.sha256(
                 value.contiguous().view(torch.uint8).cpu().numpy().tobytes()
             ).hexdigest()
+        row["tracking_enabled"] = batch.mamba_track_indices is not None
+        tracked = None
         if batch.mamba_track_indices is not None:
             tracked = int(batch.mamba_track_indices[0])
+        elif label in ("pre_commit", "post_commit"):
+            position = batch.reqs[0].mamba_next_track_idx
+            if position is not None:
+                tracked = int(pool.req_index_to_mamba_ping_pong_track_buffer_mapping[req, position])
+        if tracked is not None and tracked >= 0:
             row["track_slot"] = tracked
             for name, value in (
                 ("track_ssm", convert_ssm_layout(state.temporal[:, tracked],

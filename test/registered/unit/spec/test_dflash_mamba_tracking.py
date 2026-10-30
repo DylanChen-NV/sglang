@@ -7,9 +7,45 @@ import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
+from sglang.srt.managers.schedule_batch import mamba_lazy_spec_in_window
 
 
 class TestDflashMambaTracking(unittest.TestCase):
+    def test_safe_window_covers_every_possible_inflight_crossing(self):
+        for interval in (4, 128, 512):
+            for block in (1, 8):
+                for committed in range(2 * interval + 1):
+                    req = SimpleNamespace(kv_committed_len=committed)
+                    reachable = mamba_lazy_spec_in_window(req, interval, block)
+                    for inflight in range(block + 1):
+                        prefix = committed + inflight
+                        for accepted in range(1, block + 1):
+                            if prefix // interval != (prefix + accepted) // interval:
+                                self.assertTrue(reachable, (interval, block, committed, inflight, accepted))
+
+    def test_window_clears_stale_metadata_and_refreshes_at_boundary(self):
+        batch = SimpleNamespace(
+            reqs=[SimpleNamespace(kv_committed_len=100)],
+            mamba_track_indices=torch.tensor([19]),
+            mamba_track_mask=torch.tensor([True]),
+            mamba_track_seqlens=torch.tensor([128]),
+        )
+        server_args = SimpleNamespace(enable_mamba_extra_buffer=lambda: True,
+                                      enable_mamba_extra_buffer_lazy=lambda: False)
+        with patch("sglang.srt.speculative.spec_utils.get_server_args", return_value=server_args), \
+             patch("sglang.srt.speculative.spec_utils.get_exec",
+                   return_value=SimpleNamespace(mamba=SimpleNamespace(mamba_track_interval=128))), \
+             patch("sglang.srt.speculative.spec_utils.set_mamba_track_indices_from_reqs") as gather:
+            prepare_mamba_track_for_verify(batch, max_draft_tokens=8)
+            gather.assert_not_called()
+            self.assertIsNone(batch.mamba_track_indices)
+            self.assertIsNone(batch.mamba_track_mask)
+            self.assertIsNone(batch.mamba_track_seqlens)
+            batch.reqs[0].kv_committed_len = 112
+            prepare_mamba_track_for_verify(batch, max_draft_tokens=8)
+            gather.assert_called_once_with(batch, None)
+
     def test_verify_refreshes_slots_after_filter_and_ping_pong_swap(self):
         factory = torch.tensor
         batch = SimpleNamespace(

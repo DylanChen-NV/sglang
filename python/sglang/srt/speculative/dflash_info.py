@@ -56,6 +56,7 @@ class DFlashVerifyInput(SpecInput):
         target_worker: TpModelWorker,
         *,
         defer_metadata_init: bool = False,
+        mamba_track_window: int = 0,
     ) -> tuple[ForwardBatch, bool]:
         """Prepare a DFLASH verify forward batch for overlap scheduling.
 
@@ -77,7 +78,7 @@ class DFlashVerifyInput(SpecInput):
         # the state that actually corresponds to a cached checkpoint length.
         from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
 
-        prepare_mamba_track_for_verify(batch)
+        prepare_mamba_track_for_verify(batch, max_draft_tokens=mamba_track_window)
         verify_forward_batch = ForwardBatch.init_new(
             batch,
             target_worker.model_runner,

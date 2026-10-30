@@ -38,7 +38,10 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
+from sglang.srt.managers.schedule_batch import (
+    mamba_lazy_spec_in_window,
+    set_mamba_track_indices_from_reqs,
+)
 from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool as assign_req_to_token_pool,
@@ -749,7 +752,9 @@ def move_accept_tokens_to_target_kvcache(
     )
 
 
-def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
+def prepare_mamba_track_for_verify(
+    batch: ScheduleBatch, *, max_draft_tokens: int = 0
+) -> None:
     """Rebuild mamba track indices from reqs before a TARGET_VERIFY forward.
 
     Spec batches skip the refresh in prepare_for_decode, and filter/merge
@@ -764,6 +769,19 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     server_args = get_server_args()
     if not server_args.enable_mamba_extra_buffer():
         return
+    batch.mamba_track_mask = None
+    batch.mamba_track_seqlens = None
+    if max_draft_tokens > 0:
+        interval = get_exec().mamba.mamba_track_interval
+        # The native window includes the one in-flight verify that has not
+        # reached CPU Req accounting yet. Only omit the snapshot when *no*
+        # request can reach a boundary, including its current verify block.
+        if all(
+            not mamba_lazy_spec_in_window(req, interval, max_draft_tokens)
+            for req in batch.reqs
+        ):
+            batch.mamba_track_indices = None
+            return
     track_positions = None
     if server_args.enable_mamba_extra_buffer_lazy():
         track_positions = batch.mamba_lazy_spec_track_positions_cpu
@@ -774,8 +792,6 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
             "must run in prepare_for_decode for every spec decode iteration"
         )
     set_mamba_track_indices_from_reqs(batch, track_positions)
-    batch.mamba_track_mask = None
-    batch.mamba_track_seqlens = None
 
 
 def _verify_commit_step_indices(
