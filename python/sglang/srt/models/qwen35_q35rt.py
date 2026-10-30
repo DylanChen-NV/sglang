@@ -437,13 +437,20 @@ class Q35rtForCausalLM(nn.Module):
             slot = self.adapter.req_to_token_pool.translate_mamba_indices(
                 batch.mamba_track_indices
             )
+        audit = os.environ.get("SGLANG_Q35RT_DEBUG_STATE", "0") == "1"
+        if audit:
+            details = dict(commit_count=int(commit_lens[0]),
+                           checkpoint_count=None if count is None else int(count[0]))
+            self._debug_state("pre_commit", batch, 0, **details)
         self.adapter.commit(commit_lens, bonus, batch.req_pool_indices, slot, count,
                             tokens_already_advanced=tokens_already_advanced)
+        if audit:
+            self._debug_state("post_commit", batch, 0, **details)
         # Context must be materialized before native radix publication.
         if not tokens_already_advanced:
             self.adapter.forward_context(batch.req_pool_indices)
 
-    def _debug_state(self, label, batch, length):
+    def _debug_state(self, label, batch, length, **details):
         import hashlib
         import json
 
@@ -464,6 +471,7 @@ class Q35rtForCausalLM(nn.Module):
                 draft_value=gather(self.engine.d_vc, loc),
             )
         row = dict(label=label, length=length, request=req, slot=slot)
+        row.update(details)
         for name, value in tensors.items():
             row[name] = hashlib.sha256(
                 value.contiguous().view(torch.uint8).cpu().numpy().tobytes()

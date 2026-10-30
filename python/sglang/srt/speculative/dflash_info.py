@@ -71,6 +71,13 @@ class DFlashVerifyInput(SpecInput):
             if batch.forward_mode.is_idle()
             else ForwardMode.TARGET_VERIFY
         )
+        # Spec decode preparation and filter/merge can leave tracking metadata
+        # unset. Refresh native ping-pong slots before either graph or eager
+        # verify, as the other speculative workers do, so acceptance publishes
+        # the state that actually corresponds to a cached checkpoint length.
+        from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
+
+        prepare_mamba_track_for_verify(batch)
         verify_forward_batch = ForwardBatch.init_new(
             batch,
             target_worker.model_runner,
