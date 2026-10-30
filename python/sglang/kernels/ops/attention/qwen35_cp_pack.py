@@ -69,3 +69,23 @@ def combine(local,peer,out,rank):
             local.view(torch.int16),peer.view(torch.int16),out.view(torch.int16),
             n,rank,4096,num_warps=4)
     return out
+
+
+@triton.jit
+def _prefix(K,V,Index,KH,VH,N,ks,vs,B:tl.constexpr):
+    i=tl.program_id(0)*B+tl.arange(0,B)
+    row,col=i//256,i%256
+    slot=tl.load(Index+row,i<N*256,other=0).to(tl.int64)
+    k=tl.load(K+slot*ks+col,i<N*256,other=0)
+    v=tl.load(V+slot*vs+col,i<N*256,other=0)
+    tl.store(KH+i,k,i<N*256)
+    tl.store(VH+i,v,i<N*256)
+
+
+def copy_prefix(k,v,index,kh,vh):
+    """Read native physical slots directly into CP scratch; pool stays unchanged."""
+    n=index.numel()
+    if n:
+        _prefix[(triton.cdiv(n*256,4096),)](
+            k.view(torch.int16),v.view(torch.int16),index,kh.view(torch.int16),vh.view(torch.int16),
+            n,k.stride(0),v.stride(0),4096,num_warps=4)
