@@ -717,6 +717,9 @@ class Q35rtComputeAdapter:
     def forward_cycle(self, forward_batch):
         if forward_batch.batch_size != 1 or not forward_batch.forward_mode.is_target_verify():
             raise ValueError("q35rt fused cycle requires native BS1 target verify")
+        if not getattr(self, "_fused_cycle_logged", False):
+            logger.info("q35rt fused query/verify/context active; native state commit remains explicit")
+            self._fused_cycle_logged = True
         self._bind_request(forward_batch.req_pool_indices)
         stream = torch.cuda.current_stream(self.engine.dev)
         for tensor in (forward_batch.req_pool_indices, forward_batch.input_ids, forward_batch.positions):
