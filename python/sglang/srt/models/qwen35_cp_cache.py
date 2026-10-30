@@ -497,7 +497,17 @@ def gdn(layer, x, ctx):
     q, k, v = l2norm_fwd(q[0].contiguous()), l2norm_fwd(k[0].contiguous()), v[0].contiguous()
     alpha, beta = torch.exp(g[0].float()), beta[0].float()
 
-    def run(values, initial, fp32_output=False, rounded_output=False, bf16_output=False):
+    pair = None
+    if not ctx.single and r == 1 and (
+        ctx.affine_mode == "two-bf16"
+        or (ctx.affine_mode == "fp32" and ctx.fp32_refinement == "u16-fused-gemm")
+    ):
+        from sglang.kernels.ops.attention.qwen35_cp_gdn import create_pair
+
+        pair = create_pair(q, k, alpha, beta, ctx.cu_local, ctx.zero_v[:E])
+
+    def run(values, initial, fp32_output=False, rounded_output=False, bf16_output=False,
+            homogeneous=False):
         options = {}
         checkpoints = None
         if 0 < cut < E:
@@ -515,9 +525,13 @@ def gdn(layer, x, ctx):
                                                   else ctx.fp32_workspace.u_view(E)),
                                round_output_to_bf16=True,
                                emit_bf16_output=(ctx.fp32_refinement == "none"))
-        out,state = kernel(q=q, k=k, v=values, g=alpha, beta=beta,
-            scale=None, initial_state=initial, output_final_state=True, cu_seqlens=ctx.cu_local,
-            use_qk_l2norm_in_kernel=False, output_state=torch.empty_like(initial), **options)
+        if pair is not None:
+            out, state = pair.run(values, initial, output_state=torch.empty_like(initial),
+                                  homogeneous=homogeneous, **options)
+        else:
+            out,state = kernel(q=q, k=k, v=values, g=alpha, beta=beta,
+                scale=None, initial_state=initial, output_final_state=True, cu_seqlens=ctx.cu_local,
+                use_qk_l2norm_in_kernel=False, output_state=torch.empty_like(initial), **options)
         checkpoint = checkpoints[:1].clone() if checkpoints is not None else (state if cut == E else None)
         return out,state,checkpoint
 
@@ -532,7 +546,7 @@ def gdn(layer, x, ctx):
             u16 = ctx.fp32_refinement == "u16-fused-gemm"
             u, transition, checkpoint_transition = run(ctx.zero_v[:E], ctx.eye,
                 rounded_output=(ctx.fp32_optimization == "u-output" and not u16),
-                bf16_output=u16)
+                bf16_output=u16, homogeneous=True)
             # Receive only after local GDN and the U/transition response.
             # Reuse scratch without retaining asynchronous Work across compute.
             previous = (ctx.fp32_views.previous if ctx.fp32_views is not None
