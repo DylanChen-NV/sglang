@@ -605,11 +605,8 @@ def gdn(layer, x, ctx):
     from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
     from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
-    from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
     from sglang.kernels.ops.attention.fla.layernorm_gated import layernorm_fn
-    from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
-        fused_qkv_split_gdn_prefill,
-    )
+    from sglang.kernels.ops.attention.qwen35_cp_gdn_norm import split_norm
     from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_fn
 
     w, E, r = layer.weights, ctx.size, ctx.rank
@@ -645,13 +642,8 @@ def gdn(layer, x, ctx):
         has_initial_state=ctx.has_initial,
         activation="silu",
     ).T[:E]
-    q, k, v = fused_qkv_split_gdn_prefill(xc, 16, 16, 32, 128, 128, 128)
+    q, k, v = split_norm(xc)
     g, beta = fused_gdn_gating(w["A_log"], a, b, w["dt_bias"])
-    q, k, v = (
-        l2norm_fwd(q[0].contiguous()),
-        l2norm_fwd(k[0].contiguous()),
-        v[0].contiguous(),
-    )
     alpha, beta = torch.exp(g[0].float()), beta[0].float()
 
     pair = None
