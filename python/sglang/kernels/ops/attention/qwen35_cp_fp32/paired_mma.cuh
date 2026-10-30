@@ -3,8 +3,8 @@
 
 namespace qwen35_cp {
 
-__device__ __forceinline__ void pair_fma(
-    float a, float b0, float b1, float& c0, float& c1) {
+__device__ __forceinline__ void pair_fma(float a, float b0, float b1, float &c0,
+                                         float &c1) {
   float x, y;
   asm("{ .reg .b64 a,b,c,d; mov.b64 a,{%2,%2}; mov.b64 b,{%3,%4}; "
       "mov.b64 c,{%5,%6}; fma.rn.f32x2 d,a,b,c; mov.b64 {%0,%1},d; }"
@@ -14,8 +14,7 @@ __device__ __forceinline__ void pair_fma(
   c1 = y;
 }
 
-template <class Base>
-struct PairedWarpMma : Base {
+template <class Base> struct PairedWarpMma : Base {
   using FragmentA = typename Base::FragmentA;
   using FragmentB = typename Base::FragmentB;
   using FragmentC = typename Base::FragmentC;
@@ -25,8 +24,8 @@ struct PairedWarpMma : Base {
   using LayoutC = typename Base::LayoutC;
 
   CUTLASS_DEVICE
-  void operator()(FragmentC& d, FragmentA a, FragmentB b,
-                  FragmentC const& c, int = 0) const {
+  void operator()(FragmentC &d, FragmentA a, FragmentB b, FragmentC const &c,
+                  int = 0) const {
     constexpr int M = ThreadShape::kM;
     constexpr int N = ThreadShape::kN;
     constexpr int K = ThreadShape::kK;
@@ -36,7 +35,8 @@ struct PairedWarpMma : Base {
     auto lc = LayoutC::packed({M, N});
     d = c;
     // Each output retains exactly the original increasing-K FMA sequence.
-    // Pairing independent N outputs changes instruction issue, not reduction order.
+    // Pairing independent N outputs changes instruction issue, not reduction
+    // order.
     CUTLASS_PRAGMA_UNROLL
     for (int k = 0; k < K; ++k) {
       CUTLASS_PRAGMA_UNROLL
@@ -52,4 +52,4 @@ struct PairedWarpMma : Base {
   }
 };
 
-}  // namespace qwen35_cp
+} // namespace qwen35_cp

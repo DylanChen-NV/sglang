@@ -1,4 +1,5 @@
 """Per-device scratch for the single-stream, single-active-request executor."""
+
 import functools
 
 import torch

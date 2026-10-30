@@ -94,6 +94,7 @@ class CPContext:
     @property
     def backend(self):
         from sglang.srt.model_executor.forward_context import get_attn_backend
+
         return get_attn_backend()
 
     def exchange(self, send=None, recv=None):
@@ -111,12 +112,16 @@ class CPContext:
             work.wait()
 
     def share_from(self, tensor, source):
-        dist.broadcast(tensor, src=dist.get_global_rank(self.group, source), group=self.group)
+        dist.broadcast(
+            tensor, src=dist.get_global_rank(self.group, source), group=self.group
+        )
         return tensor
 
 
 def rope_cache(dim, max_pos, device):
-    inv = 1.0 / (1e7 ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
+    inv = 1.0 / (
+        1e7 ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+    )
     f = torch.outer(torch.arange(max_pos, dtype=torch.float32, device=device), inv)
     return torch.cat([f.cos(), f.sin()], -1).contiguous()
 
@@ -135,9 +140,13 @@ def make_context(model, input_ids, batch):
     args = get_server_args()
     reuse = getattr(args, "enable_qwen35_cp_prefix_cache", False)
     if (not reuse and not args.disable_radix_cache) or args.chunked_prefill_size != -1:
-        raise ValueError("M2 CP requires --disable-radix-cache --chunked-prefill-size -1")
+        raise ValueError(
+            "M2 CP requires --disable-radix-cache --chunked-prefill-size -1"
+        )
     if args.mamba_ssm_dtype != "float32":
-        raise ValueError("M2 CP requires --mamba-ssm-dtype float32 to retain reference state precision")
+        raise ValueError(
+            "M2 CP requires --mamba-ssm-dtype float32 to retain reference state precision"
+        )
     if get_parallel().tp_size != 2 or get_parallel().pp_size != 1:
         raise ValueError("Qwen3.5 reference CP requires TP world 2 and PP 1")
     if batch.forward_mode.name != "EXTEND" or batch.batch_size != 1:
@@ -157,19 +166,28 @@ def make_context(model, input_ids, batch):
             rope=rope_cache(64, capacity, dev),
             kh=torch.zeros(capacity, 1, 256, dtype=torch.bfloat16, device=dev),
             vh=torch.zeros(capacity, 1, 256, dtype=torch.bfloat16, device=dev),
-            page_table=torch.arange(capacity // 64, dtype=torch.int32, device=dev)[None],
-            eye=torch.eye(128, dtype=torch.float32, device=dev).expand(1, 32, 128, 128).contiguous(),
+            page_table=torch.arange(capacity // 64, dtype=torch.int32, device=dev)[
+                None
+            ],
+            eye=torch.eye(128, dtype=torch.float32, device=dev)
+            .expand(1, 32, 128, 128)
+            .contiguous(),
             zero_state=torch.zeros(1, 32, 128, 128, dtype=torch.float32, device=dev),
             zero_v=torch.zeros(capacity, 32, 128, dtype=torch.bfloat16, device=dev),
             convs=torch.zeros(30, 8192, 3, dtype=torch.bfloat16, device=dev),
             zero_slot=torch.zeros(1, dtype=torch.int32, device=dev),
         )
     model._cp_scratch["convs"].zero_()
-    ctx = CPContext(length, get_parallel().tp_rank,
-                    get_parallel().tp_group.device_group,
-                    split_rows(length, align_cut=reuse), batch.out_cache_loc.long(), batch,
-                    **model._cp_scratch,
-                    diagnostic_root=os.environ.get("Q35_CP_LAYER_DIAGNOSTICS"))
+    ctx = CPContext(
+        length,
+        get_parallel().tp_rank,
+        get_parallel().tp_group.device_group,
+        split_rows(length, align_cut=reuse),
+        batch.out_cache_loc.long(),
+        batch,
+        **model._cp_scratch,
+        diagnostic_root=os.environ.get("Q35_CP_LAYER_DIAGNOSTICS"),
+    )
     batch.qwen35_cp_context = ctx
     ctx.final_states = []
     # These values are identical across the ten attention / thirty GDN layers.
@@ -183,6 +201,7 @@ def make_context(model, input_ids, batch):
     ctx.reuse = reuse
     if reuse:
         from sglang.srt.models.qwen35_cp_cache import initialize
+
         initialize(ctx, args)
     return ctx
 
@@ -198,27 +217,37 @@ def persist_states(ctx):
     if rank == owner:
         states = torch.cat(ctx.final_states, dim=0)
         convs = ctx.convs
+
         def heads(r):
-            return torch.cat([convs[:, :2048][:, r*1024:(r+1)*1024],
-                              convs[:, 2048:4096][:, r*1024:(r+1)*1024],
-                              convs[:, 4096:][:, r*2048:(r+1)*2048]], dim=1)
-        local_state = states[:, rank*16:(rank+1)*16]
+            return torch.cat(
+                [
+                    convs[:, :2048][:, r * 1024 : (r + 1) * 1024],
+                    convs[:, 2048:4096][:, r * 1024 : (r + 1) * 1024],
+                    convs[:, 4096:][:, r * 2048 : (r + 1) * 2048],
+                ],
+                dim=1,
+            )
+
+        local_state = states[:, rank * 16 : (rank + 1) * 16]
         local_conv = heads(rank)
-        ctx.exchange(send=states[:, (1-rank)*16:(2-rank)*16].contiguous())
-        ctx.exchange(send=heads(1-rank).contiguous())
+        ctx.exchange(send=states[:, (1 - rank) * 16 : (2 - rank) * 16].contiguous())
+        ctx.exchange(send=heads(1 - rank).contiguous())
     else:
         local_state = torch.empty(30, 16, 128, 128, dtype=torch.float32, device=dev)
         local_conv = torch.empty(30, 4096, 3, dtype=torch.bfloat16, device=dev)
         ctx.exchange(recv=local_state)
         ctx.exchange(recv=local_conv)
     pool = ctx.backend.req_to_token_pool
-    mid = pool.translate_mamba_indices(pool.get_mamba_indices(ctx.batch.req_pool_indices))
+    mid = pool.translate_mamba_indices(
+        pool.get_mamba_indices(ctx.batch.req_pool_indices)
+    )
     cache = pool.mamba_pool.mamba_cache
     cache.temporal[:, mid] = local_state[:, None]
     cache.conv[0][:, mid] = local_conv[:, None]
     ctx.final_states.clear()
     if ctx.reuse:
         from sglang.srt.models.qwen35_cp_cache import persist_checkpoint
+
         persist_checkpoint(ctx)
 
 
@@ -227,13 +256,19 @@ def write_layer_probe(ctx, layer, kind, value):
     if not ctx.diagnostic_root or not len(value):
         return
     size = len(value)
-    indices = sorted({0, min(1, size-1), min(2, size-1), size-1,
-                      max(0, size-2)} | {i*size//16 for i in range(16)})
-    selected = value.index_select(0, torch.tensor(indices, device=value.device)).detach().cpu()
-    root = Path(ctx.diagnostic_root)/f'L{ctx.length}'
+    indices = sorted(
+        {0, min(1, size - 1), min(2, size - 1), size - 1, max(0, size - 2)}
+        | {i * size // 16 for i in range(16)}
+    )
+    selected = (
+        value.index_select(0, torch.tensor(indices, device=value.device)).detach().cpu()
+    )
+    root = Path(ctx.diagnostic_root) / f"L{ctx.length}"
     root.mkdir(parents=True, exist_ok=True)
-    torch.save(dict(global_rows=[ctx.start+i for i in indices], output=selected),
-               root/f'rank{ctx.rank}.layer{layer:02d}.{kind}.pt')
+    torch.save(
+        dict(global_rows=[ctx.start + i for i in indices], output=selected),
+        root / f"rank{ctx.rank}.layer{layer:02d}.{kind}.pt",
+    )
 
 
 def param(*shape, dtype=None):
@@ -245,19 +280,37 @@ class CPDecoderLayer(nn.Module):
 
     def __init__(self, config, layer_id):
         super().__init__()
-        if (config.hidden_size, config.num_hidden_layers, config.num_experts) != (2048, 40, 256):
+        if (config.hidden_size, config.num_hidden_layers, config.num_experts) != (
+            2048,
+            40,
+            256,
+        ):
             raise ValueError("M2 CP is fixed to Qwen3.5-35B-A3B")
         self.layer_id = layer_id
         self.full = (layer_id + 1) % 4 == 0
         self.linear_id = layer_id - layer_id // 4
-        shapes = dict(in_ln=(2048,), post_ln=(2048,), router=(256, 2048),
-                      se_gu=(1024, 2048), se_down=(2048, 512), se_gate=(2048,),
-                      w13=(256, 32, 1024, 64), w2=(256, 8, 2048, 64))
+        shapes = dict(
+            in_ln=(2048,),
+            post_ln=(2048,),
+            router=(256, 2048),
+            se_gu=(1024, 2048),
+            se_down=(2048, 512),
+            se_gate=(2048,),
+            w13=(256, 32, 1024, 64),
+            w2=(256, 8, 2048, 64),
+        )
         if self.full:
             shapes.update(qkv=(9216, 2048), qn=(256,), kn=(256,), o=(2048, 4096))
         else:
-            shapes.update(qkvw=(8192, 2048), zw=(4096, 2048), ba=(64, 2048),
-                          conv=(8192, 4), gnorm=(128,), out=(2048, 4096), dt_bias=(32,))
+            shapes.update(
+                qkvw=(8192, 2048),
+                zw=(4096, 2048),
+                ba=(64, 2048),
+                conv=(8192, 4),
+                gnorm=(128,),
+                out=(2048, 4096),
+                dt_bias=(32,),
+            )
         self.weights = nn.ParameterDict({k: param(*s) for k, s in shapes.items()})
         if not self.full:
             self.weights["A_log"] = param(32, dtype=torch.float32)
@@ -268,64 +321,110 @@ class CPDecoderLayer(nn.Module):
             self._loaded_parts = set()
         self._loaded_parts.add(name)
         w = self.weights
-        simple = {"input_layernorm.weight": "in_ln", "post_attention_layernorm.weight": "post_ln",
-                  "mlp.gate.weight": "router", "mlp.shared_expert.down_proj.weight": "se_down",
-                  "mlp.shared_expert_gate.weight": "se_gate",
-                  "self_attn.q_norm.weight": "qn", "self_attn.k_norm.weight": "kn",
-                  "self_attn.o_proj.weight": "o", "linear_attn.in_proj_qkv.weight": "qkvw",
-                  "linear_attn.in_proj_z.weight": "zw", "linear_attn.conv1d.weight": "conv",
-                  "linear_attn.A_log": "A_log", "linear_attn.dt_bias": "dt_bias",
-                  "linear_attn.norm.weight": "gnorm", "linear_attn.out_proj.weight": "out"}
+        simple = {
+            "input_layernorm.weight": "in_ln",
+            "post_attention_layernorm.weight": "post_ln",
+            "mlp.gate.weight": "router",
+            "mlp.shared_expert.down_proj.weight": "se_down",
+            "mlp.shared_expert_gate.weight": "se_gate",
+            "self_attn.q_norm.weight": "qn",
+            "self_attn.k_norm.weight": "kn",
+            "self_attn.o_proj.weight": "o",
+            "linear_attn.in_proj_qkv.weight": "qkvw",
+            "linear_attn.in_proj_z.weight": "zw",
+            "linear_attn.conv1d.weight": "conv",
+            "linear_attn.A_log": "A_log",
+            "linear_attn.dt_bias": "dt_bias",
+            "linear_attn.norm.weight": "gnorm",
+            "linear_attn.out_proj.weight": "out",
+        }
         if name in simple:
             key = simple[name]
             w[key].data.copy_(value.reshape(w[key].shape))
             return key
-        pieces = {"self_attn.q_proj.weight": ("qkv", 0, 8192),
-                  "self_attn.k_proj.weight": ("qkv", 8192, 8704),
-                  "self_attn.v_proj.weight": ("qkv", 8704, 9216),
-                  "linear_attn.in_proj_b.weight": ("ba", 0, 32),
-                  "linear_attn.in_proj_a.weight": ("ba", 32, 64),
-                  "mlp.shared_expert.gate_proj.weight": ("se_gu", 0, 512),
-                  "mlp.shared_expert.up_proj.weight": ("se_gu", 512, 1024)}
+        pieces = {
+            "self_attn.q_proj.weight": ("qkv", 0, 8192),
+            "self_attn.k_proj.weight": ("qkv", 8192, 8704),
+            "self_attn.v_proj.weight": ("qkv", 8704, 9216),
+            "linear_attn.in_proj_b.weight": ("ba", 0, 32),
+            "linear_attn.in_proj_a.weight": ("ba", 32, 64),
+            "mlp.shared_expert.gate_proj.weight": ("se_gu", 0, 512),
+            "mlp.shared_expert.up_proj.weight": ("se_gu", 512, 1024),
+        }
         if name in pieces:
             key, a, b = pieces[name]
             w[key].data[a:b].copy_(value)
             return key
         if name in ("mlp.experts.gate_up_proj", "mlp.experts.down_proj"):
-            from flashinfer.fused_moe.core import (_maybe_get_cached_w3_w1_permute_indices,
-                                                  get_w2_permute_indices_with_cache)
+            from flashinfer.fused_moe.core import (
+                _maybe_get_cached_w3_w1_permute_indices,
+                get_w2_permute_indices_with_cache,
+            )
+
             if name.endswith("gate_up_proj"):
                 gate, up = value.chunk(2, dim=-2)
                 raw = torch.cat([up, gate], dim=1).to(w["w13"].device).view(torch.uint8)
-                indices = _maybe_get_cached_w3_w1_permute_indices({}, raw[0], 128, is_gated_act_gemm=True)
+                indices = _maybe_get_cached_w3_w1_permute_indices(
+                    {}, raw[0], 128, is_gated_act_gemm=True
+                )
                 key = "w13"
             else:
                 raw = value.to(w["w2"].device).view(torch.uint8)
                 indices = get_w2_permute_indices_with_cache({}, raw[0], 128)
                 key = "w2"
             shuffled = raw[:, indices.to(raw.device)]
-            packed = shuffled.view(shuffled.shape[0], shuffled.shape[1], -1, 128).permute(0, 2, 1, 3).contiguous().view(torch.bfloat16)
+            packed = (
+                shuffled.view(shuffled.shape[0], shuffled.shape[1], -1, 128)
+                .permute(0, 2, 1, 3)
+                .contiguous()
+                .view(torch.bfloat16)
+            )
             w[key].data.copy_(packed)
             return key
         return None
 
     def validate_loaded(self):
-        common = {"input_layernorm.weight", "post_attention_layernorm.weight", "mlp.gate.weight",
-                  "mlp.shared_expert.gate_proj.weight", "mlp.shared_expert.up_proj.weight",
-                  "mlp.shared_expert.down_proj.weight", "mlp.shared_expert_gate.weight",
-                  "mlp.experts.gate_up_proj", "mlp.experts.down_proj"}
+        common = {
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "mlp.gate.weight",
+            "mlp.shared_expert.gate_proj.weight",
+            "mlp.shared_expert.up_proj.weight",
+            "mlp.shared_expert.down_proj.weight",
+            "mlp.shared_expert_gate.weight",
+            "mlp.experts.gate_up_proj",
+            "mlp.experts.down_proj",
+        }
         if self.full:
-            names = {f"self_attn.{key}.weight" for key in ("q_proj", "k_proj", "v_proj", "q_norm", "k_norm", "o_proj")}
+            names = {
+                f"self_attn.{key}.weight"
+                for key in ("q_proj", "k_proj", "v_proj", "q_norm", "k_norm", "o_proj")
+            }
         else:
-            names = {f"linear_attn.{key}.weight" for key in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "conv1d", "norm", "out_proj")}
+            names = {
+                f"linear_attn.{key}.weight"
+                for key in (
+                    "in_proj_qkv",
+                    "in_proj_z",
+                    "in_proj_b",
+                    "in_proj_a",
+                    "conv1d",
+                    "norm",
+                    "out_proj",
+                )
+            }
             names.update(("linear_attn.A_log", "linear_attn.dt_bias"))
         missing = (common | names) - getattr(self, "_loaded_parts", set())
         if missing:
-            raise ValueError(f"CP layer {self.layer_id}: missing checkpoint tensors {sorted(missing)}")
+            raise ValueError(
+                f"CP layer {self.layer_id}: missing checkpoint tensors {sorted(missing)}"
+            )
         if not self.full:
             # The reference short-input fallback uses one QKVZ GEMM. Keep its
             # contiguous backing storage and expose views for the CP GEMMs.
-            self.register_buffer("_qkvz", torch.cat([self.weights["qkvw"], self.weights["zw"]]))
+            self.register_buffer(
+                "_qkvz", torch.cat([self.weights["qkvw"], self.weights["zw"]])
+            )
             self.weights["qkvw"].data = self._qkvz[:8192]
             self.weights["zw"].data = self._qkvz[8192:]
 
@@ -333,28 +432,46 @@ class CPDecoderLayer(nn.Module):
         import sgl_kernel as sk
         from flashinfer.fused_moe import trtllm_bf16_moe
         from flashinfer.fused_moe.core import ActivationType
-        from sglang.kernels.ops.elementwise.elementwise import fused_gate_sigmoid_mul_add
+
+        from sglang.kernels.ops.elementwise.elementwise import (
+            fused_gate_sigmoid_mul_add,
+        )
 
         w = self.weights
         shared = F.linear(sk.silu_and_mul(F.linear(x, w["se_gu"])), w["se_down"])
         out = trtllm_bf16_moe(
-            routing_logits=F.linear(x, w["router"]), routing_bias=None, hidden_states=x,
-            gemm1_weights=w["w13"], gemm2_weights=w["w2"], num_experts=256,
-            top_k=8, n_group=None, topk_group=None, intermediate_size=512,
-            local_expert_offset=0, local_num_experts=256, routed_scaling_factor=None,
-            routing_method_type=4, tune_max_num_tokens=1 << (len(x) - 1).bit_length(),
-            activation_type=ActivationType.Swiglu.value)
+            routing_logits=F.linear(x, w["router"]),
+            routing_bias=None,
+            hidden_states=x,
+            gemm1_weights=w["w13"],
+            gemm2_weights=w["w2"],
+            num_experts=256,
+            top_k=8,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=512,
+            local_expert_offset=0,
+            local_num_experts=256,
+            routed_scaling_factor=None,
+            routing_method_type=4,
+            tune_max_num_tokens=1 << (len(x) - 1).bit_length(),
+            activation_type=ActivationType.Swiglu.value,
+        )
         fused_gate_sigmoid_mul_add(x, w["se_gate"], shared, out)
         return out
 
     def attention(self, x, positions, ctx):
         if ctx.prefix:
             from sglang.srt.models.qwen35_cp_cache import attention
+
             return attention(self, x, positions, ctx)
         import flashinfer
-        from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import fused_qk_gemma_rmsnorm_rope_gate
+
+        from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
+            fused_qk_gemma_rmsnorm_rope_gate,
+        )
+        from sglang.kernels.ops.attention.qwen35_cp_pack import combine, unpack
         from sglang.kernels.ops.attention.qwen35_cp_qk_pack import norm_pack
-        from sglang.kernels.ops.attention.qwen35_cp_pack import unpack, combine
         from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
         from sglang.srt.runtime_context import get_server_args
 
@@ -364,14 +481,38 @@ class CPDecoderLayer(nn.Module):
             qg, k, v = F.linear(x, w["qkv"]).split([8192, 512, 512], -1)
             if ctx.single:
                 q, k, gate = fused_qk_gemma_rmsnorm_rope_gate(
-                    qg, k, w["qn"], w["kn"], ctx.rope, positions, 1e-6,
-                    16, 2, 256, 64, has_gate=True)
+                    qg,
+                    k,
+                    w["qn"],
+                    w["kn"],
+                    ctx.rope,
+                    positions,
+                    1e-6,
+                    16,
+                    2,
+                    256,
+                    64,
+                    has_gate=True,
+                )
                 q, k, v = q.view(E, 2, 8, 256), k.view(E, 2, 256), v.view(E, 2, 256)
             else:
                 qa = torch.empty(L, 8, 256, **bf)
                 send = torch.empty(E, 2560, **bf)
-                gate = norm_pack(qg, k, v, w["qn"], w["kn"], ctx.rope, positions,
-                                 qa, ctx.kh, ctx.vh, send, r, ctx.start)
+                gate = norm_pack(
+                    qg,
+                    k,
+                    v,
+                    w["qn"],
+                    w["kn"],
+                    ctx.rope,
+                    positions,
+                    qa,
+                    ctx.kh,
+                    ctx.vh,
+                    send,
+                    r,
+                    ctx.start,
+                )
         if ctx.single:
             if r == 0:
                 local_k, local_v = k[:, :1].contiguous(), v[:, :1].contiguous()
@@ -384,7 +525,7 @@ class CPDecoderLayer(nn.Module):
         else:
             s, e = ctx.start, ctx.end
             ps, pe = ctx.rows[1 - r]
-            recv = torch.empty(pe-ps, 2560, **bf)
+            recv = torch.empty(pe - ps, 2560, **bf)
             ctx.exchange(send, recv)
             unpack(recv, qa, ctx.kh, ctx.vh, ps)
             local_k, local_v = ctx.kh[:L], ctx.vh[:L]
@@ -406,11 +547,21 @@ class CPDecoderLayer(nn.Module):
         vc = vv.view(-1, 64, heads, 256).permute(0, 2, 1, 3)
         seq_len, cu_q, cu_kv = attention_metadata(ctx)
         out = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
-            query=query, kv_cache=(kc, vc), workspace_buffer=ctx.workspace,
-            block_tables=ctx.page_table, seq_lens=seq_len, max_q_len=L,
-            max_kv_len=get_server_args().context_length, bmm1_scale=256 ** -0.5,
-            bmm2_scale=1.0, batch_size=1, cum_seq_lens_q=cu_q,
-            cum_seq_lens_kv=cu_kv, window_left=-1, out_dtype=torch.bfloat16)
+            query=query,
+            kv_cache=(kc, vc),
+            workspace_buffer=ctx.workspace,
+            block_tables=ctx.page_table,
+            seq_lens=seq_len,
+            max_q_len=L,
+            max_kv_len=get_server_args().context_length,
+            bmm1_scale=256**-0.5,
+            bmm2_scale=1.0,
+            batch_size=1,
+            cum_seq_lens_q=cu_q,
+            cum_seq_lens_kv=cu_kv,
+            window_left=-1,
+            out_dtype=torch.bfloat16,
+        )
         if not ctx.single:
             combined = torch.empty(E, 2, 8, 256, **bf)
             recv = torch.empty(E, 8, 256, **bf)
@@ -423,17 +574,21 @@ class CPDecoderLayer(nn.Module):
     def gdn(self, x, ctx):
         if ctx.reuse:
             from sglang.srt.models.qwen35_cp_cache import gdn
+
             return gdn(self, x, ctx)
         from flashinfer.gdn_prefill import chunk_gated_delta_rule
+
         from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
         from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
         from sglang.kernels.ops.attention.fla.layernorm_gated import layernorm_fn
-        from sglang.kernels.ops.attention.triton_gdn_fused_proj import fused_qkv_split_gdn_prefill
+        from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+            fused_qkv_split_gdn_prefill,
+        )
         from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_fn
 
         w, E, r = self.weights, ctx.size, ctx.rank
         dev = ctx.loc.device
-        conv = ctx.convs[self.linear_id:self.linear_id+1]
+        conv = ctx.convs[self.linear_id : self.linear_id + 1]
         if E:
             if ctx.single:
                 qkvz = F.linear(x, self._qkvz)
@@ -446,26 +601,48 @@ class CPDecoderLayer(nn.Module):
             b, a = ba[:, :32], ba[:, 32:]
             if not ctx.single:
                 halo = torch.empty(3, 8192, dtype=mixed.dtype, device=dev)
-                ctx.exchange(mixed[-3:].contiguous() if r == 0 else None, halo if r == 1 else None)
+                ctx.exchange(
+                    mixed[-3:].contiguous() if r == 0 else None,
+                    halo if r == 1 else None,
+                )
                 if r == 1:
                     conv[0].copy_(halo.T)
             cu, has_initial = gdn_metadata(ctx)
             xc = causal_conv1d_fn(
-                mixed.T, w["conv"], None, conv_states=conv,
-                query_start_loc=cu, seq_lens_cpu=[E],
+                mixed.T,
+                w["conv"],
+                None,
+                conv_states=conv,
+                query_start_loc=cu,
+                seq_lens_cpu=[E],
                 cache_indices=ctx.zero_slot,
                 has_initial_state=has_initial,
-                activation="silu").T[:E]
+                activation="silu",
+            ).T[:E]
             q, k, v = fused_qkv_split_gdn_prefill(xc, 16, 16, 32, 128, 128, 128)
             g, beta = fused_gdn_gating(w["A_log"], a, b, w["dt_bias"])
-            q, k, v = l2norm_fwd(q[0].contiguous()), l2norm_fwd(k[0].contiguous()), v[0].contiguous()
+            q, k, v = (
+                l2norm_fwd(q[0].contiguous()),
+                l2norm_fwd(k[0].contiguous()),
+                v[0].contiguous(),
+            )
             alpha, beta = torch.exp(g[0].float()), beta[0].float()
+
             def run(values, initial):
                 return chunk_gated_delta_rule(
-                    q=q, k=k, v=values, g=alpha, beta=beta,
-                    scale=None, initial_state=initial, output_final_state=True,
-                    cu_seqlens=cu, use_qk_l2norm_in_kernel=False,
-                    output_state=torch.empty_like(initial))
+                    q=q,
+                    k=k,
+                    v=values,
+                    g=alpha,
+                    beta=beta,
+                    scale=None,
+                    initial_state=initial,
+                    output_final_state=True,
+                    cu_seqlens=cu,
+                    use_qk_l2norm_in_kernel=False,
+                    output_state=torch.empty_like(initial),
+                )
+
             out, state = run(v, ctx.zero_state)
             if not ctx.single:
                 if r == 0:
@@ -474,27 +651,49 @@ class CPDecoderLayer(nn.Module):
                     u, transition = run(ctx.zero_v[:E], ctx.eye)
                     previous = torch.empty_like(state)
                     ctx.exchange(recv=previous)
-                    out.transpose(0, 1).baddbmm_(u.transpose(0, 1), previous[0].to(u.dtype).transpose(1, 2))
-                    state = (torch.bmm(previous[0].float(), transition[0].float()) + state[0].float())[None]
+                    out.transpose(0, 1).baddbmm_(
+                        u.transpose(0, 1), previous[0].to(u.dtype).transpose(1, 2)
+                    )
+                    state = (
+                        torch.bmm(previous[0].float(), transition[0].float())
+                        + state[0].float()
+                    )[None]
         owner = 0 if ctx.single else 1
         if r == owner:
             ctx.final_states.append(state)
         if not E:
             return x
-        y = layernorm_fn(out.reshape(-1, 128), w["gnorm"], None, z=z.reshape(-1, 128),
-                         eps=1e-6, group_size=None, norm_before_gate=True,
-                         is_rms_norm=True, activation="swish")
+        y = layernorm_fn(
+            out.reshape(-1, 128),
+            w["gnorm"],
+            None,
+            z=z.reshape(-1, 128),
+            eps=1e-6,
+            group_size=None,
+            norm_before_gate=True,
+            is_rms_norm=True,
+            activation="swish",
+        )
         return F.linear(y.view(E, 4096), w["out"])
 
-    def forward(self, positions, hidden_states, residual, forward_batch,
-                captured_last_layer_outputs=None, **kwargs):
+    def forward(
+        self,
+        positions,
+        hidden_states,
+        residual,
+        forward_batch,
+        captured_last_layer_outputs=None,
+        **kwargs,
+    ):
         import sgl_kernel as sk
 
         ctx = forward_batch.qwen35_cp_context
         w = self.weights
         if ctx.size:
             if residual is None:
-                residual, x = hidden_states, sk.gemma_rmsnorm(hidden_states, w["in_ln"], 1e-6)
+                residual, x = hidden_states, sk.gemma_rmsnorm(
+                    hidden_states, w["in_ln"], 1e-6
+                )
             else:
                 sk.gemma_fused_add_rmsnorm(hidden_states, residual, w["in_ln"], 1e-6)
                 x = hidden_states
@@ -506,7 +705,9 @@ class CPDecoderLayer(nn.Module):
                 captured_last_layer_outputs.append(hidden_states)
         a = self.attention(x, positions, ctx) if self.full else self.gdn(x, ctx)
         if ctx.size:
-            write_layer_probe(ctx, self.layer_id, "attention" if self.full else "gdn", a)
+            write_layer_probe(
+                ctx, self.layer_id, "attention" if self.full else "gdn", a
+            )
             sk.gemma_fused_add_rmsnorm(a, residual, w["post_ln"], 1e-6)
             hidden_states = self.moe(a)
             write_layer_probe(ctx, self.layer_id, "moe", hidden_states)
@@ -528,7 +729,11 @@ def load_weights(model, weights):
             if key is not None:
                 loaded.add(f"model.layers.{number}.weights.{key}")
         elif body_name in ("embed_tokens.weight", "norm.weight"):
-            obj = body.embed_tokens.weight if body_name.startswith("embed") else body.norm.weight
+            obj = (
+                body.embed_tokens.weight
+                if body_name.startswith("embed")
+                else body.norm.weight
+            )
             getattr(obj, "weight_loader", default_weight_loader)(obj, value)
             loaded.add("model." + body_name)
         elif name == "lm_head.weight" and hasattr(model, "lm_head"):
@@ -544,12 +749,28 @@ def model_forward(model, input_ids, positions, batch, input_embeds=None):
     import sgl_kernel as sk
 
     ctx = make_context(model, input_ids, batch)
-    positions = torch.arange(ctx.prefix + ctx.start, ctx.prefix + ctx.end, dtype=torch.int64, device=input_ids.device)
-    hidden = model.embed_tokens(input_ids[ctx.start:ctx.end]) if input_embeds is None else input_embeds[ctx.start:ctx.end]
+    positions = torch.arange(
+        ctx.prefix + ctx.start,
+        ctx.prefix + ctx.end,
+        dtype=torch.int64,
+        device=input_ids.device,
+    )
+    hidden = (
+        model.embed_tokens(input_ids[ctx.start : ctx.end])
+        if input_embeds is None
+        else input_embeds[ctx.start : ctx.end]
+    )
     residual, aux = None, []
     for layer in model.layers:
-        hidden, residual = layer(positions, hidden, residual, batch,
-                                 captured_last_layer_outputs=aux if getattr(layer, "_is_layer_to_capture", False) else None)
+        hidden, residual = layer(
+            positions,
+            hidden,
+            residual,
+            batch,
+            captured_last_layer_outputs=(
+                aux if getattr(layer, "_is_layer_to_capture", False) else None
+            ),
+        )
     persist_states(ctx)
     last = torch.empty(1, 2048, dtype=torch.bfloat16, device=input_ids.device)
     owner = 0 if ctx.single else 1
@@ -564,14 +785,18 @@ def logits_output(model, input_ids, positions, batch, input_embeds=None):
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
     last, aux = model.model(input_ids, positions, batch, input_embeds)
-    logits = torch.empty(1, model.config.vocab_size, dtype=torch.bfloat16, device=last.device)
+    logits = torch.empty(
+        1, model.config.vocab_size, dtype=torch.bfloat16, device=last.device
+    )
     ctx = batch.qwen35_cp_context
     owner = 0 if ctx.single else 1
     if ctx.rank == owner:
-        logits.copy_(F.linear(last, model.lm_head.weight)[:, :model.config.vocab_size])
+        logits.copy_(F.linear(last, model.lm_head.weight)[:, : model.config.vocab_size])
     ctx.share_from(logits, owner)
-    return LogitsProcessorOutput(next_token_logits=logits.float(),
-                                 hidden_states=torch.cat(aux, -1) if aux else None)
+    return LogitsProcessorOutput(
+        next_token_logits=logits.float(),
+        hidden_states=torch.cat(aux, -1) if aux else None,
+    )
 
 
 class CPDraftWeights(nn.Module):
@@ -598,34 +823,63 @@ class CPDraftWeights(nn.Module):
 
 def materialize_draft(worker, hidden, cache_loc, positions):
     import sgl_kernel as sk
-    from sglang.kernels.ops.speculative.fused_kv_materialize import _fused_norm_rope_stacked
+
+    from sglang.kernels.ops.speculative.fused_kv_materialize import (
+        _fused_norm_rope_stacked,
+    )
     from sglang.srt.runtime_context import get_parallel
 
     rank = get_parallel().tp_rank
-    rows = split_rows(cache_loc.numel(), align_cut=getattr(worker.model_runner.server_args, "enable_qwen35_cp_prefix_cache", False))
+    rows = split_rows(
+        cache_loc.numel(),
+        align_cut=getattr(
+            worker.model_runner.server_args, "enable_qwen35_cp_prefix_cache", False
+        ),
+    )
     start, end = rows[rank]
-    peer_start, peer_end = rows[1-rank]
+    peer_start, peer_end = rows[1 - rank]
     group = get_parallel().tp_group.device_group
-    peer = dist.get_global_rank(group, 1-rank)
+    peer = dist.get_global_rank(group, 1 - rank)
     draft = worker.draft_model
     weights = draft.cp_context_weights
     if not hasattr(weights, "projection"):
         weights.projection = weights.kv.flatten(0, 1).T.contiguous()
-        weights.rope = rope_cache(128, math.ceil(worker.model_runner.server_args.context_length / 64) * 64, cache_loc.device)
-        weights.eps = torch.full((6,), 1e-6, dtype=torch.float32, device=cache_loc.device)
-    local_len = end-start
+        weights.rope = rope_cache(
+            128,
+            math.ceil(worker.model_runner.server_args.context_length / 64) * 64,
+            cache_loc.device,
+        )
+        weights.eps = torch.full(
+            (6,), 1e-6, dtype=torch.float32, device=cache_loc.device
+        )
+    local_len = end - start
     bf = dict(dtype=torch.bfloat16, device=cache_loc.device)
     if local_len:
-        context = sk.rmsnorm(F.linear(hidden, draft.fc.weight), draft.hidden_norm.weight, 1e-6)
+        context = sk.rmsnorm(
+            F.linear(hidden, draft.fc.weight), draft.hidden_norm.weight, 1e-6
+        )
         projected = torch.mm(context, weights.projection).view(local_len, 6, 2048)
-        dk, dv = _fused_norm_rope_stacked(projected, weights.kn, weights.eps,
-                                         weights.rope, positions[start:end], 8, 128, 128)
+        dk, dv = _fused_norm_rope_stacked(
+            projected,
+            weights.kn,
+            weights.eps,
+            weights.rope,
+            positions[start:end],
+            8,
+            128,
+            128,
+        )
         # The native writer accepts a strided source row. Avoid copying the
         # local head shard into another packed tensor just to scatter it.
-        local_k = dk[:, :, rank*4:(rank+1)*4]
-        local_v = dv[:, :, rank*4:(rank+1)*4]
-        send = torch.stack([dk[:, :, (1-rank)*4:(2-rank)*4], dv[:, :, (1-rank)*4:(2-rank)*4]])
-    receive = torch.empty(2, 6, peer_end-peer_start, 4, 128, **bf)
+        local_k = dk[:, :, rank * 4 : (rank + 1) * 4]
+        local_v = dv[:, :, rank * 4 : (rank + 1) * 4]
+        send = torch.stack(
+            [
+                dk[:, :, (1 - rank) * 4 : (2 - rank) * 4],
+                dv[:, :, (1 - rank) * 4 : (2 - rank) * 4],
+            ]
+        )
+    receive = torch.empty(2, 6, peer_end - peer_start, 4, 128, **bf)
     ops = []
     if local_len:
         ops.append(dist.P2POp(dist.isend, send, peer, group))
@@ -638,8 +892,14 @@ def materialize_draft(worker, hidden, cache_loc, positions):
     peer_loc = cache_loc[peer_start:peer_end]
     for layer in range(6):
         if local_len:
-            pool.set_kv_buffer(None, local_loc, local_k[layer], local_v[layer],
-                               layer_id_override=layer)
+            pool.set_kv_buffer(
+                None, local_loc, local_k[layer], local_v[layer], layer_id_override=layer
+            )
         if peer_end > peer_start:
-            pool.set_kv_buffer(None, peer_loc, receive[0, layer], receive[1, layer],
-                               layer_id_override=layer)
+            pool.set_kv_buffer(
+                None,
+                peer_loc,
+                receive[0, layer],
+                receive[1, layer],
+                layer_id_override=layer,
+            )
