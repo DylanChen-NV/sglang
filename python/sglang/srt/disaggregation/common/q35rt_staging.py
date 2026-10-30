@@ -104,16 +104,24 @@ def pack(manager, pages, staging_buffer, notif):
         staging_buffer._q35rt_stream = torch.cuda.Stream()
     stream = staging_buffer._q35rt_stream
     stream.wait_stream(torch.cuda.default_stream())
+    fused = os.environ.get("SGLANG_Q35RT_FUSED_PD_PACK", "0")
+    if fused not in ("0", "1"):
+        raise ValueError("SGLANG_Q35RT_FUSED_PD_PACK must be 0 or 1")
     with torch.cuda.stream(stream):
         indices = torch.as_tensor(np.asarray(pages, dtype=np.int64), device="cuda")
-        _pack[(len(widths), triton.cdiv(count * max(widths), 1024))](
-            *values,
-            indices,
-            staging_buffer.buffer[:total].view(torch.uint16),
-            count,
-            manager.kv_args.page_size,
-            1024
-        )
+        if fused == "1":
+            from q35rt.cache_ops import pack_native_cp2_pairs
+
+            pack_native_cp2_pairs(values[0], indices, staging_buffer.buffer[:total], manager.kv_args.page_size)
+        else:
+            _pack[(len(widths), triton.cdiv(count * max(widths), 1024))](
+                *values,
+                indices,
+                staging_buffer.buffer[:total].view(torch.uint16),
+                count,
+                manager.kv_args.page_size,
+                1024
+            )
     stream.synchronize()
     verify_dir = os.environ.get("Q35_PD_VERIFY_DIR")
     if verify_dir:
