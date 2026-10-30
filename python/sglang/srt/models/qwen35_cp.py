@@ -446,7 +446,7 @@ class CPDecoderLayer(nn.Module):
                 mixed = F.linear(x, w["qkvw"])
                 z = F.linear(x, w["zw"]).view(E, 32, 128)
             ba = F.linear(x, w["ba"])
-        b, a = ba[:, :32], ba[:, 32:]
+            b, a = ba[:, :32], ba[:, 32:]
             if not ctx.single:
                 halo = torch.empty(3, 8192, dtype=mixed.dtype, device=dev)
                 ctx.exchange(mixed[-3:].contiguous() if r == 0 else None, halo if r == 1 else None)
