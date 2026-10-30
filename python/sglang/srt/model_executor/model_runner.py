@@ -1560,12 +1560,6 @@ class ModelRunner:
 
             # Replay cuda graph if applicable
             if can_run_graph:
-                if getattr(forward_batch, "q35rt_fused_cycle", False):
-                    # Current-cycle graph reads native recurrent slots. Keep
-                    # the same deferred clear/COW work as the eager path,
-                    # before replay consumes those slots. The native graph
-                    # runner publishes its map read-done event after replay.
-                    self._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
                 ret = self.decode_cuda_graph_runner.execute(
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
