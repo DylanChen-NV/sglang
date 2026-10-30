@@ -1426,9 +1426,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         accept, committed, bonus, output, lengths = self._next_accept_bonus_buffers(1)
         model = self.target_worker.model_runner.model
+        track_count, track_interval = model.q35rt_cycle_tracking_metadata(batch)
+        tracking = {} if track_count is None else dict(checkpoint_count=track_count, track_interval=track_interval)
         pack_fused_cycle(model.engine, prefix_lens, accept, committed, bonus, output,
-                         lengths, candidates=block_ids)
-        model.q35rt_commit(batch, committed, bonus, prefix_lens, tokens_already_advanced=True)
+                         lengths, candidates=block_ids, **tracking)
+        model.q35rt_commit(batch, committed, bonus, prefix_lens, tokens_already_advanced=True,
+                           checkpoint_count=track_count)
         if on_publish is not None:
             on_publish(lengths)
         return GenerationBatchResult(

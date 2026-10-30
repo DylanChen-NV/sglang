@@ -333,6 +333,11 @@ class Q35rtForCausalLM(nn.Module):
             64 * 4 + 128 * 4 + 4
         )
         self._pd_staging = args.disaggregation_mode == "decode"
+        fused_track = os.environ.get("SGLANG_Q35RT_FUSED_TRACK_METADATA", "0")
+        if fused_track not in ("0", "1"):
+            raise ValueError("SGLANG_Q35RT_FUSED_TRACK_METADATA must be 0 or 1")
+        self._fused_track_metadata = fused_track == "1"
+        self._cycle_track_count = None
         self.q35rt_pd_stage_bytes_per_slot = (
             30 * 8192 * 3 * 2 if self._pd_staging else 0
         )
@@ -405,17 +410,30 @@ class Q35rtForCausalLM(nn.Module):
             pd_staging=self._pd_staging,
         )
 
-    def q35rt_commit(self, batch, commit_lens, bonus, prefix_lens, *, tokens_already_advanced=False):
+    def q35rt_cycle_tracking_metadata(self, batch):
+        if not self._fused_track_metadata or batch.mamba_track_indices is None:
+            return None, 0
+        from sglang.srt.runtime_context import get_exec
+
+        if self._cycle_track_count is None:
+            self._cycle_track_count = torch.empty(1, dtype=torch.int64, device=self.engine.dev)
+        return self._cycle_track_count, get_exec().mamba.mamba_track_interval
+
+    def q35rt_commit(self, batch, commit_lens, bonus, prefix_lens, *, tokens_already_advanced=False,
+                     checkpoint_count=None):
         slot, count = None, None
         if batch.mamba_track_indices is not None:
             from sglang.srt.runtime_context import get_exec
 
-            interval = get_exec().mamba.mamba_track_interval
-            end = prefix_lens + commit_lens.to(prefix_lens.dtype)
-            relative = end // interval * interval - prefix_lens
-            count = torch.where(
-                (relative > 0) & (relative <= commit_lens), relative, -1
-            ).to(torch.int64)
+            if checkpoint_count is None:
+                interval = get_exec().mamba.mamba_track_interval
+                end = prefix_lens + commit_lens.to(prefix_lens.dtype)
+                relative = end // interval * interval - prefix_lens
+                count = torch.where(
+                    (relative > 0) & (relative <= commit_lens), relative, -1
+                ).to(torch.int64)
+            else:
+                count = checkpoint_count
             slot = self.adapter.req_to_token_pool.translate_mamba_indices(
                 batch.mamba_track_indices
             )
