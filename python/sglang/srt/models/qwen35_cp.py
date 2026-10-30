@@ -209,9 +209,10 @@ def make_context(model, input_ids, batch):
     # These values are identical across the ten attention / thirty GDN layers.
     # Construct once before launching model work instead of repeating tiny
     # synchronous host-to-device transfers between layers.
-    from sglang.kernels.ops.attention.qwen35_cp_metadata import create
-    ctx.seq_len, ctx.cu_full, ctx.cu_local, ctx.has_initial = create(
-        length, ctx.size, not ctx.single and ctx.rank == 1, dev)
+    ctx.seq_len = torch.tensor([length], dtype=torch.int32, device=dev)
+    ctx.cu_full = torch.tensor([0, length], dtype=torch.int32, device=dev)
+    ctx.cu_local = torch.tensor([0, ctx.size], dtype=torch.int32, device=dev)
+    ctx.has_initial = torch.tensor([not ctx.single and ctx.rank == 1], device=dev)
     ctx.prefix = 0
     ctx.reuse = reuse
     if reuse:
@@ -479,7 +480,7 @@ class CPDecoderLayer(nn.Module):
                 mixed = F.linear(x, w["qkvw"])
                 z = F.linear(x, w["zw"]).view(E, 32, 128)
             ba = F.linear(x, w["ba"])
-            b, a = ba[:, :32].contiguous(), ba[:, 32:].contiguous()
+        b, a = ba[:, :32], ba[:, 32:]
             if not ctx.single:
                 halo = torch.empty(3, 8192, dtype=mixed.dtype, device=dev)
                 ctx.exchange(mixed[-3:].contiguous() if r == 0 else None, halo if r == 1 else None)
