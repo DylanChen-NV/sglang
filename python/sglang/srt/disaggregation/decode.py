@@ -693,6 +693,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self, rids_to_check: Optional[List[str]] = None
     ) -> List[Req]:
         # TODO refactor the scheduling part, reuse with the unified engine logic as much as possible
+        if not self.retracted_queue:
+            return []
 
         # allocate memory
         resumed_reqs = []
@@ -910,6 +912,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
         if is_pp_mode:
             rids_to_check = set(pp_good_rids) | set(pp_bad_rids)
+
+        # Handshake progression above may mutate the queue. With no remaining
+        # request, there is no admission decision needing pool/budget queries.
+        if not self.queue:
+            return [], []
 
         failed_reqs = []
         preallocated_reqs = []

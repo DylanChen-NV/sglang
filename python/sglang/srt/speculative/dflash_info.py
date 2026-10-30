@@ -54,6 +54,8 @@ class DFlashVerifyInput(SpecInput):
         self,
         batch: ScheduleBatch,
         target_worker: TpModelWorker,
+        *,
+        defer_metadata_init: bool = False,
     ) -> tuple[ForwardBatch, bool]:
         """Prepare a DFLASH verify forward batch for overlap scheduling.
 
@@ -82,7 +84,11 @@ class DFlashVerifyInput(SpecInput):
                 verify_forward_batch
             )
         )
-        if can_run_cuda_graph:
+        if defer_metadata_init:
+            # The immediate ModelRunner forward loads graph inputs once (or
+            # initializes eager metadata). Caller must not mark FB preplanned.
+            pass
+        elif can_run_cuda_graph:
             target_worker.model_runner.decode_cuda_graph_runner.load_batch(
                 verify_forward_batch
             )

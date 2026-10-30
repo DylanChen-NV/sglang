@@ -214,6 +214,7 @@ class Q35rtForCausalLM(nn.Module):
     """Opt-in leaf compute model driven by the native SGLang worker."""
 
     q35rt_direct_logits = True
+    cuda_graph_reads_req_to_token = True
     q35rt_build_attention_backend = staticmethod(build_q35rt_attention_backend)
     q35rt_prefill_materializes_context = True
     # Shared native target/draft page ownership, explicit accepted-state
@@ -554,6 +555,7 @@ class Q35rtForCausalLM(nn.Module):
 
 class Q35rtDFlashDraftModel(nn.Module):
     q35rt_direct_logits = True
+    cuda_graph_reads_req_to_token = True
     q35rt_build_attention_backend = staticmethod(build_q35rt_attention_backend)
     supports_fused_context_kv = False
 

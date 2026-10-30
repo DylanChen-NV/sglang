@@ -1202,13 +1202,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.forward_mode.is_target_verify()
             and self.model_runner.spec_algorithm.is_dflash_family()
         )
-        # Exception: breakable-graph verify replays (captured forward metadata)
-        # re-read req_to_token *during* replay, so the pre-replay snapshot is
-        # too early -- record the event after replay instead.
+        # Replays that read native maps during compute must publish after the
+        # replay. This includes q35rt even with a full CUDA graph: it bypasses
+        # attention metadata and directly reads req_to_token in the kernel.
         read_done_post_replay = (
             publish_read_done
             and forward_batch.forward_mode.is_target_verify()
-            and self.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+            and (
+                self.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+                or getattr(self.model_runner.model, "cuda_graph_reads_req_to_token", False)
+            )
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)

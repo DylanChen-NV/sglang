@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 from dataclasses import replace
 from typing import List, Optional
 
@@ -277,6 +278,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._q35rt_direct_logits = getattr(
             self.draft_model, "q35rt_direct_logits", False
         )
+        defer_verify = os.environ.get("SGLANG_Q35RT_DEFER_VERIFY_METADATA", "0")
+        if defer_verify not in ("0", "1"):
+            raise ValueError("SGLANG_Q35RT_DEFER_VERIFY_METADATA must be 0 or 1")
+        self._q35rt_defer_verify_metadata = self._q35rt_direct_logits and defer_verify == "1"
         self._use_fused_kv_materialize = (
             is_cuda() or is_hip()
         ) and not self._q35rt_direct_logits
@@ -1721,7 +1726,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
 
         verify_forward_batch, _ = verify_input.prepare_for_verify(
-            batch, self.target_worker
+            batch, self.target_worker,
+            defer_metadata_init=self._q35rt_defer_verify_metadata,
         )
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
@@ -1730,7 +1736,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
+            skip_attn_backend_init=not self._q35rt_defer_verify_metadata,
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
