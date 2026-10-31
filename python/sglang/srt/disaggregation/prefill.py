@@ -765,6 +765,9 @@ class SchedulerDisaggregationPrefillMixin:
             result.copy_done,
         )
 
+        from sglang.srt.disaggregation.common.q35rt_early_token import publish_before_draft
+
+        publish_before_draft(self, batch, result)
         if copy_done is not None:
             copy_done.synchronize()
         if result.routed_experts_output is not None:
@@ -1241,6 +1244,11 @@ class SchedulerDisaggregationPrefillMixin:
 
         state_indices: Optional[List] = None
         if last_chunk:
+            early_aux_done = getattr(req, "q35rt_pre_draft_aux_done", None)
+            if early_aux_done is not None:
+                if not early_aux_done.wait(30):
+                    req.disagg_kv_sender.kv_mgr._q35rt_fail_stop("Early aux read did not complete")
+                del req.q35rt_pre_draft_aux_done
             self.disagg_metadata_buffers.set_buf(req)
 
             # Most state payloads read token-pool rows and should match the KV

@@ -368,6 +368,8 @@ class TransferStatus:
     num_pp_ranks_expected: Optional[int] = None
     # Whether aux data has been received.
     received_aux: bool = False
+    # Output-only target token; never satisfies native aux completion.
+    received_early_aux: bool = False
     # PP ranks that have sent state data (state is layer-specific, each PP rank sends its portion).
     received_state_per_pp: Set[int] = dataclasses.field(default_factory=set)
     # Whether state data is expected (set based on state_type).
@@ -1185,6 +1187,20 @@ class NixlKVManager(CommonKVManager):
                     raise RuntimeError(f"Uncertain NIXL write state: {state}")
                 time.sleep(0)
 
+    def q35rt_send_early_aux(self, room, aux_index):
+        if self._q35rt_source_guard is None:
+            raise RuntimeError("Early aux task requires source quiescence")
+        completed = threading.Event()
+        peers = self.transfer_infos.get(room, {})
+        shard = sum(info.dst_port for info in peers.values()) % len(self.transfer_queues)
+        self.transfer_queues[shard].put(TransferKVChunk(
+            room=room, prefill_kv_indices=np.empty(0, dtype=np.int32),
+            index_slice=slice(0, 0), is_last_chunk=False,
+            prefill_aux_index=aux_index, state_indices=None,
+            chunk_id=-1, q35rt_aux_complete=completed,
+        ))
+        return completed
+
     def transfer_worker(self, queue: FastQueue, staging_buffer=None):
         # Per-worker staging strategy: lazy-created on first chunk so we
         # see kv_buffer_tensors (set by ModelRunner after engine init).
@@ -1235,6 +1251,13 @@ class NixlKVManager(CommonKVManager):
                     assert req.agent_name in self.decode_kv_args_table
                     dst_info = self.decode_kv_args_table[req.agent_name]
                     decode_tp_size = dst_info.decode_tp_size
+
+                    if kv_chunk.q35rt_aux_complete is not None:
+                        handles.append(self.send_aux(
+                            req.agent_name, kv_chunk.prefill_aux_index,
+                            dst_info.dst_aux_ptrs, req.dst_aux_index, f"{req.room}_tokenv1",
+                        ))
+                        continue
 
                     from sglang.srt.disaggregation.common.q35rt_early_token import enabled as early_token_enabled
 
@@ -1484,6 +1507,10 @@ class NixlKVManager(CommonKVManager):
                         self._q35rt_fail_stop(fatal)
                     finally:
                         self._q35rt_transfer_tls.handles = None
+                if kv_chunk.q35rt_aux_complete is not None:
+                    # Includes rejected/aborted admission, which posted no reads.
+                    # An admitted error reaches here only after safe handle drain.
+                    kv_chunk.q35rt_aux_complete.set()
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -2683,7 +2710,9 @@ class NixlKVManager(CommonKVManager):
                         # abort starts, no later poll may launch a new scatter
                         # after this room's cancellation fence has completed.
                         continue
-                if tag == "kv":
+                if tag == "tokenv1":
+                    self.transfer_statuses[room].received_early_aux = True
+                elif tag == "kv":
                     chunk_id = int(components[2])
                     is_last_chunk = bool(int(components[3]))
                     pp_rank = int(components[4]) if len(components) > 4 else 0

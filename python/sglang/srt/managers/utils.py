@@ -67,6 +67,8 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
+    # Optional output-only token copy. It never replaces full copy_done.
+    q35rt_target_sample: Optional[tuple[torch.Tensor, torch.cuda.Event]] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None

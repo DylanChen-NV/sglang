@@ -1474,6 +1474,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
 
+            from sglang.srt.disaggregation.common.q35rt_early_token import capture_target_sample
+
+            capture_target_sample(self, batch, batch_output)
+
             if getattr(
                 self.target_worker.model_runner.model,
                 "q35rt_prefill_materializes_context",
