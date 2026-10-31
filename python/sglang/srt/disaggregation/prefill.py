@@ -48,13 +48,19 @@ def _completed_cp_handoff_stream(*, transfer_poll=False):
                 if value not in ("0", "1"):
                     raise ValueError("SGLANG_QWEN35_CP_HANDOFF_STREAM must be 0 or 1")
                 enabled = (
-                    value == "1" and self.enable_overlap
+                    value == "1"
                     and self.server_args.enable_qwen35_cp_prefill
                     and self.server_args.prefill_max_requests == 1
                     and self.server_args.chunked_prefill_size == -1
                 )
                 self._q35rt_cp_handoff_enabled = enabled
-            if not enabled or (transfer_poll and not self.disagg_prefill_inflight_queue):
+            # Without native CPU overlap, current result processing still
+            # waits on its producing default stream. Only *older*, completed
+            # transfer rows can use this private stream in that case.
+            if (
+                not enabled or (not self.enable_overlap and not transfer_poll)
+                or (transfer_poll and not self.disagg_prefill_inflight_queue)
+            ):
                 return function(self, *args, **kwargs)
             stream = getattr(self, "_q35rt_cp_completion_stream", None)
             if stream is None:
@@ -67,6 +73,14 @@ def _completed_cp_handoff_stream(*, transfer_poll=False):
             return result
         return wrapped
     return decorate
+
+
+class _CPForwardCompletionPoller:
+    def __init__(self, event):
+        self.event = event
+
+    def poll(self):
+        return KVPoll.Success if self.event.query() else KVPoll.Transferring
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
@@ -602,6 +616,10 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
+        cp_handoff_poll = (
+            self.server_args.enable_qwen35_cp_prefill
+            and os.environ.get("SGLANG_QWEN35_CP_HANDOFF_STREAM", "0") == "1"
+        )
         while True:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -628,6 +646,24 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
                 result = self.run_batch(batch)
+                if cp_handoff_poll and self.disagg_prefill_inflight_queue:
+                    # The current GPU forward is already queued. Finish older
+                    # requests' handoffs before the synchronous result wait
+                    # would otherwise delay their HTTP completion by a full
+                    # prefill. Stop once this forward is ready, so transport
+                    # backpressure cannot starve result processing or aborts.
+                    ready = torch.cuda.Event()
+                    ready.record()
+                    poller = _CPForwardCompletionPoller(ready)
+                    while self.disagg_prefill_inflight_queue:
+                        self.process_disagg_prefill_inflight_queue()
+                        if not self.disagg_prefill_inflight_queue:
+                            break
+                        status = poll_and_all_reduce_attn_cp_tp_group(
+                            [poller], self.attn_cp_cpu_group, self.attn_tp_cpu_group
+                        )
+                        if status[0] == KVPoll.Success:
+                            break
                 self.process_batch_result(batch, result)
             else:
                 self.on_idle()
