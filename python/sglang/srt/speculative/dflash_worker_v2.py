@@ -1501,10 +1501,23 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
             device = next_token_ids.device
-            ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-            draft_seq_lens = torch.tensor(
-                batch.prefix_lens, dtype=torch.int32, device=device
-            )
+            if self.model_runner.server_args.enable_qwen35_cp_prefill and device.type == "cuda":
+                # A pageable torch.tensor(..., device='cuda') here waits for
+                # the already queued target prefill. These CPU-known lengths
+                # need only an ordered H2D copy, so keep immutable pinned
+                # sources alive with the native result through copy_done.
+                ctx_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int32, pin_memory=True)
+                draft_seq_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int32, pin_memory=True)
+                ctx_lens = ctx_lens_cpu.to(device, non_blocking=True)
+                draft_seq_lens = draft_seq_lens_cpu.to(device, non_blocking=True)
+                batch_output.extra_keep_alive_refs = list(batch_output.extra_keep_alive_refs or ()) + [
+                    ctx_lens_cpu, draft_seq_lens_cpu
+                ]
+            else:
+                ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
+                draft_seq_lens = torch.tensor(
+                    batch.prefix_lens, dtype=torch.int32, device=device
+                )
 
             if batch.out_cache_loc is None:
                 raise RuntimeError(
