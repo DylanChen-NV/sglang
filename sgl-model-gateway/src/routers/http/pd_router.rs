@@ -7,6 +7,7 @@ use axum::{
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
 use futures_util::StreamExt;
 use memchr::memmem;
 use reqwest::Client;
@@ -15,7 +16,7 @@ use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
-use super::pd_types::api_path;
+use super::pd_types::{api_path, RequestWithBootstrap};
 use crate::{
     config::types::RetryConfig,
     core::{
@@ -60,6 +61,13 @@ struct PreparedWorkerRequest<'a> {
     endpoint_url: String,
     body: Cow<'a, Value>,
 }
+
+enum PDRequestBody {
+    Json(Value),
+    Encoded(Bytes),
+}
+
+type PDBodyEncoder<T> = fn(&T, &dyn Worker) -> Result<Bytes, serde_json::Error>;
 
 #[derive(Clone)]
 struct PDRequestContext<'a> {
@@ -368,6 +376,63 @@ impl PDRouter {
         original_request: &T,
         context: PDRequestContext<'_>,
     ) -> Response {
+        self.execute_dual_dispatch_with_encoder(headers, original_request, context, None)
+            .await
+    }
+
+    fn can_encode_directly(
+        context: &PDRequestContext<'_>,
+        prefill: &dyn Worker,
+        decode: &dyn Worker,
+    ) -> bool {
+        context.route == "/generate"
+            && context.batch_size.is_none()
+            && !prefill.is_dp_aware()
+            && !decode.is_dp_aware()
+            && prefill.dp_rank().is_none()
+    }
+
+    fn encode_generate_with_bootstrap(
+        original: &GenerateRequest,
+        bootstrap_host: String,
+        bootstrap_port: Option<u16>,
+        bootstrap_room: u64,
+    ) -> Result<Bytes, serde_json::Error> {
+        let mut request = original.clone();
+        // Upstream's optional room is i32, while native room IDs are 63-bit.
+        // Clear the overridden keys before flattening, so no duplicate keys
+        // or narrowing conversion can change what the worker receives.
+        request.bootstrap_host = None;
+        request.bootstrap_port = None;
+        request.bootstrap_room = None;
+        serde_json::to_vec(&RequestWithBootstrap {
+            original: &request,
+            bootstrap_host,
+            bootstrap_port,
+            bootstrap_room,
+        })
+        .map(Bytes::from)
+    }
+
+    fn encode_generate_pd(
+        request: &GenerateRequest,
+        prefill: &dyn Worker,
+    ) -> Result<Bytes, serde_json::Error> {
+        Self::encode_generate_with_bootstrap(
+            request,
+            prefill.bootstrap_host().to_string(),
+            prefill.bootstrap_port(),
+            super::pd_types::generate_room_id(),
+        )
+    }
+
+    async fn execute_dual_dispatch_with_encoder<T: Serialize + Clone>(
+        &self,
+        headers: Option<&HeaderMap>,
+        original_request: &T,
+        context: PDRequestContext<'_>,
+        encoder: Option<PDBodyEncoder<T>>,
+    ) -> Response {
         let start_time = Instant::now();
 
         let route = context.route;
@@ -415,25 +480,36 @@ impl PDRouter {
                             decode.url()
                         );
 
-                        let mut json_request = match serde_json::to_value(shared_request.as_ref()) {
-                            Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
-                        };
-
-                        json_request = match Self::inject_bootstrap_into_value(
-                            json_request,
-                            prefill.as_ref(),
-                            context.batch_size,
-                        ) {
-                            Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
+                        let request_body = match encoder.filter(|_| {
+                            Self::can_encode_directly(&context, prefill.as_ref(), decode.as_ref())
+                        }) {
+                            Some(encode) => match encode(shared_request.as_ref(), prefill.as_ref())
+                            {
+                                Ok(bytes) => PDRequestBody::Encoded(bytes),
+                                Err(e) => return Self::handle_serialization_error(e),
+                            },
+                            None => {
+                                let json_request =
+                                    match serde_json::to_value(shared_request.as_ref()) {
+                                        Ok(v) => v,
+                                        Err(e) => return Self::handle_serialization_error(e),
+                                    };
+                                match Self::inject_bootstrap_into_value(
+                                    json_request,
+                                    prefill.as_ref(),
+                                    context.batch_size,
+                                ) {
+                                    Ok(v) => PDRequestBody::Json(v),
+                                    Err(e) => return Self::handle_serialization_error(e),
+                                }
+                            }
                         };
 
                         let ctx_is_stream = context.is_stream;
                         let response = self
                             .execute_dual_dispatch_internal(
                                 headers,
-                                json_request,
+                                request_body,
                                 context,
                                 Arc::clone(&prefill),
                                 Arc::clone(&decode),
@@ -646,7 +722,7 @@ impl PDRouter {
     async fn execute_dual_dispatch_internal(
         &self,
         headers: Option<&HeaderMap>,
-        json_request: Value,
+        request_body: PDRequestBody,
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
@@ -663,36 +739,49 @@ impl PDRouter {
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
-        let (prepared_prefill, prepared_decode) = match Self::prepare_pd_worker_requests(
-            context.route,
-            &json_request,
-            prefill.as_ref(),
-            decode.as_ref(),
-        )
-        .await
-        {
-            Ok(requests) => requests,
-            Err(e) => {
-                error!("Failed to prepare PD worker requests: {}", e);
-                return error::internal_error("pd_request_preparation_failed", e);
+        let (prefill_url, decode_url, prefill_body, decode_body) = match request_body {
+            PDRequestBody::Encoded(bytes) => (
+                Self::worker_endpoint_url(prefill.as_ref(), context.route),
+                Self::worker_endpoint_url(decode.as_ref(), context.route),
+                bytes.clone(),
+                bytes,
+            ),
+            PDRequestBody::Json(json_request) => {
+                let (prepared_prefill, prepared_decode) = match Self::prepare_pd_worker_requests(
+                    context.route,
+                    &json_request,
+                    prefill.as_ref(),
+                    decode.as_ref(),
+                )
+                .await
+                {
+                    Ok(requests) => requests,
+                    Err(e) => {
+                        error!("Failed to prepare PD worker requests: {}", e);
+                        return error::internal_error("pd_request_preparation_failed", e);
+                    }
+                };
+                let (prefill_body, decode_body) = match Self::encode_pd_bodies(
+                    prepared_prefill.body.as_ref(),
+                    prepared_decode.body.as_ref(),
+                ) {
+                    Ok(bodies) => bodies,
+                    Err(error) => return Self::handle_serialization_error(error),
+                };
+                (
+                    prepared_prefill.endpoint_url,
+                    prepared_decode.endpoint_url,
+                    prefill_body,
+                    decode_body,
+                )
             }
         };
 
         // Build both requests
-        let prefill_request = self.build_post_with_headers(
-            &self.client,
-            &prepared_prefill.endpoint_url,
-            &prepared_prefill.body,
-            headers,
-            false,
-        );
-        let decode_request = self.build_post_with_headers(
-            &self.client,
-            &prepared_decode.endpoint_url,
-            &prepared_decode.body,
-            headers,
-            false,
-        );
+        let prefill_request =
+            self.build_post_with_headers(&self.client, &prefill_url, prefill_body, headers, false);
+        let decode_request =
+            self.build_post_with_headers(&self.client, &decode_url, decode_body, headers, false);
 
         // Run both in this handler task (not a detached tokio::spawn) so a client
         // disconnect cancels the pending decode request too, keeping the
@@ -1355,15 +1444,31 @@ impl PDRouter {
         Ok((prefill_status, prefill_body))
     }
 
+    fn encode_pd_bodies(
+        prefill: &Value,
+        decode: &Value,
+    ) -> Result<(Bytes, Bytes), serde_json::Error> {
+        let prefill_body = Bytes::from(serde_json::to_vec(prefill)?);
+        let decode_body = if std::ptr::eq(prefill, decode) {
+            prefill_body.clone()
+        } else {
+            Bytes::from(serde_json::to_vec(decode)?)
+        };
+        Ok((prefill_body, decode_body))
+    }
+
     fn build_post_with_headers(
         &self,
         client: &Client,
         endpoint_url: &str,
-        json_request: &Value,
+        encoded_body: Bytes,
         headers: Option<&HeaderMap>,
         connection_close: bool,
     ) -> reqwest::RequestBuilder {
-        let mut request = client.post(endpoint_url).json(json_request);
+        let mut request = client
+            .post(endpoint_url)
+            .header(CONTENT_TYPE, "application/json")
+            .body(encoded_body);
         if connection_close {
             request = request.header("Connection", "close");
         }
@@ -1586,7 +1691,13 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch_with_encoder(
+            headers,
+            body,
+            context,
+            Some(Self::encode_generate_pd),
+        )
+        .await
     }
 
     async fn route_chat(
@@ -1739,6 +1850,141 @@ mod tests {
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    #[test]
+    fn test_typed_generate_preserves_body_and_overrides_bootstrap_once() {
+        for input in [
+            json!({"input_ids": (0..60000).collect::<Vec<u32>>(), "stream": true,
+                "sampling_params": {"temperature": 0, "max_new_tokens": 400},
+                "bootstrap_host": "stale", "bootstrap_port": 12, "bootstrap_room": 17,
+                "bootstrap_pair_key": "retained", "extra_key": "中文 \" key",
+                "session_params": {"nested": {"array": [1, null, "中文"]}}}),
+            json!({"text": "中文 / \" escaped \\ text", "stream": false}),
+        ] {
+            let original: GenerateRequest = serde_json::from_value(input).unwrap();
+            let before = serde_json::to_value(&original).unwrap();
+            let room = i64::MAX as u64 - 11;
+            let bytes = PDRouter::encode_generate_with_bootstrap(
+                &original,
+                "127.0.0.1".to_string(),
+                None,
+                room,
+            )
+            .unwrap();
+            let mut expected = before.clone();
+            expected["bootstrap_host"] = json!("127.0.0.1");
+            expected["bootstrap_port"] = Value::Null;
+            expected["bootstrap_room"] = json!(room);
+            assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
+            assert_eq!(serde_json::to_value(&original).unwrap(), before);
+            let encoded = std::str::from_utf8(&bytes).unwrap();
+            for key in ["bootstrap_host", "bootstrap_port", "bootstrap_room"] {
+                assert_eq!(encoded.matches(&format!("\"{key}\":")).count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn test_typed_generate_falls_back_for_batch_dp_and_other_routes() {
+        let prefill = BasicWorkerBuilder::new("http://prefill:30000")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+        let decode = BasicWorkerBuilder::new("http://decode:30001")
+            .worker_type(WorkerType::Decode)
+            .build();
+        let dp_prefill = DPAwareWorkerBuilder::new("http://prefill:30000", 2, 4)
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+        let dp_decode = DPAwareWorkerBuilder::new("http://decode:30001", 1, 4)
+            .worker_type(WorkerType::Decode)
+            .build();
+        let mut context = PDRequestContext {
+            route: "/generate",
+            batch_size: None,
+            is_stream: true,
+            return_logprob: false,
+            request_text: None,
+            model_id: None,
+            headers: None,
+        };
+        assert!(PDRouter::can_encode_directly(&context, &prefill, &decode));
+        assert!(!PDRouter::can_encode_directly(
+            &context,
+            &dp_prefill,
+            &decode
+        ));
+        assert!(!PDRouter::can_encode_directly(
+            &context, &prefill, &dp_decode
+        ));
+        context.batch_size = Some(1);
+        assert!(!PDRouter::can_encode_directly(&context, &prefill, &decode));
+        context.batch_size = None;
+        context.route = "/v1/chat/completions";
+        assert!(!PDRouter::can_encode_directly(&context, &prefill, &decode));
+    }
+
+    #[test]
+    fn test_encode_pd_bodies_shares_identical_prepared_value() {
+        let request = json!({
+            "input_ids": (0..60000).collect::<Vec<u32>>(),
+            "bootstrap_host": "127.0.0.1", "bootstrap_port": 31911,
+            "bootstrap_room": [41, 42], "stream": true,
+            "nested": {"text": "Unicode 中文 / escaped \" text", "null": null}
+        });
+        let (prefill, decode) = PDRouter::encode_pd_bodies(&request, &request).unwrap();
+        assert_eq!(prefill.as_ref(), serde_json::to_vec(&request).unwrap());
+        assert_eq!(prefill, decode);
+        assert_eq!(prefill.as_ptr(), decode.as_ptr());
+        assert_eq!(serde_json::from_slice::<Value>(&decode).unwrap(), request);
+    }
+
+    #[test]
+    fn test_encode_pd_bodies_preserves_distinct_dp_payloads() {
+        let prefill = json!({"input_ids": [[1, 2], [3]], "bootstrap_room": [11, 12]});
+        let mut decode = prefill.clone();
+        decode["disagg_prefill_dp_rank"] = json!(2);
+        let (prefill_bytes, decode_bytes) = PDRouter::encode_pd_bodies(&prefill, &decode).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&prefill_bytes).unwrap(),
+            prefill
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&decode_bytes).unwrap(),
+            decode
+        );
+        assert_ne!(prefill_bytes.as_ptr(), decode_bytes.as_ptr());
+        assert!(prefill.get("disagg_prefill_dp_rank").is_none());
+    }
+
+    #[test]
+    fn test_encoded_pd_post_preserves_headers_and_body() {
+        let router = create_test_pd_router();
+        let bytes = Bytes::from_static(b"{\"stream\":true,\"input_ids\":[1,2]}");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer test-token"),
+        );
+        let request = router
+            .build_post_with_headers(
+                &router.client,
+                "http://127.0.0.1/generate",
+                bytes.clone(),
+                Some(&headers),
+                true,
+            )
+            .build()
+            .unwrap();
+        assert_eq!(request.method(), reqwest::Method::POST);
+        assert_eq!(request.headers()[CONTENT_TYPE], "application/json");
+        assert_eq!(request.headers()["authorization"], "Bearer test-token");
+        assert_eq!(request.headers()["connection"], "close");
+        assert_eq!(request.body().unwrap().as_bytes().unwrap(), bytes.as_ref());
     }
 
     #[test]
