@@ -11,14 +11,14 @@ def enabled():
     return value == "1" and os.environ.get("SGLANG_Q35RT_PD", "0") == "1"
 
 
-def eligible(req, token):
+def eligible(req, token, *, prefill=False):
     """Leave finish-sensitive and constrained requests on native completion."""
     params = req.sampling_params
     if (
         not req.stream
         or req.finished()
         or req.to_finish is not None
-        or params.max_new_tokens <= 1
+        or (not prefill and params.max_new_tokens <= 1)
         or params.stop_strs
         or params.stop_regex_strs
         or req.grammar_key is not None
@@ -50,7 +50,9 @@ def complete_prefill_http(scheduler, req):
         or scheduler.server_args.tokenizer_worker_num != 1
         or req.pending_bootstrap
         or len(req.output_ids) != 1
-        or not eligible(req, req.output_ids[0])
+        # Native PrefillBootstrapQueue sets its internal output budget to one.
+        # Only D needs the client's budget>1 gate; P always returns one token.
+        or not eligible(req, req.output_ids[0], prefill=True)
     ):
         return
     from sglang.srt.managers.schedule_batch import FINISH_LENGTH
