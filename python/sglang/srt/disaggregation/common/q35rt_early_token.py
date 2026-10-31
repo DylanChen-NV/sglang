@@ -47,6 +47,7 @@ def complete_prefill_http(scheduler, req):
     if (
         not enabled()
         or not scheduler.server_args.enable_qwen35_cp_prefill
+        or scheduler.server_args.tokenizer_worker_num != 1
         or req.pending_bootstrap
         or len(req.output_ids) != 1
         or not eligible(req, req.output_ids[0])
