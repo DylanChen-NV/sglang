@@ -905,6 +905,11 @@ class SchedulerDisaggregationPrefillMixin:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
+        from sglang.srt.disaggregation.common.q35rt_early_token import complete_prefill_http
+
+        for req in batch.reqs:
+            complete_prefill_http(self, req)
+
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
             batch=batch,

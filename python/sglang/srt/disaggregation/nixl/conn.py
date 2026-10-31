@@ -1170,6 +1170,25 @@ class NixlKVManager(CommonKVManager):
                     dst_info = self.decode_kv_args_table[req.agent_name]
                     decode_tp_size = dst_info.decode_tp_size
 
+                    from sglang.srt.disaggregation.common.q35rt_early_token import enabled as early_token_enabled
+
+                    aux_posted_early = False
+
+                    def post_early_aux():
+                        nonlocal aux_posted_early
+                        if not kv_chunk.is_last_chunk or not early_token_enabled():
+                            return
+                        if kv_chunk.prefill_aux_index is None:
+                            raise RuntimeError("Missing aux index for last chunk")
+                        aux_notif = f"{req.room}_aux"
+                        if len(kv_chunk.prefill_kv_indices) == 0 or not self.kv_args.kv_data_ptrs:
+                            aux_notif += f"_nokv_{self.transfer_source_rank}_{kv_chunk.chunk_id}"
+                        handles.append(self.send_aux(
+                            req.agent_name, kv_chunk.prefill_aux_index,
+                            dst_info.dst_aux_ptrs, req.dst_aux_index, aux_notif,
+                        ))
+                        aux_posted_early = True
+
                     # Skip KV RDMA transfer when there are no pages to send
                     # (e.g., decode-side radix cache matched the entire prefix).
                     # Aux data is still sent below when is_last_chunk=True.
@@ -1230,6 +1249,7 @@ class NixlKVManager(CommonKVManager):
                                 req,
                                 dst_info,
                                 queue,
+                                before_transfer=post_early_aux,
                             )
                             if deferred:
                                 # Chunk re-enqueued; stop processing remaining
@@ -1293,6 +1313,8 @@ class NixlKVManager(CommonKVManager):
 
                     if kv_chunk.is_last_chunk:
                         dst_info = self.decode_kv_args_table[req.agent_name]
+                        if not len(kv_chunk.prefill_kv_indices):
+                            post_early_aux()
                         if kv_chunk.state_indices:
                             state_xfer_handles = self.maybe_send_extra(
                                 req.agent_name,
@@ -1312,6 +1334,8 @@ class NixlKVManager(CommonKVManager):
                                 h for h in state_xfer_handles if h is not None
                             )
 
+                        if aux_posted_early:
+                            continue
                         if kv_chunk.prefill_aux_index is None:
                             raise RuntimeError("Missing aux index for last chunk")
                         # A no-KV notification still identifies its PP source.
@@ -1986,6 +2010,7 @@ class NixlKVManager(CommonKVManager):
         req: TransferInfo,
         dst_info: KVArgsRegisterInfo,
         queue: FastQueue,
+        before_transfer=None,
     ):
         """Attempt staging transfer for one chunk. Returns (xfer_handle, deferred).
 
@@ -2041,6 +2066,8 @@ class NixlKVManager(CommonKVManager):
             f"_{self.transfer_source_rank}_{chunk_idx}"
             f"_{page_start}_{num_pages}_{req.agent_name}"
         )
+        if before_transfer is not None:
+            before_transfer()
         handle = self.send_kvcache_staged(
             req.agent_name,
             src_prefill_kv_indices,

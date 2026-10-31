@@ -1893,7 +1893,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.req.pd_rebootstrap_forced_output_id = None
         else:
             committed_output_id = output_id[0].item()
-        decode_req.req.output_ids.append(committed_output_id)
+        early_token = getattr(decode_req.req, "q35rt_early_token", None)
+        if early_token is None:
+            decode_req.req.output_ids.append(committed_output_id)
+        elif early_token != committed_output_id or list(decode_req.req.output_ids) != [early_token]:
+            prepare_abort(decode_req.req, "q35rt early token differs from native committed token",
+                          status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+            return
+        else:
+            del decode_req.req.q35rt_early_token
         decode_req.req.cached_tokens = cached_tokens[0].item()
         # The prefill node already reported its prefix-cache hit in
         # cached_tokens[0]. Seed already_computed with it so that
@@ -2018,6 +2028,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 continue
 
             hicache_restore_status = decode_req.hicache_restore_status
+            if poll != KVPoll.Failed and hicache_restore_status != HiCacheRestoreResult.FAILED:
+                from sglang.srt.disaggregation.common.q35rt_early_token import emit_decode_token
+
+                if emit_decode_token(self, decode_req):
+                    logger.info("q35rt early token: rid=%s", decode_req.req.rid)
             if (
                 poll == KVPoll.Failed
                 or hicache_restore_status == HiCacheRestoreResult.FAILED
