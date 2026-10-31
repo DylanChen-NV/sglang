@@ -104,6 +104,7 @@ class PrefillServerInfo:
     # /generate to http://{bootstrap_host}:{prefill_http_port} to trigger a KV
     # recompute -- no router-injected pd_rebootstrap_prefill_url needed.
     prefill_http_port: Optional[int] = None
+    q35rt_quiescence_version: int = 0
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -526,6 +527,16 @@ class CommonKVManager(BaseKVManager):
             return False
 
         # Sanity checks
+        from sglang.srt.disaggregation.common.q35rt_quiescence import protocol_version
+
+        version = protocol_version()
+        if info.q35rt_quiescence_version != version:
+            raise RuntimeError("Q35rt PD quiescence capability differs between P and D")
+        if version and (
+            info.attn_tp_size != 2 or info.pp_size != 1 or info.dp_size != 1
+            or self.attn_tp_size != 1 or self.dcp_size != 1
+        ):
+            raise RuntimeError("Q35rt quiescence currently requires paired CP2 P -> TP1 D")
         if info.page_size is not None and info.page_size != self.kv_args.page_size:
             raise RuntimeError(
                 f"Page size mismatch: prefill server has page_size={info.page_size}, "
@@ -674,6 +685,8 @@ class CommonKVManager(BaseKVManager):
 
     def register_to_bootstrap(self):
         """Register prefill server info to bootstrap server via HTTP PUT."""
+        from sglang.srt.disaggregation.common.q35rt_quiescence import protocol_version
+
         if self.dist_init_addr:
             # Multi-node case: bootstrap server's host is dist_init_addr
             host = NetworkAddress.parse(self.dist_init_addr).resolved().host
@@ -710,6 +723,7 @@ class CommonKVManager(BaseKVManager):
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
             "prefill_http_port": get_serving().port,
+            "q35rt_quiescence_version": protocol_version(),
         }
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
@@ -1507,14 +1521,17 @@ class CommonKVReceiver(BaseKVReceiver):
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
-                    sock.send_multipart(
-                        [
+                    frames = [
                             b"ABORT",
                             str(self.bootstrap_room).encode("ascii"),
                             self.kv_mgr.local_ip.encode("ascii"),
                             str(self.kv_mgr.rank_port).encode("ascii"),
-                        ]
-                    )
+                    ]
+                    if getattr(self.kv_mgr, "q35rt_quiescence_version", 0):
+                        frames.extend([
+                            self.kv_mgr.agent.name.encode("ascii"), b"q35rt-quiet-v1"
+                        ])
+                    sock.send_multipart(frames)
                 logger.debug(
                     f"Sent abort notification for room {self.bootstrap_room} "
                     f"to {bootstrap_info.get('rank_ip', 'unknown')}:{bootstrap_info.get('rank_port', 'unknown')}"
@@ -1542,6 +1559,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
+        self.q35rt_quiescence_version: Optional[int] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -1609,6 +1627,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
         prefill_http_port = data.get("prefill_http_port")
+        quiescence_version = int(data.get("q35rt_quiescence_version", 0))
+        if self.q35rt_quiescence_version is None:
+            self.q35rt_quiescence_version = quiescence_version
+        elif self.q35rt_quiescence_version != quiescence_version:
+            return web.Response(text="Q35rt P rank capability mismatch", status=400)
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -1707,6 +1730,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
+                q35rt_quiescence_version=self.q35rt_quiescence_version or 0,
             )
             return web.json_response(dataclasses.asdict(info), status=200)
 

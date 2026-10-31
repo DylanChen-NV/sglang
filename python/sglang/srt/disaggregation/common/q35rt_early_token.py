@@ -76,6 +76,9 @@ def emit_decode_token(queue, decode_req):
     if not enabled() or decode_req.is_rebootstrap or req.output_ids:
         return False
     receiver = decode_req.kv_receiver
+    quiet = getattr(receiver, "_q35rt_quiet", None)
+    if quiet is not None and quiet.pending:
+        return False
     manager = receiver.kv_mgr
     if not hasattr(manager, "transfer_statuses"):
         return False

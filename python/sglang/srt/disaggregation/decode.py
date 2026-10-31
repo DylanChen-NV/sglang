@@ -2028,6 +2028,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 continue
 
             hicache_restore_status = decode_req.hicache_restore_status
+            if hicache_restore_status == HiCacheRestoreResult.FAILED and (
+                getattr(decode_req.kv_receiver, "_q35rt_quiet", None) is not None
+                and poll != KVPoll.Failed
+            ):
+                decode_req.kv_receiver.abort()
+                poll = decode_req.kv_receiver.poll()
+                if poll != KVPoll.Failed:
+                    continue
             if poll != KVPoll.Failed and hicache_restore_status != HiCacheRestoreResult.FAILED:
                 from sglang.srt.disaggregation.common.q35rt_early_token import emit_decode_token
 
