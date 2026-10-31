@@ -647,6 +647,9 @@ class NixlKVManager(CommonKVManager):
                 room,
             )
             return
+        quiet = getattr(decode_req.kv_receiver, "_q35rt_quiet", None)
+        if quiet is not None and quiet.pending:
+            return
         prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
         handle_staging_req(
             msg,
@@ -1160,6 +1163,8 @@ class NixlKVManager(CommonKVManager):
     def _q35rt_notify_quiet(self, room, peer, failed):
         tag = "failv1" if failed else "quietv1"
         self.agent.send_notif(peer, f"{room}_{tag}_{self.transfer_source_rank}".encode("ascii"))
+        logger.info("Q35RT_QUIET_ACK room=%s rank=%s failed=%s ns=%s", room,
+                    self.transfer_source_rank, int(failed), time.monotonic_ns())
 
     def _q35rt_initialize_xfer(self, *args, **kwargs):
         handle = self.agent.initialize_xfer(*args, **kwargs)
@@ -2673,6 +2678,11 @@ class NixlKVManager(CommonKVManager):
                         if tag == "failv1":
                             receiver._q35rt_begin_abort("Prefill transfer failed after draining writes")
                         continue
+                    if receiver._q35rt_quiet.pending:
+                        # Other receivers also drain this shared agent. Once
+                        # abort starts, no later poll may launch a new scatter
+                        # after this room's cancellation fence has completed.
+                        continue
                 if tag == "kv":
                     chunk_id = int(components[2])
                     is_last_chunk = bool(int(components[3]))
@@ -2856,6 +2866,8 @@ class NixlKVManager(CommonKVManager):
         if self.q35rt_quiescence_version:
             if len(msg) != 6 or msg[5] != b"q35rt-quiet-v1":
                 self._q35rt_fail_stop("Missing negotiated Q35rt abort capability")
+            logger.info("Q35RT_ABORT_RECV room=%s rank=%s ns=%s", room_to_be_aborted,
+                        self.transfer_source_rank, time.monotonic_ns())
             try:
                 self._q35rt_source_guard.cancel(
                     room_to_be_aborted, (msg[4].decode("ascii"),)
@@ -3096,7 +3108,7 @@ class NixlKVReceiver(CommonKVReceiver):
     ):
         self.started_transfer = False
         self._q35rt_remote_possible = False
-        self._q35rt_quiet = DestinationQuiescence((0, 1)) if mgr.q35rt_quiescence_version else None
+        self._q35rt_quiet = DestinationQuiescence((0, 1)) if mgr.q35rt_quiescence_version == Q35RT_QUIESCENCE_V1 else None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
         if self._q35rt_quiet is not None:
             mgr._q35rt_receivers[self.bootstrap_room] = self
@@ -3213,6 +3225,8 @@ class NixlKVReceiver(CommonKVReceiver):
         return KVPoll.WaitingForInput  # type: ignore
 
     def _q35rt_begin_abort(self, reason):
+        if not self._q35rt_quiet.pending:
+            logger.info("Q35RT_QUIET_BEGIN room=%s ns=%s", self.bootstrap_room, time.monotonic_ns())
         self._q35rt_quiet.abort(time.monotonic())
         self.conclude_state = None
         self.kv_mgr.record_failure(self.bootstrap_room, reason)
@@ -3244,6 +3258,7 @@ class NixlKVReceiver(CommonKVReceiver):
                 except Exception as fatal:
                     self.kv_mgr._q35rt_fail_stop(fatal)
                 self.conclude_state = KVPoll.Failed
+                logger.info("Q35RT_QUIET_DONE room=%s ns=%s", self.bootstrap_room, time.monotonic_ns())
                 self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(self.bootstrap_room)
                 return KVPoll.Failed
             if time.monotonic() - quiet.started_at > 15:
