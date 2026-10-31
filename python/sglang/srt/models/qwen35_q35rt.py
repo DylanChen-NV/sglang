@@ -163,8 +163,10 @@ class Q35rtHybridKVPool(HybridLinearKVPool):
             raise ValueError("SGLANG_Q35RT_DIRECT_PD_SLAB must be 0 or 1")
         if value == "1":
             manager.q35rt_slab_targets = (
-                self.full_kv_pool.slab_key, self.full_kv_pool.slab_value,
-                self._draft_pool.slab_key, self._draft_pool.slab_value,
+                self.full_kv_pool.slab_key,
+                self.full_kv_pool.slab_value,
+                self._draft_pool.slab_key,
+                self._draft_pool.slab_value,
             )
             self._direct_pd_slab = True
 
@@ -178,9 +180,16 @@ class Q35rtHybridKVPool(HybridLinearKVPool):
             from q35rt.state_ops import unpack_native_state
 
             state_slots = req_pool.translate_mamba_indices(
-                req_pool.req_index_to_mamba_index_mapping[req.req_pool_idx : req.req_pool_idx + 1]
+                req_pool.req_index_to_mamba_index_mapping[
+                    req.req_pool_idx : req.req_pool_idx + 1
+                ]
             )
-            unpack_native_state(bulk_state, self.mamba_pool.mamba_cache.temporal, self._conv_receive, state_slots)
+            unpack_native_state(
+                bulk_state,
+                self.mamba_pool.mamba_cache.temporal,
+                self._conv_receive,
+                state_slots,
+            )
         logger.info(
             "q35rt PD import: rid=%s reused_tokens=%s new_tokens=%s",
             req.rid,
@@ -353,7 +362,9 @@ class Q35rtForCausalLM(nn.Module):
         if fused_graph not in ("0", "1"):
             raise ValueError("SGLANG_Q35RT_FUSED_CYCLE_GRAPH must be 0 or 1")
         if fused_graph == "1" and not self.engine.fused_cycle_enabled:
-            raise ValueError("q35rt fused graph requires the fused cycle implementation")
+            raise ValueError(
+                "q35rt fused graph requires the fused cycle implementation"
+            )
         self.q35rt_capture_fused_cycle = fused_graph == "1"
         self._cycle_track_count = None
         self.q35rt_pd_stage_bytes_per_slot = (
@@ -434,11 +445,21 @@ class Q35rtForCausalLM(nn.Module):
         from sglang.srt.runtime_context import get_exec
 
         if self._cycle_track_count is None:
-            self._cycle_track_count = torch.empty(1, dtype=torch.int64, device=self.engine.dev)
+            self._cycle_track_count = torch.empty(
+                1, dtype=torch.int64, device=self.engine.dev
+            )
         return self._cycle_track_count, get_exec().mamba.mamba_track_interval
 
-    def q35rt_commit(self, batch, commit_lens, bonus, prefix_lens, *, tokens_already_advanced=False,
-                     checkpoint_count=None):
+    def q35rt_commit(
+        self,
+        batch,
+        commit_lens,
+        bonus,
+        prefix_lens,
+        *,
+        tokens_already_advanced=False,
+        checkpoint_count=None,
+    ):
         slot, count = None, None
         if batch.mamba_track_indices is not None:
             from sglang.srt.runtime_context import get_exec
@@ -459,13 +480,21 @@ class Q35rtForCausalLM(nn.Module):
         if audit:
             from sglang.srt.runtime_context import get_exec
 
-            details = dict(commit_count=int(commit_lens[0]),
-                           prefix_count=int(prefix_lens[0]),
-                           track_interval=get_exec().mamba.mamba_track_interval,
-                           checkpoint_count=None if count is None else int(count[0]))
+            details = dict(
+                commit_count=int(commit_lens[0]),
+                prefix_count=int(prefix_lens[0]),
+                track_interval=get_exec().mamba.mamba_track_interval,
+                checkpoint_count=None if count is None else int(count[0]),
+            )
             self._debug_state("pre_commit", batch, 0, **details)
-        self.adapter.commit(commit_lens, bonus, batch.req_pool_indices, slot, count,
-                            tokens_already_advanced=tokens_already_advanced)
+        self.adapter.commit(
+            commit_lens,
+            bonus,
+            batch.req_pool_indices,
+            slot,
+            count,
+            tokens_already_advanced=tokens_already_advanced,
+        )
         if audit:
             self._debug_state("post_commit", batch, 0, **details)
         # Context must be materialized before native radix publication.
@@ -482,8 +511,12 @@ class Q35rtForCausalLM(nn.Module):
         req = int(batch.req_pool_indices[0])
         slot = int(pool.req_index_to_mamba_index_mapping[req])
         state = pool.mamba_pool.mamba_cache
-        tensors = {"ssm": convert_ssm_layout(state.temporal[:, slot],
-                    self.engine.recurrent_state_layout, "vk"), "conv": state.conv[0][:, slot]}
+        tensors = {
+            "ssm": convert_ssm_layout(
+                state.temporal[:, slot], self.engine.recurrent_state_layout, "vk"
+            ),
+            "conv": state.conv[0][:, slot],
+        }
         if length:
             loc = pool.req_to_token[req, :length].to(torch.int64)
             tensors.update(
@@ -505,12 +538,22 @@ class Q35rtForCausalLM(nn.Module):
         elif label in ("pre_commit", "post_commit"):
             position = batch.reqs[0].mamba_next_track_idx
             if position is not None:
-                tracked = int(pool.req_index_to_mamba_ping_pong_track_buffer_mapping[req, position])
+                tracked = int(
+                    pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
+                        req, position
+                    ]
+                )
         if tracked is not None and tracked >= 0:
             row["track_slot"] = tracked
             for name, value in (
-                ("track_ssm", convert_ssm_layout(state.temporal[:, tracked],
-                    self.engine.recurrent_state_layout, "vk")),
+                (
+                    "track_ssm",
+                    convert_ssm_layout(
+                        state.temporal[:, tracked],
+                        self.engine.recurrent_state_layout,
+                        "vk",
+                    ),
+                ),
                 ("track_conv", state.conv[0][:, tracked]),
             ):
                 row[name] = hashlib.sha256(
@@ -766,20 +809,33 @@ class Q35rtComputeAdapter:
         return LogitsProcessorOutput(
             next_token_logits=result.logits,
             hidden_states=result.hidden_states,
-            customized_info={"q35rt_target_top1": result.top1} if result.top1 is not None else None,
+            customized_info=(
+                {"q35rt_target_top1": result.top1} if result.top1 is not None else None
+            ),
         )
 
     def forward_cycle(self, forward_batch):
-        if forward_batch.batch_size != 1 or not forward_batch.forward_mode.is_target_verify():
+        if (
+            forward_batch.batch_size != 1
+            or not forward_batch.forward_mode.is_target_verify()
+        ):
             raise ValueError("q35rt fused cycle requires native BS1 target verify")
         if not getattr(self, "_fused_cycle_logged", False):
-            logger.info("q35rt fused query/verify/context active; native state commit remains explicit")
+            logger.info(
+                "q35rt fused query/verify/context active; native state commit remains explicit"
+            )
             self._fused_cycle_logged = True
         self._bind_request(forward_batch.req_pool_indices)
         stream = torch.cuda.current_stream(self.engine.dev)
-        for tensor in (forward_batch.req_pool_indices, forward_batch.input_ids, forward_batch.positions):
+        for tensor in (
+            forward_batch.req_pool_indices,
+            forward_batch.input_ids,
+            forward_batch.positions,
+        ):
             tensor.record_stream(stream)
-        self.engine.fused_cycle_forward(forward_batch.input_ids[:1], forward_batch.positions[:1])
+        self.engine.fused_cycle_forward(
+            forward_batch.input_ids[:1], forward_batch.positions[:1]
+        )
         return LogitsProcessorOutput(next_token_logits=None)
 
     def commit(
@@ -796,7 +852,9 @@ class Q35rtComputeAdapter:
         if req_pool_indices is not None:
             self._bind_request(req_pool_indices)
         kwargs = {"tokens_already_advanced": True} if tokens_already_advanced else {}
-        self.engine.commit(accepted_input_count, bonus, checkpoint_slot, checkpoint_count, **kwargs)
+        self.engine.commit(
+            accepted_input_count, bonus, checkpoint_slot, checkpoint_count, **kwargs
+        )
 
     def forward_context(self, req_pool_indices=None):
         if req_pool_indices is not None:
@@ -813,10 +871,18 @@ class Q35rtComputeAdapter:
         result = self.engine.query_forward(
             forward_batch.input_ids, forward_batch.positions[:1]
         )
-        return LogitsProcessorOutput(next_token_logits=result.logits,
-            customized_info={"q35rt_draft_top1": result.top1} if result.top1 is not None else None)
+        return LogitsProcessorOutput(
+            next_token_logits=result.logits,
+            customized_info=(
+                {"q35rt_draft_top1": result.top1} if result.top1 is not None else None
+            ),
+        )
 
     def forward_draft(self):
         result = self.engine.draft_forward()
-        return LogitsProcessorOutput(next_token_logits=result.logits,
-            customized_info={"q35rt_draft_top1": result.top1} if result.top1 is not None else None)
+        return LogitsProcessorOutput(
+            next_token_logits=result.logits,
+            customized_info=(
+                {"q35rt_draft_top1": result.top1} if result.top1 is not None else None
+            ),
+        )

@@ -80,7 +80,11 @@ class ScheduleBatchDisaggregationDecodeMixin:
         minimal_q35rt = (
             len(reqs) == 1
             and self.spec_algorithm.is_dflash()
-            and getattr(self.token_to_kv_pool_allocator.get_kvcache(), "q35rt_prebuilt_minimal", False)
+            and getattr(
+                self.token_to_kv_pool_allocator.get_kvcache(),
+                "q35rt_prebuilt_minimal",
+                False,
+            )
         )
         if minimal_q35rt:
             # PREBUILT runs no model forward. Native DFlash seeds the next step

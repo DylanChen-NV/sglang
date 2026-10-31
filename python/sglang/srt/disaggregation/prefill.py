@@ -39,6 +39,7 @@ def _completed_cp_handoff_stream(function):
     transport keeps the Req's pool rows pinned until transfer completion.
     Join metadata/cache writes back to the scheduler before later allocation.
     """
+
     @wraps(function)
     def wrapped(self, *args, **kwargs):
         enabled = getattr(self, "_q35rt_cp_handoff_enabled", None)
@@ -47,7 +48,8 @@ def _completed_cp_handoff_stream(function):
             if value not in ("0", "1"):
                 raise ValueError("SGLANG_QWEN35_CP_HANDOFF_STREAM must be 0 or 1")
             enabled = (
-                value == "1" and not self.enable_overlap
+                value == "1"
+                and not self.enable_overlap
                 and self.server_args.enable_qwen35_cp_prefill
                 and self.server_args.prefill_max_requests == 1
                 and self.server_args.chunked_prefill_size == -1
@@ -70,6 +72,7 @@ def _completed_cp_handoff_stream(function):
             done.record()
         self.schedule_stream.wait_event(done)
         return result
+
     return wrapped
 
 
@@ -79,6 +82,7 @@ class _CPForwardCompletionPoller:
 
     def poll(self):
         return KVPoll.Success if self.event.query() else KVPoll.Transferring
+
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
@@ -328,7 +332,9 @@ class PrefillBootstrapQueue:
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if envs.SGLANG_Q35RT_PD.get():
             kv_manager.q35rt_mamba_cache = self.token_to_kv_pool.mamba_pool.mamba_cache
-            kv_manager.q35rt_bulk_state = getattr(self.token_to_kv_pool, "_q35rt_bulk_state", None)
+            kv_manager.q35rt_bulk_state = getattr(
+                self.token_to_kv_pool, "_q35rt_bulk_state", None
+            )
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
             and hasattr(kv_manager, "set_kv_buffer_tensors")
@@ -651,10 +657,12 @@ class SchedulerDisaggregationPrefillMixin:
                     # GPU submission can delay their HTTP completion by the
                     # full CPU submission interval.
                     body = self.tp_worker.model_runner.model.model
+
                     def progress_completed_handoffs(reads_ready):
                         self._q35rt_cp_reads_ready = reads_ready
                         if self.disagg_prefill_inflight_queue:
                             self.process_disagg_prefill_inflight_queue()
+
                     body.q35rt_cp_handoff_progress = progress_completed_handoffs
                     try:
                         result = self.run_batch(batch)
@@ -765,7 +773,9 @@ class SchedulerDisaggregationPrefillMixin:
             result.copy_done,
         )
 
-        from sglang.srt.disaggregation.common.q35rt_early_token import publish_before_draft
+        from sglang.srt.disaggregation.common.q35rt_early_token import (
+            publish_before_draft,
+        )
 
         publish_before_draft(self, batch, result)
         if copy_done is not None:
@@ -908,7 +918,9 @@ class SchedulerDisaggregationPrefillMixin:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
-        from sglang.srt.disaggregation.common.q35rt_early_token import complete_prefill_http
+        from sglang.srt.disaggregation.common.q35rt_early_token import (
+            complete_prefill_http,
+        )
 
         for req in batch.reqs:
             complete_prefill_http(self, req)
@@ -1247,7 +1259,9 @@ class SchedulerDisaggregationPrefillMixin:
             early_aux_done = getattr(req, "q35rt_pre_draft_aux_done", None)
             if early_aux_done is not None:
                 if not early_aux_done.wait(30):
-                    req.disagg_kv_sender.kv_mgr._q35rt_fail_stop("Early aux read did not complete")
+                    req.disagg_kv_sender.kv_mgr._q35rt_fail_stop(
+                        "Early aux read did not complete"
+                    )
                 del req.q35rt_pre_draft_aux_done
             self.disagg_metadata_buffers.set_buf(req)
 

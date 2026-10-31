@@ -1116,7 +1116,13 @@ class ServerArgs:
             help="Affine output repair arithmetic for the Qwen3.5 CP prefix-cache executor. "
             "fp32 uses IEEE FP32 matmul. bf16-fp32-local preserves the local GDN "
             "output in FP32 and uses a BF16 dot with FP32 accumulation.",
-            choices=("two-bf16", "fp32", "single-bf16", "bf16-fp32-local", "two-bf16-fp32-local"),
+            choices=(
+                "two-bf16",
+                "fp32",
+                "single-bf16",
+                "bf16-fp32-local",
+                "two-bf16-fp32-local",
+            ),
         ),
         NS("exec"),
     ] = "two-bf16"
@@ -1135,7 +1141,10 @@ class ServerArgs:
     ] = "none"
     qwen35_cp_fp32_refinement: A[
         str,
-        Arg(help="Opt-in refinement of the FP32 affine path; u16-fused-gemm stores U as BF16 and promotes it inside the FP32 kernel. Recurrent state is received on demand.", choices=("none", "u32-only", "host-cache", "fused-gemm", "u16-fused-gemm")),
+        Arg(
+            help="Opt-in refinement of the FP32 affine path; u16-fused-gemm stores U as BF16 and promotes it inside the FP32 kernel. Recurrent state is received on demand.",
+            choices=("none", "u32-only", "host-cache", "fused-gemm", "u16-fused-gemm"),
+        ),
         NS("exec"),
     ] = "none"
     enable_prefill_cp: A[
@@ -5112,20 +5121,41 @@ class ServerArgs:
 
         if self.enable_qwen35_cp_prefix_cache and not self.enable_qwen35_cp_prefill:
             raise ValueError("CP prefix cache requires --enable-qwen35-cp-prefill")
-        if self.qwen35_cp_affine_mode != "two-bf16" and not self.enable_qwen35_cp_prefix_cache:
-            raise ValueError("Selected CP affine mode requires --enable-qwen35-cp-prefix-cache")
+        if (
+            self.qwen35_cp_affine_mode != "two-bf16"
+            and not self.enable_qwen35_cp_prefix_cache
+        ):
+            raise ValueError(
+                "Selected CP affine mode requires --enable-qwen35-cp-prefix-cache"
+            )
         if self.qwen35_cp_affine_fuse_output and self.qwen35_cp_affine_mode not in (
-                "bf16-fp32-local", "two-bf16-fp32-local"):
+            "bf16-fp32-local",
+            "two-bf16-fp32-local",
+        ):
             raise ValueError("Fused CP affine output requires an FP32-local BF16 mode")
         if self.qwen35_cp_affine_mode == "fp32":
             if not self.enable_qwen35_cp_prefix_cache:
-                raise ValueError("FP32 CP affine correction requires --enable-qwen35-cp-prefix-cache")
+                raise ValueError(
+                    "FP32 CP affine correction requires --enable-qwen35-cp-prefix-cache"
+                )
             if self.enable_tf32_matmul:
-                raise ValueError("FP32 CP affine correction is incompatible with --enable-tf32-matmul")
-        if self.qwen35_cp_fp32_optimization != "none" and self.qwen35_cp_affine_mode != "fp32":
-            raise ValueError("FP32 CP optimization requires --qwen35-cp-affine-mode fp32")
-        if self.qwen35_cp_fp32_refinement != "none" and self.qwen35_cp_fp32_optimization != "u-output":
-            raise ValueError("FP32 CP refinement requires --qwen35-cp-fp32-optimization u-output")
+                raise ValueError(
+                    "FP32 CP affine correction is incompatible with --enable-tf32-matmul"
+                )
+        if (
+            self.qwen35_cp_fp32_optimization != "none"
+            and self.qwen35_cp_affine_mode != "fp32"
+        ):
+            raise ValueError(
+                "FP32 CP optimization requires --qwen35-cp-affine-mode fp32"
+            )
+        if (
+            self.qwen35_cp_fp32_refinement != "none"
+            and self.qwen35_cp_fp32_optimization != "u-output"
+        ):
+            raise ValueError(
+                "FP32 CP refinement requires --qwen35-cp-fp32-optimization u-output"
+            )
         serialized_cp_prefill = (
             self.enable_qwen35_cp_prefill
             and self.disaggregation_mode == "prefill"
@@ -5133,14 +5163,24 @@ class ServerArgs:
             and self.disable_overlap_schedule
         )
         if self.qwen35_cp_fp32_optimization in ("workspace", "u-output") and (
-                not self.disable_overlap_schedule
-                or (self.max_running_requests != 1 and not serialized_cp_prefill)):
-            raise ValueError("FP32 CP workspace requires serialized BS1 prefill and disabled overlap scheduling")
+            not self.disable_overlap_schedule
+            or (self.max_running_requests != 1 and not serialized_cp_prefill)
+        ):
+            raise ValueError(
+                "FP32 CP workspace requires serialized BS1 prefill and disabled overlap scheduling"
+            )
         if self.enable_qwen35_cp_prefill:
-            if model_arch not in ("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"):
-                raise ValueError("reference CP prefill is supported for Qwen3.5 MoE only")
+            if model_arch not in (
+                "Qwen3_5MoeForConditionalGeneration",
+                "Qwen3_5MoeForCausalLM",
+            ):
+                raise ValueError(
+                    "reference CP prefill is supported for Qwen3.5 MoE only"
+                )
             if self.tp_size != 2 or self.pp_size != 1 or self.enable_dp_attention:
-                raise ValueError("reference CP requires two collocated ranks without PP/DP attention")
+                raise ValueError(
+                    "reference CP requires two collocated ranks without PP/DP attention"
+                )
             # Native autotune constructs decode/verify-shaped dummy inputs.
             # This backend is a cold-prefill executor; reference kernels use
             # their own prefill heuristics and are warmed by real extend inputs.

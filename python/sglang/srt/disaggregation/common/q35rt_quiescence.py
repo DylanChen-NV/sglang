@@ -13,9 +13,10 @@ Q35RT_QUIESCENCE_V1 = 1
 
 
 def protocol_version():
-    flags = [os.environ.get(name, "0") for name in (
-        "SGLANG_Q35RT_QUIESCENCE", "SGLANG_Q35RT_EARLY_TOKEN"
-    )]
+    flags = [
+        os.environ.get(name, "0")
+        for name in ("SGLANG_Q35RT_QUIESCENCE", "SGLANG_Q35RT_EARLY_TOKEN")
+    ]
     if any(value not in ("0", "1") for value in flags):
         raise ValueError("Q35rt quiescence/early-token flags must be 0 or 1")
     return int(os.environ.get("SGLANG_Q35RT_PD", "0") == "1" and "1" in flags)
@@ -78,9 +79,9 @@ class SourceQuiescence:
     def can_release(self, room):
         with self._lock:
             state = self._rooms.get(room)
-            return state is None or (state.active == 0 and (
-                not state.cancelled or state.quiesced
-            ))
+            return state is None or (
+                state.active == 0 and (not state.cancelled or state.quiesced)
+            )
 
     def release(self, room):
         # Native clear must remove transfer_infos before this call. A stale
@@ -92,8 +93,14 @@ class SourceQuiescence:
                 self._discard(room, state)
 
     def _discard(self, room, state):
-        if state.released and state.active == 0 and not state.finalizing and (
-            not state.cancelled or (state.quiesced and state.peers <= state.notified)
+        if (
+            state.released
+            and state.active == 0
+            and not state.finalizing
+            and (
+                not state.cancelled
+                or (state.quiesced and state.peers <= state.notified)
+            )
         ):
             self._rooms.pop(room, None)
 

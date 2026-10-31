@@ -83,7 +83,9 @@ class SchedulerRequestReceiver:
         )
         object.__setattr__(self, "_q35rt_mq_requests", enabled)
         if enabled:
-            logger.info("Q35RT_MQ_REQUESTS active: native local message-queue broadcast")
+            logger.info(
+                "Q35RT_MQ_REQUESTS active: native local message-queue broadcast"
+            )
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:

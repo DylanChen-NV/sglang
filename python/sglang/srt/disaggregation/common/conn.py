@@ -533,10 +533,15 @@ class CommonKVManager(BaseKVManager):
         if info.q35rt_quiescence_version != version:
             raise RuntimeError("Q35rt PD quiescence capability differs between P and D")
         if version and (
-            info.attn_tp_size != 2 or info.pp_size != 1 or info.dp_size != 1
-            or self.attn_tp_size != 1 or self.dcp_size != 1
+            info.attn_tp_size != 2
+            or info.pp_size != 1
+            or info.dp_size != 1
+            or self.attn_tp_size != 1
+            or self.dcp_size != 1
         ):
-            raise RuntimeError("Q35rt quiescence currently requires paired CP2 P -> TP1 D")
+            raise RuntimeError(
+                "Q35rt quiescence currently requires paired CP2 P -> TP1 D"
+            )
         if info.page_size is not None and info.page_size != self.kv_args.page_size:
             raise RuntimeError(
                 f"Page size mismatch: prefill server has page_size={info.page_size}, "
@@ -1522,15 +1527,15 @@ class CommonKVReceiver(BaseKVReceiver):
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
                     frames = [
-                            b"ABORT",
-                            str(self.bootstrap_room).encode("ascii"),
-                            self.kv_mgr.local_ip.encode("ascii"),
-                            str(self.kv_mgr.rank_port).encode("ascii"),
+                        b"ABORT",
+                        str(self.bootstrap_room).encode("ascii"),
+                        self.kv_mgr.local_ip.encode("ascii"),
+                        str(self.kv_mgr.rank_port).encode("ascii"),
                     ]
                     if getattr(self.kv_mgr, "q35rt_quiescence_version", 0):
-                        frames.extend([
-                            self.kv_mgr.agent.name.encode("ascii"), b"q35rt-quiet-v1"
-                        ])
+                        frames.extend(
+                            [self.kv_mgr.agent.name.encode("ascii"), b"q35rt-quiet-v1"]
+                        )
                     sock.send_multipart(frames)
                 logger.debug(
                     f"Sent abort notification for room {self.bootstrap_room} "

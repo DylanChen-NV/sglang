@@ -284,7 +284,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         defer_verify = os.environ.get("SGLANG_Q35RT_DEFER_VERIFY_METADATA", "0")
         if defer_verify not in ("0", "1"):
             raise ValueError("SGLANG_Q35RT_DEFER_VERIFY_METADATA must be 0 or 1")
-        self._q35rt_defer_verify_metadata = self._q35rt_direct_logits and defer_verify == "1"
+        self._q35rt_defer_verify_metadata = (
+            self._q35rt_direct_logits and defer_verify == "1"
+        )
         track_window = os.environ.get("SGLANG_Q35RT_TRACK_WINDOW", "0")
         if track_window not in ("0", "1"):
             raise ValueError("SGLANG_Q35RT_TRACK_WINDOW must be 0 or 1")
@@ -1405,14 +1407,17 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
-    def _forward_q35rt_fused_cycle(self, batch, block_ids, positions, cache_locations,
-                                   prefix_lens, on_publish):
+    def _forward_q35rt_fused_cycle(
+        self, batch, block_ids, positions, cache_locations, prefix_lens, on_publish
+    ):
         """Native allocation, ModelRunner preparation, commit, and result ownership."""
         from q35rt.framework_ops import pack_fused_cycle
 
         verify = DFlashVerifyInput(
-            draft_token=block_ids.reshape(-1), positions=positions,
-            draft_token_num=int(self.block_size), custom_mask=None,
+            draft_token=block_ids.reshape(-1),
+            positions=positions,
+            draft_token_num=int(self.block_size),
+            custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
         batch.out_cache_loc = cache_locations
@@ -1421,30 +1426,58 @@ class DFlashWorkerV2(BaseSpecWorker):
             batch.seq_lens_cpu = host_lens + int(self.block_size)
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
         forward_batch, _ = verify.prepare_for_verify(
-            batch, self.target_worker, defer_metadata_init=True,
+            batch,
+            self.target_worker,
+            defer_metadata_init=True,
             mamba_track_window=int(self.block_size) if self._q35rt_track_window else 0,
         )
         batch.seq_lens_cpu, batch.seq_lens_sum = host_lens, host_sum
         forward_batch.q35rt_fused_cycle = True
         result = self.target_worker.forward_batch_generation(
-            batch=None, forward_batch=forward_batch, is_verify=True,
+            batch=None,
+            forward_batch=forward_batch,
+            is_verify=True,
             skip_attn_backend_init=False,
         )
         accept, committed, bonus, output, lengths = self._next_accept_bonus_buffers(1)
         model = self.target_worker.model_runner.model
         track_count, track_interval = model.q35rt_cycle_tracking_metadata(batch)
-        tracking = {} if track_count is None else dict(checkpoint_count=track_count, track_interval=track_interval)
-        pack_fused_cycle(model.engine, prefix_lens, accept, committed, bonus, output,
-                         lengths, candidates=block_ids, **tracking)
-        model.q35rt_commit(batch, committed, bonus, prefix_lens, tokens_already_advanced=True,
-                           checkpoint_count=track_count)
+        tracking = (
+            {}
+            if track_count is None
+            else dict(checkpoint_count=track_count, track_interval=track_interval)
+        )
+        pack_fused_cycle(
+            model.engine,
+            prefix_lens,
+            accept,
+            committed,
+            bonus,
+            output,
+            lengths,
+            candidates=block_ids,
+            **tracking,
+        )
+        model.q35rt_commit(
+            batch,
+            committed,
+            bonus,
+            prefix_lens,
+            tokens_already_advanced=True,
+            checkpoint_count=track_count,
+        )
         if on_publish is not None:
             on_publish(lengths)
         return GenerationBatchResult(
-            logits_output=result.logits_output, next_token_ids=output.reshape(-1),
-            accept_lens=committed, can_run_cuda_graph=False,
-            next_draft_input=self._make_next_draft_input_decode(bonus_tokens=bonus, new_seq_lens=lengths),
-            speculative_num_draft_tokens=int(self.block_size), new_seq_lens=lengths,
+            logits_output=result.logits_output,
+            next_token_ids=output.reshape(-1),
+            accept_lens=committed,
+            can_run_cuda_graph=False,
+            next_draft_input=self._make_next_draft_input_decode(
+                bonus_tokens=bonus, new_seq_lens=lengths
+            ),
+            speculative_num_draft_tokens=int(self.block_size),
+            new_seq_lens=lengths,
         )
 
     def forward_batch_generation(
@@ -1474,7 +1507,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
 
-            from sglang.srt.disaggregation.common.q35rt_early_token import capture_target_sample
+            from sglang.srt.disaggregation.common.q35rt_early_token import (
+                capture_target_sample,
+            )
 
             capture_target_sample(self, batch, batch_output)
 
@@ -1505,20 +1540,29 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
             device = next_token_ids.device
-            if self.model_runner.server_args.enable_qwen35_cp_prefill and device.type == "cuda":
+            if (
+                self.model_runner.server_args.enable_qwen35_cp_prefill
+                and device.type == "cuda"
+            ):
                 # A pageable torch.tensor(..., device='cuda') here waits for
                 # the already queued target prefill. These CPU-known lengths
                 # need only an ordered H2D copy, so keep immutable pinned
                 # sources alive with the native result through copy_done.
-                ctx_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int32, pin_memory=True)
-                draft_seq_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int32, pin_memory=True)
+                ctx_lens_cpu = torch.tensor(
+                    batch.extend_lens, dtype=torch.int32, pin_memory=True
+                )
+                draft_seq_lens_cpu = torch.tensor(
+                    batch.prefix_lens, dtype=torch.int32, pin_memory=True
+                )
                 ctx_lens = ctx_lens_cpu.to(device, non_blocking=True)
                 draft_seq_lens = draft_seq_lens_cpu.to(device, non_blocking=True)
-                batch_output.extra_keep_alive_refs = list(batch_output.extra_keep_alive_refs or ()) + [
-                    ctx_lens_cpu, draft_seq_lens_cpu
-                ]
+                batch_output.extra_keep_alive_refs = list(
+                    batch_output.extra_keep_alive_refs or ()
+                ) + [ctx_lens_cpu, draft_seq_lens_cpu]
             else:
-                ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
+                ctx_lens = torch.tensor(
+                    batch.extend_lens, dtype=torch.int32, device=device
+                )
                 draft_seq_lens = torch.tensor(
                     batch.prefix_lens, dtype=torch.int32, device=device
                 )
@@ -1677,15 +1721,25 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
 
         if (
-            self._q35rt_direct_logits and bs == 1 and SIMULATE_ACC_LEN <= 0
+            self._q35rt_direct_logits
+            and bs == 1
+            and SIMULATE_ACC_LEN <= 0
             and getattr(target_model.engine, "fused_cycle_enabled", False)
             and can_use_q35rt_fused_cycle(
-                batch.sampling_info, has_grammar=batch.has_grammar,
-                return_sampling_mask=any(getattr(req, "return_sampling_mask", False) for req in batch.reqs),
+                batch.sampling_info,
+                has_grammar=batch.has_grammar,
+                return_sampling_mask=any(
+                    getattr(req, "return_sampling_mask", False) for req in batch.reqs
+                ),
             )
         ):
             return self._forward_q35rt_fused_cycle(
-                batch, block_ids, positions, verify_out_cache_loc, prefix_lens, on_publish
+                batch,
+                block_ids,
+                positions,
+                verify_out_cache_loc,
+                prefix_lens,
+                on_publish,
             )
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
@@ -1747,13 +1801,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_logits_output = draft_out.logits_output
 
         if self._q35rt_direct_logits:
-            cached_top1 = (draft_logits_output.customized_info or {}).get("q35rt_draft_top1")
+            cached_top1 = (draft_logits_output.customized_info or {}).get(
+                "q35rt_draft_top1"
+            )
             if cached_top1 is not None:
                 draft_next = cached_top1.view(bs, block_size)[:, 1:]
             else:
-                draft_next = draft_logits_output.next_token_logits.view(bs, block_size, -1)[
-                    :, 1:
-                ].argmax(-1)
+                draft_next = draft_logits_output.next_token_logits.view(
+                    bs, block_size, -1
+                )[:, 1:].argmax(-1)
         elif self._draft_sampler is not None and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
@@ -1810,7 +1866,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
 
         verify_forward_batch, _ = verify_input.prepare_for_verify(
-            batch, self.target_worker,
+            batch,
+            self.target_worker,
             defer_metadata_init=self._q35rt_defer_verify_metadata,
         )
         batch.seq_lens_cpu = seq_lens_cpu_backup
@@ -1874,7 +1931,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
         else:
             target_predict = get_dflash_greedy_target_top1(
-                logits_output, logits_modified=logits_modified, grammar_mask=grammar_mask
+                logits_output,
+                logits_modified=logits_modified,
+                grammar_mask=grammar_mask,
             ).view(bs, int(self.block_size))
             if self._use_triton_accept_bonus:
                 try:
@@ -1997,11 +2056,15 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
-        if logits_output.customized_info and "q35rt_target_top1" in logits_output.customized_info:
+        if (
+            logits_output.customized_info
+            and "q35rt_target_top1" in logits_output.customized_info
+        ):
             # This borrowed GPU workspace is internal to verify. Do not expose
             # it as client metadata or mutate the captured graph's shared dict.
             logits_output.customized_info = {
-                key: value for key, value in logits_output.customized_info.items()
+                key: value
+                for key, value in logits_output.customized_info.items()
                 if key != "q35rt_target_top1"
             } or None
 

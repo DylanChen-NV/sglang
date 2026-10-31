@@ -495,7 +495,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.scheduler.server_args,
             self.is_mla_backend,
         )
-        if self.enable_staging and hasattr(self.token_to_kv_pool, "q35rt_bind_pd_manager"):
+        if self.enable_staging and hasattr(
+            self.token_to_kv_pool, "q35rt_bind_pd_manager"
+        ):
             self.token_to_kv_pool.q35rt_bind_pd_manager(kv_manager)
         # Staging buffer setup (only when heterogeneous TP staging is enabled)
         if self.enable_staging and not self.is_mla_backend:
@@ -1896,9 +1898,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         early_token = getattr(decode_req.req, "q35rt_early_token", None)
         if early_token is None:
             decode_req.req.output_ids.append(committed_output_id)
-        elif early_token != committed_output_id or list(decode_req.req.output_ids) != [early_token]:
-            prepare_abort(decode_req.req, "q35rt early token differs from native committed token",
-                          status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif early_token != committed_output_id or list(decode_req.req.output_ids) != [
+            early_token
+        ]:
+            prepare_abort(
+                decode_req.req,
+                "q35rt early token differs from native committed token",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
             return
@@ -2036,8 +2043,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 poll = decode_req.kv_receiver.poll()
                 if poll != KVPoll.Failed:
                     continue
-            if poll != KVPoll.Failed and hicache_restore_status != HiCacheRestoreResult.FAILED:
-                from sglang.srt.disaggregation.common.q35rt_early_token import emit_decode_token
+            if (
+                poll != KVPoll.Failed
+                and hicache_restore_status != HiCacheRestoreResult.FAILED
+            ):
+                from sglang.srt.disaggregation.common.q35rt_early_token import (
+                    emit_decode_token,
+                )
 
                 if emit_decode_token(self, decode_req):
                     logger.info("q35rt early token: rid=%s", decode_req.req.rid)

@@ -21,16 +21,23 @@ def pre_draft_enabled():
     if value not in ("0", "1"):
         raise ValueError("SGLANG_Q35RT_PRE_DRAFT_TOKEN must be 0 or 1")
     if value == "1" and not enabled():
-        raise ValueError("Pre-draft token publication requires native early token/quiescence")
+        raise ValueError(
+            "Pre-draft token publication requires native early token/quiescence"
+        )
     return value == "1"
 
 
 def capture_target_sample(worker, batch, result):
     """Copy only the sampled token before later draft work enters its stream."""
     args = worker.model_runner.server_args
-    if (not pre_draft_enabled() or not args.enable_qwen35_cp_prefill
-        or not args.disable_overlap_schedule or args.chunked_prefill_size != -1
-        or len(batch.reqs) != 1 or not batch.reqs[0].stream):
+    if (
+        not pre_draft_enabled()
+        or not args.enable_qwen35_cp_prefill
+        or not args.disable_overlap_schedule
+        or args.chunked_prefill_size != -1
+        or len(batch.reqs) != 1
+        or not batch.reqs[0].stream
+    ):
         return
     import torch
 
@@ -39,7 +46,9 @@ def capture_target_sample(worker, batch, result):
         return
     stream = getattr(worker, "_q35rt_sample_copy_stream", None)
     if stream is None:
-        stream = worker._q35rt_sample_copy_stream = torch.cuda.Stream(device=token.device)
+        stream = worker._q35rt_sample_copy_stream = torch.cuda.Stream(
+            device=token.device
+        )
     target_done = torch.cuda.Event()
     target_done.record(torch.cuda.current_stream(token.device))
     host = torch.empty(token.shape, dtype=token.dtype, device="cpu", pin_memory=True)
@@ -55,21 +64,27 @@ def capture_target_sample(worker, batch, result):
 def publish_before_draft(scheduler, batch, result):
     """Publish an output view; full copy_done and native cache processing remain."""
     sample = result.q35rt_target_sample
-    if (sample is None or not pre_draft_enabled() or len(batch.reqs) != 1
-        or scheduler.server_args.tokenizer_worker_num != 1):
+    if (
+        sample is None
+        or not pre_draft_enabled()
+        or len(batch.reqs) != 1
+        or scheduler.server_args.tokenizer_worker_num != 1
+    ):
         return False
     req = batch.reqs[0]
     if req.output_ids or req.inflight_middle_chunks > 0 or req.finished_output:
         return False
-    from sglang.srt.disaggregation.prefill import should_force_retry
     from sglang.srt.disaggregation.base.conn import KVPoll
+    from sglang.srt.disaggregation.prefill import should_force_retry
     from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 
     if req.pending_bootstrap:
         if should_force_retry(req):
             return False
         polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender], scheduler.attn_cp_cpu_group, scheduler.attn_tp_cpu_group
+            [req.disagg_kv_sender],
+            scheduler.attn_cp_cpu_group,
+            scheduler.attn_tp_cpu_group,
         )
         # Do not run bootstrap failure/retry cleanup before full GPU completion.
         if polls[0] != KVPoll.WaitingForInput:
@@ -91,8 +106,13 @@ def publish_before_draft(scheduler, batch, result):
         req.bootstrap_room, req.metadata_buffer_index
     )
     complete_prefill_http(scheduler, req, sampled_token=token)
-    logger.info("Q35RT_PRE_DRAFT_TOKEN rid=%s room=%s full_ready=%s ns=%s", req.rid,
-                req.bootstrap_room, int(result.copy_done.query()), time.monotonic_ns())
+    logger.info(
+        "Q35RT_PRE_DRAFT_TOKEN rid=%s room=%s full_ready=%s ns=%s",
+        req.rid,
+        req.bootstrap_room,
+        int(result.copy_done.query()),
+        time.monotonic_ns(),
+    )
     return True
 
 
@@ -129,7 +149,11 @@ def eligible(req, token, *, prefill=False):
 
 def complete_prefill_http(scheduler, req, *, sampled_token=None):
     """Close only the P HTTP response; native Req still owns its live transfer."""
-    token = sampled_token if sampled_token is not None else (req.output_ids[0] if len(req.output_ids) == 1 else None)
+    token = (
+        sampled_token
+        if sampled_token is not None
+        else (req.output_ids[0] if len(req.output_ids) == 1 else None)
+    )
     if (
         not enabled()
         or not scheduler.server_args.enable_qwen35_cp_prefill
@@ -172,7 +196,9 @@ def emit_decode_token(queue, decode_req):
     if not hasattr(manager, "transfer_statuses"):
         return False
     status = manager.transfer_statuses.get(req.bootstrap_room)
-    if status is None or not (status.received_aux or getattr(status, "received_early_aux", False)):
+    if status is None or not (
+        status.received_aux or getattr(status, "received_early_aux", False)
+    ):
         return False
     buffers = queue.metadata_buffers.get_buf(decode_req.metadata_buffer_index)
     # Native aux completion fences the CPU buffers. The room guard prevents a

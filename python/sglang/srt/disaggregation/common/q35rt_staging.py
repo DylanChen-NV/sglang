@@ -4,8 +4,8 @@ Native bootstrap, allocation, notifications and completion fences remain in
 NIXL. Each registered region supplies its own row width, including draft KV.
 """
 
-import os
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +14,7 @@ import triton
 import triton.language as tl
 
 logger = logging.getLogger(__name__)
+
 
 def bulk_state_enabled():
     value = os.environ.get("SGLANG_Q35RT_BULK_STATE", "0")
@@ -40,8 +41,17 @@ def state_registration_spans(pool, pointers, lengths):
         tensors = [cache.temporal, cache.conv[0] if conv is None else conv]
     spans = [(tensor.data_ptr(), tensor.nbytes) for tensor in tensors]
     for pointer, length in zip(pointers, lengths):
-        if pointer and length and not any(start <= pointer and pointer + length <= start + size for start, size in spans):
-            raise ValueError("state descriptor is outside the owned q35rt tensor backing")
+        if (
+            pointer
+            and length
+            and not any(
+                start <= pointer and pointer + length <= start + size
+                for start, size in spans
+            )
+        ):
+            raise ValueError(
+                "state descriptor is outside the owned q35rt tensor backing"
+            )
     return spans
 
 
@@ -52,18 +62,34 @@ def configure_bulk_state(pool):
     cache = pool.mamba_pool.mamba_cache
     state, conv = cache.temporal, cache.conv[0]
     heads, slots = state.shape[2], state.shape[1]
-    if state.shape[0] != 30 or state.dtype != torch.float32 or tuple(state.shape[-2:]) != (128, 128):
+    if (
+        state.shape[0] != 30
+        or state.dtype != torch.float32
+        or tuple(state.shape[-2:]) != (128, 128)
+    ):
         raise ValueError("bulk state requires the validated Qwen3.5 FP32 state")
     if heads == 16:
-        if conv.dtype != torch.bfloat16 or os.environ.get("SGLANG_Q35RT_PRODUCER_EVENT", "0") != "1":
-            raise ValueError("bulk CP2 state requires BF16 conv and exact producer events")
+        if (
+            conv.dtype != torch.bfloat16
+            or os.environ.get("SGLANG_Q35RT_PRODUCER_EVENT", "0") != "1"
+        ):
+            raise ValueError(
+                "bulk CP2 state requires BF16 conv and exact producer events"
+            )
     elif heads != 32 or not hasattr(pool, "q35rt_import_received"):
         raise ValueError("bulk state requires the paired CP2/q35rt TP1 deployment")
     packet = getattr(pool, "_q35rt_bulk_state", None)
     if packet is None:
-        packet = torch.empty((slots, state_packet_bytes(heads)), dtype=torch.uint8, device=state.device)
+        packet = torch.empty(
+            (slots, state_packet_bytes(heads)), dtype=torch.uint8, device=state.device
+        )
         pool._q35rt_bulk_state = packet
-        logger.info("q35rt bulk state: slots=%s bytes_per_slot=%s registered_bytes=%s", slots, packet.shape[1], packet.nbytes)
+        logger.info(
+            "q35rt bulk state: slots=%s bytes_per_slot=%s registered_bytes=%s",
+            slots,
+            packet.shape[1],
+            packet.nbytes,
+        )
     elif tuple(packet.shape) != (slots, state_packet_bytes(heads)):
         raise ValueError("registered bulk-state backing cannot be resized")
     return [packet.data_ptr()], [packet.nbytes], [packet.shape[1]]
@@ -81,7 +107,9 @@ def pack_bulk_state(manager, slot, producer_ready):
     stream.wait_event(producer_ready)
     cache = manager.q35rt_mamba_cache
     with torch.cuda.stream(stream):
-        pack_native_state(cache.temporal, cache.conv[0], int(slot), manager.q35rt_bulk_state)
+        pack_native_state(
+            cache.temporal, cache.conv[0], int(slot), manager.q35rt_bulk_state
+        )
     # NIXL does not inherit PyTorch stream dependencies. Fence only this packet.
     stream.synchronize()
 
@@ -191,19 +219,30 @@ def pack(manager, pages, staging_buffer, notif, *, producer_ready=None):
     with torch.cuda.stream(stream):
         if page_scratch == "1":
             if not hasattr(staging_buffer, "_q35rt_page_indices"):
-                capacity = staging_buffer.buffer.numel() // (manager.kv_args.page_size * row_elements * 2)
-                staging_buffer._q35rt_page_indices = torch.empty(capacity, dtype=torch.int64, device="cuda")
-                staging_buffer._q35rt_page_indices_cpu = torch.empty(capacity, dtype=torch.int64, pin_memory=True)
-            host_indices = staging_buffer._q35rt_page_indices_cpu[:len(pages)]
+                capacity = staging_buffer.buffer.numel() // (
+                    manager.kv_args.page_size * row_elements * 2
+                )
+                staging_buffer._q35rt_page_indices = torch.empty(
+                    capacity, dtype=torch.int64, device="cuda"
+                )
+                staging_buffer._q35rt_page_indices_cpu = torch.empty(
+                    capacity, dtype=torch.int64, pin_memory=True
+                )
+            host_indices = staging_buffer._q35rt_page_indices_cpu[: len(pages)]
             host_indices.copy_(torch.from_numpy(np.asarray(pages, dtype=np.int64)))
-            indices = staging_buffer._q35rt_page_indices[:len(pages)]
+            indices = staging_buffer._q35rt_page_indices[: len(pages)]
             indices.copy_(host_indices, non_blocking=True)
         else:
             indices = torch.as_tensor(np.asarray(pages, dtype=np.int64), device="cuda")
         if fused == "1":
             from q35rt.cache_ops import pack_native_cp2_pairs
 
-            pack_native_cp2_pairs(values[0], indices, staging_buffer.buffer[:total], manager.kv_args.page_size)
+            pack_native_cp2_pairs(
+                values[0],
+                indices,
+                staging_buffer.buffer[:total],
+                manager.kv_args.page_size,
+            )
         else:
             _pack[(len(widths), triton.cdiv(count * max(widths), 1024))](
                 *values,
@@ -211,7 +250,7 @@ def pack(manager, pages, staging_buffer, notif, *, producer_ready=None):
                 staging_buffer.buffer[:total].view(torch.uint16),
                 count,
                 manager.kv_args.page_size,
-                1024
+                1024,
             )
     stream.synchronize()
     verify_dir = os.environ.get("Q35_PD_VERIFY_DIR")
@@ -252,7 +291,9 @@ def scatter(manager, staging_view, pages, prefill_tp):
         from q35rt.cache_ops import scatter_packed_cp2_to_slabs
 
         scatter_packed_cp2_to_slabs(
-            staging_view[:total], pages, *manager.q35rt_slab_targets,
+            staging_view[:total],
+            pages,
+            *manager.q35rt_slab_targets,
             manager.kv_args.page_size,
         )
         return
@@ -263,7 +304,7 @@ def scatter(manager, staging_view, pages, prefill_tp):
         count,
         count * row_elements,
         manager.kv_args.page_size,
-        1024
+        1024,
     )
 
 
