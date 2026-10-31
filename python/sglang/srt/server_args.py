@@ -8203,11 +8203,21 @@ class ServerArgs:
                 )
                 self.optimistic_prefill_attempts = 0
             elif resolved_view(self).uses_mamba_radix_cache:
-                logger.warning(
-                    "Optimistic prefill does not support models that use "
-                    "mamba radix cache."
+                q35rt_cp_candidate = (
+                    os.environ.get("SGLANG_Q35RT_OPTIMISTIC_PREFILL", "0") == "1"
+                    and envs.SGLANG_Q35RT_PD.get()
+                    and self.enable_qwen35_cp_prefill
+                    and self.disable_overlap_schedule
+                    and self.disaggregation_transfer_backend == "nixl"
                 )
-                self.optimistic_prefill_attempts = 0
+                if q35rt_cp_candidate:
+                    logger.info("Experimental q35rt CP2 optimistic prefill enabled")
+                else:
+                    logger.warning(
+                        "Optimistic prefill does not support models that use "
+                        "mamba radix cache."
+                    )
+                    self.optimistic_prefill_attempts = 0
 
         # Handle model inference tensor dump.
         if self.debug_tensor_dump_output_folder is not None:
