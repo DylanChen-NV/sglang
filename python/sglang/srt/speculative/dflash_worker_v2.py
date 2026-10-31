@@ -61,6 +61,7 @@ from sglang.srt.speculative.spec_utils import (
     build_grammar_vocab_mask,
 )
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
+from sglang.srt.utils.nvtx_utils import operations_nvtx_range
 
 _is_npu = is_npu()
 
@@ -1460,9 +1461,10 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
-            batch_output = self.target_worker.forward_batch_generation(
-                batch, capture_hidden_mode=CaptureHiddenMode.FULL
-            )
+            with operations_nvtx_range("dflash.target_prefill"):
+                batch_output = self.target_worker.forward_batch_generation(
+                    batch, capture_hidden_mode=CaptureHiddenMode.FULL
+                )
 
             logits_output, next_token_ids = (
                 batch_output.logits_output,
@@ -1514,11 +1516,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_lens,
                 int(sum(batch.extend_lens)),
             )
-            self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=logits_output.hidden_states,
-                cache_loc=batch.out_cache_loc,
-                positions=positions,
-            )
+            with operations_nvtx_range("dflash.materialize_prefill_context"):
+                self._append_target_hidden_to_draft_kv_by_loc(
+                    target_hidden=logits_output.hidden_states,
+                    cache_loc=batch.out_cache_loc,
+                    positions=positions,
+                )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
             logits_output.hidden_states = None

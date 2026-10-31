@@ -16,6 +16,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from sglang.srt.utils.nvtx_utils import profile_method, NVTX_OPERATIONS_ENABLED
 
 
 def enabled():
@@ -206,6 +207,7 @@ def make_context(model, input_ids, batch):
     return ctx
 
 
+@profile_method("qwen35_cp.persist_states", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
 def persist_states(ctx):
     """Write native head shards after all reference layer computation.
 
@@ -737,6 +739,7 @@ def load_weights(model, weights):
     return loaded
 
 
+@profile_method("qwen35_cp.model_forward", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
 def model_forward(model, input_ids, positions, batch, input_embeds=None):
     import sgl_kernel as sk
 
@@ -773,6 +776,7 @@ def model_forward(model, input_ids, positions, batch, input_embeds=None):
     return last, aux
 
 
+@profile_method("qwen35_cp.logits_output", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
 def logits_output(model, input_ids, positions, batch, input_embeds=None):
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
@@ -813,6 +817,7 @@ class CPDraftWeights(nn.Module):
             self.kn.data[number].copy_(value)
 
 
+@profile_method("qwen35_cp.materialize_draft", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
 def materialize_draft(worker, hidden, cache_loc, positions):
     import sgl_kernel as sk
 
