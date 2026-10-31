@@ -1094,12 +1094,16 @@ def setup_state_kv_args(
             if envs.SGLANG_Q35RT_PD.get():
                 from sglang.srt.disaggregation.common.q35rt_staging import (
                     bulk_state_enabled,
+                    coalesced_state_registration_enabled,
                     configure_bulk_state,
+                    state_registration_spans,
                 )
 
                 if bulk_state_enabled():
                     data_ptrs, data_lens, item_lens = configure_bulk_state(token_to_kv_pool)
                     dim, conv_shard_groups, slice_outer_counts, layer_ids = item_lens[:], [None], [1], [0]
+                if coalesced_state_registration_enabled():
+                    kv_args.q35rt_state_registration = state_registration_spans(token_to_kv_pool, data_ptrs, data_lens)
             append_state_component(
                 kv_args,
                 StateType.MAMBA,

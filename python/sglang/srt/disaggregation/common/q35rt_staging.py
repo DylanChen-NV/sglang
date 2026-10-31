@@ -5,6 +5,7 @@ NIXL. Each registered region supplies its own row width, including draft KV.
 """
 
 import os
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -12,12 +13,36 @@ import torch
 import triton
 import triton.language as tl
 
+logger = logging.getLogger(__name__)
 
 def bulk_state_enabled():
     value = os.environ.get("SGLANG_Q35RT_BULK_STATE", "0")
     if value not in ("0", "1"):
         raise ValueError("SGLANG_Q35RT_BULK_STATE must be 0 or 1")
     return value == "1"
+
+
+def coalesced_state_registration_enabled():
+    value = os.environ.get("SGLANG_Q35RT_STATE_REGISTRATION", "0")
+    if value not in ("0", "1"):
+        raise ValueError("SGLANG_Q35RT_STATE_REGISTRATION must be 0 or 1")
+    return value == "1"
+
+
+def state_registration_spans(pool, pointers, lengths):
+    """Register whole owned tensors; transfer descriptors keep native slices."""
+    packet = getattr(pool, "_q35rt_bulk_state", None)
+    if packet is not None:
+        tensors = [packet]
+    else:
+        cache = pool.mamba_pool.mamba_cache
+        conv = getattr(pool, "_conv_receive", None)
+        tensors = [cache.temporal, cache.conv[0] if conv is None else conv]
+    spans = [(tensor.data_ptr(), tensor.nbytes) for tensor in tensors]
+    for pointer, length in zip(pointers, lengths):
+        if pointer and length and not any(start <= pointer and pointer + length <= start + size for start, size in spans):
+            raise ValueError("state descriptor is outside the owned q35rt tensor backing")
+    return spans
 
 
 def configure_bulk_state(pool):
@@ -38,6 +63,7 @@ def configure_bulk_state(pool):
     if packet is None:
         packet = torch.empty((slots, state_packet_bytes(heads)), dtype=torch.uint8, device=state.device)
         pool._q35rt_bulk_state = packet
+        logger.info("q35rt bulk state: slots=%s bytes_per_slot=%s registered_bytes=%s", slots, packet.shape[1], packet.nbytes)
     elif tuple(packet.shape) != (slots, state_packet_bytes(heads)):
         raise ValueError("registered bulk-state backing cannot be resized")
     return [packet.data_ptr()], [packet.nbytes], [packet.shape[1]]

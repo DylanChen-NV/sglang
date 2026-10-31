@@ -1430,6 +1430,13 @@ class NixlKVManager(CommonKVManager):
                 state_addrs.append(
                     (state_data_ptr, state_data_len, self.kv_args.gpu_id, "")
                 )
+        registration = getattr(self.kv_args, "q35rt_state_registration", None)
+        if registration is not None:
+            if self.kv_args.state_types != [StateType.MAMBA]:
+                raise ValueError("q35rt state registration requires a single native Mamba component")
+            logical_count = len(state_addrs)
+            state_addrs = [(pointer, size, self.kv_args.gpu_id, "") for pointer, size in registration]
+            logger.info("q35rt state registration: logical_regions=%s registered_regions=%s", logical_count, len(state_addrs))
         if state_addrs:
             self.state_descs = self.agent.register_memory(state_addrs, "VRAM")
             logger.debug(

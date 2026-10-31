@@ -1660,7 +1660,15 @@ class KVCacheConfigurator:
             getattr(self.model, "q35rt_kv_bytes_per_token", 0) * self.pool_page_size
         )
         fixed_bytes = getattr(self.model, "q35rt_fixed_cache_bytes", 0)
-        if stage_bytes := getattr(self.model, "q35rt_pd_stage_bytes_per_slot", 0):
+        stage_bytes = getattr(self.model, "q35rt_pd_stage_bytes_per_slot", 0)
+        if self.mambaish_config is not None and envs.SGLANG_Q35RT_PD.get():
+            from sglang.srt.disaggregation.common.q35rt_staging import bulk_state_enabled
+
+            if bulk_state_enabled():
+                from q35rt.state_ops import state_packet_bytes
+
+                stage_bytes += state_packet_bytes(32 // get_parallel().attn_tp_size)
+        if stage_bytes:
             extra = get_disagg().disaggregation_decode_extra_slots
             ping_pong = (
                 (2 if not get_schedule().disable_overlap_schedule else 1)
