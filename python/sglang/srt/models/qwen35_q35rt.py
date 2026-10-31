@@ -169,6 +169,14 @@ class Q35rtHybridKVPool(HybridLinearKVPool):
         # their canonical transport buffers need not have been refreshed.
         start = req.cache_protected_len
         end = len(req.origin_input_ids)
+        bulk_state = getattr(self, "_q35rt_bulk_state", None)
+        if bulk_state is not None:
+            from q35rt.state_ops import unpack_native_state
+
+            state_slots = req_pool.translate_mamba_indices(
+                req_pool.req_index_to_mamba_index_mapping[req.req_pool_idx : req.req_pool_idx + 1]
+            )
+            unpack_native_state(bulk_state, self.mamba_pool.mamba_cache.temporal, self._conv_receive, state_slots)
         logger.info(
             "q35rt PD import: rid=%s reused_tokens=%s new_tokens=%s",
             req.rid,

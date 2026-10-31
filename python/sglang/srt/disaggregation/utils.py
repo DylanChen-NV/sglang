@@ -1091,6 +1091,15 @@ def setup_state_kv_args(
             # Global layer ids let the sender pair src/dst entries when the
             # prefill PP stage registers only its own subset of mamba layers.
             layer_ids = token_to_kv_pool.get_state_layer_ids()
+            if envs.SGLANG_Q35RT_PD.get():
+                from sglang.srt.disaggregation.common.q35rt_staging import (
+                    bulk_state_enabled,
+                    configure_bulk_state,
+                )
+
+                if bulk_state_enabled():
+                    data_ptrs, data_lens, item_lens = configure_bulk_state(token_to_kv_pool)
+                    dim, conv_shard_groups, slice_outer_counts, layer_ids = item_lens[:], [None], [1], [0]
             append_state_component(
                 kv_args,
                 StateType.MAMBA,

@@ -1306,6 +1306,7 @@ class NixlKVManager(CommonKVManager):
                                 dst_state_item_lens=dst_info.dst_state_item_lens,
                                 dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
                                 dst_state_layer_ids=dst_info.dst_state_layer_ids,
+                                producer_ready=kv_chunk.producer_ready,
                             )
                             handles.extend(
                                 h for h in state_xfer_handles if h is not None
@@ -2177,6 +2178,7 @@ class NixlKVManager(CommonKVManager):
         src_state_slice_outer_counts: list[int] = None,
         src_layer_ids: list[int] = None,
         dst_layer_ids: list[int] = None,
+        producer_ready=None,
     ):
         """Transfer Mamba states with TP slice support via RDMA.
 
@@ -2198,6 +2200,17 @@ class NixlKVManager(CommonKVManager):
             from sglang.srt.disaggregation.common.q35rt_staging import capture_state
 
             capture_state(self, prefill_state_indices[0], notif)
+
+        if getattr(self, "q35rt_bulk_state", None) is not None:
+            from q35rt.state_ops import RANK_BYTES
+            from sglang.srt.disaggregation.common.q35rt_staging import pack_bulk_state
+
+            if (self.attn_tp_size != 2 or decode_tp_size != 1
+                or len(src_state_data_ptrs) != 1 or len(dst_state_data_ptrs) != 1
+                or src_state_item_lens != [RANK_BYTES] or dst_state_item_lens != [2 * RANK_BYTES]
+                or src_state_dim_per_tensor != [RANK_BYTES] or dst_state_dim_per_tensor != [2 * RANK_BYTES]):
+                raise ValueError("q35rt bulk state requires matching packet support on both peers")
+            pack_bulk_state(self, prefill_state_indices[0], producer_ready)
 
         if not src_state_dim_per_tensor or not dst_state_dim_per_tensor:
             return self._send_mamba_state(
@@ -2305,6 +2318,7 @@ class NixlKVManager(CommonKVManager):
         dst_state_item_lens: List[List[int]] | None = None,
         dst_state_dim_per_tensor: List[List[int]] | None = None,
         dst_state_layer_ids: List[List[int]] | None = None,
+        producer_ready=None,
     ):
         """Send state per hybrid component, dispatching by state_type[i]."""
         state_types = getattr(self.kv_args, "state_types", []) or []
@@ -2376,6 +2390,7 @@ class NixlKVManager(CommonKVManager):
                         src_outer_counts,
                         src_layer_ids=src_lids,
                         dst_layer_ids=dst_lids,
+                        producer_ready=producer_ready,
                     )
                 else:
                     h = self._send_mamba_state(

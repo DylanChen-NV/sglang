@@ -13,6 +13,53 @@ import triton
 import triton.language as tl
 
 
+def bulk_state_enabled():
+    value = os.environ.get("SGLANG_Q35RT_BULK_STATE", "0")
+    if value not in ("0", "1"):
+        raise ValueError("SGLANG_Q35RT_BULK_STATE must be 0 or 1")
+    return value == "1"
+
+
+def configure_bulk_state(pool):
+    """Describe a registered packet while keeping native compute/cache pools."""
+    from q35rt.state_ops import state_packet_bytes
+
+    cache = pool.mamba_pool.mamba_cache
+    state, conv = cache.temporal, cache.conv[0]
+    heads, slots = state.shape[2], state.shape[1]
+    if state.shape[0] != 30 or state.dtype != torch.float32 or tuple(state.shape[-2:]) != (128, 128):
+        raise ValueError("bulk state requires the validated Qwen3.5 FP32 state")
+    if heads == 16:
+        if conv.dtype != torch.bfloat16 or os.environ.get("SGLANG_Q35RT_PRODUCER_EVENT", "0") != "1":
+            raise ValueError("bulk CP2 state requires BF16 conv and exact producer events")
+    elif heads != 32 or not hasattr(pool, "q35rt_import_received"):
+        raise ValueError("bulk state requires the paired CP2/q35rt TP1 deployment")
+    packet = getattr(pool, "_q35rt_bulk_state", None)
+    if packet is None:
+        packet = torch.empty((slots, state_packet_bytes(heads)), dtype=torch.uint8, device=state.device)
+        pool._q35rt_bulk_state = packet
+    elif tuple(packet.shape) != (slots, state_packet_bytes(heads)):
+        raise ValueError("registered bulk-state backing cannot be resized")
+    return [packet.data_ptr()], [packet.nbytes], [packet.shape[1]]
+
+
+def pack_bulk_state(manager, slot, producer_ready):
+    from q35rt.state_ops import pack_native_state
+
+    if producer_ready is None:
+        raise RuntimeError("bulk state transfer requires this request's producer event")
+    torch.cuda.set_device(manager.kv_args.gpu_id)
+    if not hasattr(manager, "_q35rt_state_stream"):
+        manager._q35rt_state_stream = torch.cuda.Stream()
+    stream = manager._q35rt_state_stream
+    stream.wait_event(producer_ready)
+    cache = manager.q35rt_mamba_cache
+    with torch.cuda.stream(stream):
+        pack_native_state(cache.temporal, cache.conv[0], int(slot), manager.q35rt_bulk_state)
+    # NIXL does not inherit PyTorch stream dependencies. Fence only this packet.
+    stream.synchronize()
+
+
 @triton.jit
 def _pack(
     ptrs,

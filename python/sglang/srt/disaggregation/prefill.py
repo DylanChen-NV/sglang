@@ -328,6 +328,7 @@ class PrefillBootstrapQueue:
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if envs.SGLANG_Q35RT_PD.get():
             kv_manager.q35rt_mamba_cache = self.token_to_kv_pool.mamba_pool.mamba_cache
+            kv_manager.q35rt_bulk_state = getattr(self.token_to_kv_pool, "_q35rt_bulk_state", None)
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
             and hasattr(kv_manager, "set_kv_buffer_tensors")
