@@ -1141,9 +1141,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
-        if os.environ.get("SGLANG_Q35RT", "0") == "1" and isinstance(
-            obj, GenerateReqInput
-        ):
+        q35rt_deployment = (
+            os.environ.get("SGLANG_Q35RT", "0") == "1"
+            or envs.SGLANG_Q35RT_PD.get()
+        )
+        if q35rt_deployment and isinstance(obj, GenerateReqInput):
             if obj.return_logprob:
                 raise ValueError("q35rt/DFLASH does not support return_logprob yet")
             if getattr(obj, "input_embeds", None) is not None:
