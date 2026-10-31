@@ -411,6 +411,7 @@ class NixlKVManager(CommonKVManager):
         self._q35rt_transfer_tls = threading.local()
         self._q35rt_receivers = {}
         self._q35rt_source_guard = None
+        self._q35rt_staging_lock = threading.RLock() if self.q35rt_quiescence_version else None
         self.transfer_source_rank = (
             self.kv_args.pp_rank * self.server_args.tp_size + self.kv_args.engine_rank
         )
@@ -632,6 +633,13 @@ class NixlKVManager(CommonKVManager):
         threading.Thread(target=decode_staging_thread, daemon=True).start()
 
     def _handle_staging_req(self, msg):
+        lock = self._q35rt_staging_lock
+        if lock is None:
+            return self._handle_staging_req_unlocked(msg)
+        with lock:
+            return self._handle_staging_req_unlocked(msg)
+
+    def _handle_staging_req_unlocked(self, msg):
         from sglang.srt.disaggregation.common.staging_handler import (
             handle_staging_req,
         )
@@ -649,10 +657,15 @@ class NixlKVManager(CommonKVManager):
                 room,
             )
             return
-        quiet = getattr(decode_req.kv_receiver, "_q35rt_quiet", None)
+        receiver = decode_req.kv_receiver
+        if receiver is None or (
+            self.q35rt_quiescence_version and self._q35rt_receivers.get(room) is not receiver
+        ):
+            return
+        quiet = getattr(receiver, "_q35rt_quiet", None)
         if quiet is not None and quiet.pending:
             return
-        prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
+        prefill_tp = receiver.prefill_info.attn_tp_size
         handle_staging_req(
             msg,
             self._staging_ctx.allocator,

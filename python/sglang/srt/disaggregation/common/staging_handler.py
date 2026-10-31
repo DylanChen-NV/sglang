@@ -149,6 +149,13 @@ class DecodeStagingHandler:
         self._room_to_receiver[room] = decode_req.kv_receiver
 
     def unregister_decode_req(self, room: int) -> None:
+        lock = getattr(self.kv_manager, "_q35rt_staging_lock", None)
+        if lock is None:
+            return self._unregister_decode_req(room)
+        with lock:
+            return self._unregister_decode_req(room)
+
+    def _unregister_decode_req(self, room: int) -> None:
         # Pop before release_room so no new arrival can start consuming the slots.
         decode_req = self._room_to_decode_req.pop(room, None)
         receiver = self._room_to_receiver.pop(room, None)
