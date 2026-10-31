@@ -5126,9 +5126,15 @@ class ServerArgs:
             raise ValueError("FP32 CP optimization requires --qwen35-cp-affine-mode fp32")
         if self.qwen35_cp_fp32_refinement != "none" and self.qwen35_cp_fp32_optimization != "u-output":
             raise ValueError("FP32 CP refinement requires --qwen35-cp-fp32-optimization u-output")
+        serialized_cp_prefill = (
+            self.enable_qwen35_cp_prefill
+            and self.disaggregation_mode == "prefill"
+            and self.prefill_max_requests == 1
+        )
         if self.qwen35_cp_fp32_optimization in ("workspace", "u-output") and (
-                self.max_running_requests != 1 or not self.disable_overlap_schedule):
-            raise ValueError("FP32 CP workspace requires one active request and disabled overlap scheduling")
+                not self.disable_overlap_schedule
+                or (self.max_running_requests != 1 and not serialized_cp_prefill)):
+            raise ValueError("FP32 CP workspace requires serialized BS1 prefill and disabled overlap scheduling")
         if self.enable_qwen35_cp_prefill:
             if model_arch not in ("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"):
                 raise ValueError("reference CP prefill is supported for Qwen3.5 MoE only")
