@@ -1669,7 +1669,7 @@ class KVCacheConfigurator:
 
                 stage_bytes += state_packet_bytes(32 // get_parallel().attn_tp_size)
         if stage_bytes:
-            extra = get_disagg().disaggregation_decode_extra_slots
+            extra = get_disagg().disaggregation_decode_extra_slots or 0
             ping_pong = (
                 (2 if not get_schedule().disable_overlap_schedule else 1)
                 if self.server_args.enable_mamba_extra_buffer()
