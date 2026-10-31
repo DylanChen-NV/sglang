@@ -185,8 +185,21 @@ def pack(manager, pages, staging_buffer, notif, *, producer_ready=None):
     fused = os.environ.get("SGLANG_Q35RT_FUSED_PD_PACK", "0")
     if fused not in ("0", "1"):
         raise ValueError("SGLANG_Q35RT_FUSED_PD_PACK must be 0 or 1")
+    page_scratch = os.environ.get("SGLANG_Q35RT_PACK_PAGE_SCRATCH", "0")
+    if page_scratch not in ("0", "1"):
+        raise ValueError("SGLANG_Q35RT_PACK_PAGE_SCRATCH must be 0 or 1")
     with torch.cuda.stream(stream):
-        indices = torch.as_tensor(np.asarray(pages, dtype=np.int64), device="cuda")
+        if page_scratch == "1":
+            if not hasattr(staging_buffer, "_q35rt_page_indices"):
+                capacity = staging_buffer.buffer.numel() // (manager.kv_args.page_size * row_elements * 2)
+                staging_buffer._q35rt_page_indices = torch.empty(capacity, dtype=torch.int64, device="cuda")
+                staging_buffer._q35rt_page_indices_cpu = torch.empty(capacity, dtype=torch.int64, pin_memory=True)
+            host_indices = staging_buffer._q35rt_page_indices_cpu[:len(pages)]
+            host_indices.copy_(torch.from_numpy(np.asarray(pages, dtype=np.int64)))
+            indices = staging_buffer._q35rt_page_indices[:len(pages)]
+            indices.copy_(host_indices, non_blocking=True)
+        else:
+            indices = torch.as_tensor(np.asarray(pages, dtype=np.int64), device="cuda")
         if fused == "1":
             from q35rt.cache_ops import pack_native_cp2_pairs
 
