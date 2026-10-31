@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
@@ -34,6 +35,8 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -66,6 +69,21 @@ class SchedulerRequestReceiver:
     stream_output: Callable[..., None]
     get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
+    _q35rt_mq_requests: bool = field(init=False, default=False, repr=False)
+
+    def __post_init__(self):
+        enabled = (
+            envs.SGLANG_Q35RT_MQ_REQUESTS.get()
+            and self.server_args.enable_qwen35_cp_prefill
+            and self.server_args.nnodes == 1
+            and self.server_args.pp_size == 1
+            and self.ps.tp_size == 2
+            and not self.server_args.enable_dp_attention
+            and self.tp_group.mq_broadcaster is not None
+        )
+        object.__setattr__(self, "_q35rt_mq_requests", enabled)
+        if enabled:
+            logger.info("Q35RT_MQ_REQUESTS active: native local message-queue broadcast")
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -206,6 +224,11 @@ class SchedulerRequestReceiver:
                     src=self.tp_group.ranks[0],
                 )
             recv_reqs = work_reqs + control_reqs
+        elif self._q35rt_mq_requests:
+            # Reuse the native queue owned by this exact TP group. Both ranks
+            # enter this call for empty/control/work batches in the same order.
+            # CPU input and pickle-wrapper ownership are unchanged.
+            recv_reqs = self.tp_group.broadcast_object(recv_reqs, src=0)
         elif self.ps.tp_size != 1:
             recv_reqs = broadcast_pyobj(
                 recv_reqs,
