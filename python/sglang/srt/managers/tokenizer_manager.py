@@ -1311,13 +1311,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if isinstance(input_ids[0], list):
             # Batch of sequences
             for seq in input_ids:
-                if any(id >= vocab_size for id in seq):
+                if seq and max(seq) >= vocab_size:
                     raise ValueError(
                         f"The input_ids {seq} contains values greater than the vocab size ({vocab_size})."
                     )
         else:
             # Single sequence
-            if any(id >= vocab_size for id in input_ids):
+            if max(input_ids) >= vocab_size:
                 raise ValueError(
                     f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
                 )
