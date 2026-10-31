@@ -91,7 +91,7 @@ def metadata(manager, receive=False):
     return getattr(manager, name)
 
 
-def pack(manager, pages, staging_buffer, notif):
+def pack(manager, pages, staging_buffer, notif, *, producer_ready=None):
     if manager.attn_tp_size != 2:
         raise ValueError("q35rt PD staging currently requires CP2 prefill")
     torch.cuda.set_device(manager.kv_args.gpu_id)
@@ -103,7 +103,12 @@ def pack(manager, pages, staging_buffer, notif):
     if not hasattr(staging_buffer, "_q35rt_stream"):
         staging_buffer._q35rt_stream = torch.cuda.Stream()
     stream = staging_buffer._q35rt_stream
-    stream.wait_stream(torch.cuda.default_stream())
+    if producer_ready is None:
+        stream.wait_stream(torch.cuda.default_stream())
+    else:
+        # This chunk's pool data is immutable until native transfer completion.
+        # Later prefill work on the producer stream belongs to other requests.
+        stream.wait_event(producer_ready)
     fused = os.environ.get("SGLANG_Q35RT_FUSED_PD_PACK", "0")
     if fused not in ("0", "1"):
         raise ValueError("SGLANG_Q35RT_FUSED_PD_PACK must be 0 or 1")

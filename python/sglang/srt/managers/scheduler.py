@@ -3665,8 +3665,18 @@ class Scheduler(
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
                 if batch_result.new_seq_lens is not None:
+                    # CP prefill returns the same unmodified input lengths.
+                    # Their authoritative CPU mirror is already prepared;
+                    # copying them back would wait for the entire GPU forward
+                    # before the P loop can progress an older Req's handoff.
+                    cp_lengths_unchanged = (
+                        self.server_args.enable_qwen35_cp_prefill
+                        and self.disaggregation_mode == DisaggregationMode.PREFILL
+                        and batch.forward_mode.is_extend()
+                        and batch_result.new_seq_lens is batch.seq_lens
+                    )
                     batch.seq_lens = batch_result.new_seq_lens
-                    if batch.seq_lens_cpu is not None:
+                    if batch.seq_lens_cpu is not None and not cp_lengths_unchanged:
                         batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
                         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                 batch.input_ids = None  # rebuilt next iter from draft_token
