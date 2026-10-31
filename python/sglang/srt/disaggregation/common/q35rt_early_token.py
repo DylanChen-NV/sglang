@@ -4,6 +4,7 @@ import copy
 import logging
 import os
 import time
+from array import array
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +85,7 @@ def publish_before_draft(scheduler, batch, result):
     if not getattr(manager, "q35rt_quiescence_version", 0):
         raise RuntimeError("Pre-draft token requires negotiated source quiescence")
     view = copy.copy(req)
-    view.output_ids = [token]
+    view.output_ids = array("q", [token])
     scheduler.disagg_metadata_buffers.set_buf(view)
     req.q35rt_pre_draft_aux_done = manager.q35rt_send_early_aux(
         req.bootstrap_room, req.metadata_buffer_index
@@ -147,7 +148,7 @@ def complete_prefill_http(scheduler, req, *, sampled_token=None):
     # response view, so the actual Req remains unfinished in the native inflight
     # queue until every transfer has completed and native cleanup releases it.
     response = copy.copy(req)
-    response.output_ids = [token]
+    response.output_ids = array("q", [token])
     response.time_stats = copy.copy(req.time_stats)
     response.finished_reason = FINISH_LENGTH(length=0)
     response.finished_output = False
