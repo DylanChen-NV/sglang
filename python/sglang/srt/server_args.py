@@ -5131,8 +5131,12 @@ class ServerArgs:
             and self.disaggregation_mode == "prefill"
             and self.prefill_max_requests == 1
         )
+        cp_overlap = os.environ.get("SGLANG_QWEN35_CP_OVERLAP", "0")
+        if cp_overlap not in ("0", "1"):
+            raise ValueError("SGLANG_QWEN35_CP_OVERLAP must be 0 or 1")
+        stream_serialized_cp = serialized_cp_prefill and cp_overlap == "1"
         if self.qwen35_cp_fp32_optimization in ("workspace", "u-output") and (
-                not self.disable_overlap_schedule
+                (not self.disable_overlap_schedule and not stream_serialized_cp)
                 or (self.max_running_requests != 1 and not serialized_cp_prefill)):
             raise ValueError("FP32 CP workspace requires serialized BS1 prefill and disabled overlap scheduling")
         if self.enable_qwen35_cp_prefill:
