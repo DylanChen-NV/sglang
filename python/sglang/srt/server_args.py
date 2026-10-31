@@ -5126,26 +5126,9 @@ class ServerArgs:
             raise ValueError("FP32 CP optimization requires --qwen35-cp-affine-mode fp32")
         if self.qwen35_cp_fp32_refinement != "none" and self.qwen35_cp_fp32_optimization != "u-output":
             raise ValueError("FP32 CP refinement requires --qwen35-cp-fp32-optimization u-output")
-        serialized_cp_prefill = (
-            self.enable_qwen35_cp_prefill
-            and self.disaggregation_mode == "prefill"
-            and self.prefill_max_requests == 1
-        )
-        cp_overlap = os.environ.get("SGLANG_QWEN35_CP_OVERLAP", "0")
-        if cp_overlap not in ("0", "1"):
-            raise ValueError("SGLANG_QWEN35_CP_OVERLAP must be 0 or 1")
-        # CPU scheduling may overlap while all BS1 compute stays ordered on
-        # one native forward stream. Multi-stream execution cannot share this
-        # workspace without separate backing.
-        stream_serialized_cp = (
-            serialized_cp_prefill and cp_overlap == "1"
-            and not self.enable_two_batch_overlap
-            and not getattr(self, "enable_pdmux", False)
-        )
         if self.qwen35_cp_fp32_optimization in ("workspace", "u-output") and (
-                (not self.disable_overlap_schedule and not stream_serialized_cp)
-                or (self.max_running_requests != 1 and not serialized_cp_prefill)):
-            raise ValueError("FP32 CP workspace requires serialized BS1 prefill and disabled overlap scheduling")
+                self.max_running_requests != 1 or not self.disable_overlap_schedule):
+            raise ValueError("FP32 CP workspace requires one active request and disabled overlap scheduling")
         if self.enable_qwen35_cp_prefill:
             if model_arch not in ("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"):
                 raise ValueError("reference CP prefill is supported for Qwen3.5 MoE only")

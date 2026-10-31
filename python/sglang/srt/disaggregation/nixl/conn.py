@@ -1802,7 +1802,6 @@ class NixlKVManager(CommonKVManager):
         dst_kv_item_len: int,
         notif: str,
         staging_buffer=None,
-        producer_ready=None,
     ):
         """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
         if envs.SGLANG_Q35RT_PD.get():
@@ -1815,7 +1814,6 @@ class NixlKVManager(CommonKVManager):
                 dst_attn_tp_size,
                 notif,
                 staging_buffer,
-                producer_ready,
             )
         from sglang.srt.disaggregation.common.staging_buffer import (
             compute_head_slice_params,
@@ -1925,7 +1923,6 @@ class NixlKVManager(CommonKVManager):
         dst_tp_size,
         notif,
         staging_buffer,
-        producer_ready=None,
     ):
         from sglang.srt.disaggregation.common.q35rt_staging import pack
 
@@ -1934,7 +1931,7 @@ class NixlKVManager(CommonKVManager):
         rank_bytes = len(pages) * sum(self.kv_args.kv_item_lens)
         if dst_size < 2 * rank_bytes:
             raise ValueError("q35rt decode staging pool is too small for this prefix")
-        if pack(self, pages, staging_buffer, notif, producer_ready=producer_ready) != rank_bytes:
+        if pack(self, pages, staging_buffer, notif) != rank_bytes:
             raise RuntimeError("q35rt packed KV byte count mismatch")
         dst_write = dst_ptr + (self.kv_args.engine_rank % 2) * rank_bytes
         source = self.agent.get_xfer_descs(
@@ -2044,7 +2041,6 @@ class NixlKVManager(CommonKVManager):
             dst_info.dst_kv_item_len,
             notif_tag,
             staging_buffer=staging_strategy.staging_buffer,
-            producer_ready=kv_chunk.producer_ready,
         )
         if handle is None:
             # A silent slice fallback would leak this chunk's decode-side
@@ -2483,20 +2479,6 @@ class NixlKVManager(CommonKVManager):
             # Dummy rank or already cleared; nothing to enqueue.
             return None
 
-        producer_ready = None
-        if envs.SGLANG_Q35RT_PD.get():
-            import os
-            import torch
-
-            exact_producer = os.environ.get("SGLANG_Q35RT_PRODUCER_EVENT", "0")
-            if exact_producer not in ("0", "1"):
-                raise ValueError("SGLANG_Q35RT_PRODUCER_EVENT must be 0 or 1")
-            if exact_producer == "1":
-                # Snapshot readiness on the scheduler's producing stream,
-                # before a later request can enqueue unrelated prefill work.
-                producer_ready = torch.cuda.Event()
-                producer_ready.record(torch.cuda.current_stream(self.kv_args.gpu_id))
-
         # Shard by destination (mirror mooncake): same dst endpoint(s) -> same
         # worker, keeping a room's chunks on one private staging buffer.
         session_port_sum = sum(
@@ -2513,7 +2495,6 @@ class NixlKVManager(CommonKVManager):
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
-                producer_ready=producer_ready,
             )
         )
         return None
