@@ -756,7 +756,10 @@ def model_forward(model, input_ids, positions, batch, input_embeds=None):
         else input_embeds[ctx.start : ctx.end]
     )
     residual, aux = None, []
-    for layer in model.layers:
+    handoff_progress = getattr(model, "q35rt_cp_handoff_progress", None)
+    for layer_index, layer in enumerate(model.layers):
+        if handoff_progress is not None and layer_index % 4 == 0:
+            handoff_progress()
         hidden, residual = layer(
             positions,
             hidden,

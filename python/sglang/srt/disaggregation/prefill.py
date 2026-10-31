@@ -645,7 +645,22 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
-                result = self.run_batch(batch)
+                if cp_handoff_poll and self.disagg_prefill_inflight_queue:
+                    # Progress completed, pinned older rows while Python queues
+                    # this request's CP layers. Otherwise even asynchronous
+                    # GPU submission can delay their HTTP completion by the
+                    # full CPU submission interval.
+                    body = self.tp_worker.model_runner.model.model
+                    def progress_completed_handoffs():
+                        if self.disagg_prefill_inflight_queue:
+                            self.process_disagg_prefill_inflight_queue()
+                    body.q35rt_cp_handoff_progress = progress_completed_handoffs
+                    try:
+                        result = self.run_batch(batch)
+                    finally:
+                        del body.q35rt_cp_handoff_progress
+                else:
+                    result = self.run_batch(batch)
                 if cp_handoff_poll and self.disagg_prefill_inflight_queue:
                     # The current GPU forward is already queued. Finish older
                     # requests' handoffs before the synchronous result wait
