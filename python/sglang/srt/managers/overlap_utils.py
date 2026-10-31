@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import msgspec
@@ -252,14 +251,6 @@ class FutureMap:
         self.needs_cpu_seq_lens = needs_cpu_seq_lens
         self.needs_confidence_relay = needs_confidence_relay
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
-        bs1_relay = os.environ.get("SGLANG_Q35RT_BS1_RELAY", "0")
-        if bs1_relay not in ("0", "1"):
-            raise ValueError("SGLANG_Q35RT_BS1_RELAY must be 0 or 1")
-        self._native_bs1_relay = (
-            bs1_relay == "1" and _is_cuda
-            and os.environ.get("SGLANG_Q35RT", "0") == "1"
-            and spec_algo.is_dflash_family()
-        )
 
         if _DEBUG_ASSERT:
             # Poisoned init: every row must be written before its first gather.
@@ -302,36 +293,6 @@ class FutureMap:
             req_pool_size=self.req_pool_size,
             pool=req_to_token_pool,
         )
-
-    def _single_req_index(self, batch):
-        if self._native_bs1_relay and len(batch.reqs) == 1:
-            return batch.reqs[0].req_pool_idx
-        return None
-
-    def _single_row(self, indices, single_req_index):
-        if (
-            self._native_bs1_relay and indices.numel() == 1
-            and isinstance(single_req_index, int)
-            and 0 <= single_req_index < self.req_pool_size
-        ):
-            return slice(single_req_index, single_req_index + 1)
-        return None
-
-    def _gather_rows(self, buffer, indices, single_req_index=None):
-        row = self._single_row(indices, single_req_index)
-        if row is not None:
-            # Native Req is authoritative; retain an owned snapshot because
-            # publish/stash can overwrite this same pool row before consumers
-            # of the current forward have finished reading it.
-            return buffer[row].clone()
-        return buffer[indices]
-
-    def _scatter_rows(self, buffer, indices, values, single_req_index=None):
-        row = self._single_row(indices, single_req_index)
-        if row is not None and values.ndim == 1 and values.numel() == 1:
-            buffer[row].copy_(values)
-        else:
-            buffer[indices] = values
 
     def _lazy_init_forward_buf(self, payload: RelayPayload):
         # Local import (see decide_needs_cpu_seq_lens): keep module-level deps leaf.
@@ -435,9 +396,7 @@ class FutureMap:
             if self.draft_probs_buf is not None and draft_input.draft_probs is not None:
                 draft_input.draft_probs = self.draft_probs_buf[indices]
         else:
-            draft_input.bonus_tokens = self._gather_rows(
-                self.output_tokens_buf, indices, self._single_req_index(batch)
-            )
+            draft_input.bonus_tokens = self.output_tokens_buf[indices]
         if self.need_hidden_states and not self.need_topk:
             draft_input.hidden_states = self.hidden_states_buf[indices]
         if draft_input.future_dsa_topk_indices_available:
@@ -472,9 +431,7 @@ class FutureMap:
                 self.publish_ready.synchronize()
             else:
                 self.publish_ready.wait()
-        batch.seq_lens = self._gather_rows(
-            self.new_seq_lens_buf, fi, self._single_req_index(batch)
-        )
+        batch.seq_lens = self.new_seq_lens_buf[fi]
 
         if not self.needs_cpu_seq_lens:
             # GPU gather above is kept (SB.seq_lens must advance each verify);
@@ -515,14 +472,11 @@ class FutureMap:
         future_indices: torch.Tensor,
         new_seq_lens: torch.Tensor,
         confidence: Optional[torch.Tensor] = None,
-        *,
-        single_req_index: Optional[int] = None,
     ) -> None:
         indices = future_indices
         if indices.shape[0] == 0:
             return  # DP idle
-        self._scatter_rows(self.new_seq_lens_buf, indices,
-                           new_seq_lens.to(self.new_seq_lens_buf.dtype), single_req_index)
+        self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
         publish_confidence = self.needs_confidence_relay and confidence is not None
         if publish_confidence:
             self.confidence_relay.scatter(indices, confidence)
@@ -544,8 +498,7 @@ class FutureMap:
                 publish_ready=self.publish_ready,
             )
 
-    def stash(self, future_indices: torch.Tensor, payload: RelayPayload, *,
-              single_req_index: Optional[int] = None) -> None:
+    def stash(self, future_indices: torch.Tensor, payload: RelayPayload) -> None:
         if self.spec_algo.is_ngram():
             # FIXME: remove once precomputed draft is supported.
             return
@@ -556,8 +509,9 @@ class FutureMap:
         if not self._forward_buf_initialized:
             self._lazy_init_forward_buf(payload)
         self._maybe_init_dsa_topk_indices_buf(payload)
-        self._scatter_rows(self.output_tokens_buf, indices,
-                           payload.bonus_tokens.to(self.output_tokens_buf.dtype), single_req_index)
+        self.output_tokens_buf[indices] = payload.bonus_tokens.to(
+            self.output_tokens_buf.dtype
+        )
 
         if self.need_topk:
             self.topk_p_buf[indices] = payload.topk_p.to(self.topk_p_buf.dtype)

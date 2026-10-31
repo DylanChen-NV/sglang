@@ -3572,23 +3572,14 @@ class Scheduler(
 
                     with self._forward_isolation(batch, overlap=True):
                         future_indices = batch.req_pool_indices
-                        single_req_index = (
-                            batch.reqs[0].req_pool_idx
-                            if getattr(self.future_map, "_native_bs1_relay", False) and len(batch.reqs) == 1
-                            else None
-                        )
 
                         # Spec_v2 fires on_publish mid-worker (between verify and
                         # draft_extend) so schedule prep can overlap with draft_extend.
                         # Non-spec has no later work — scheduler publishes after return.
                         fwd_kwargs = {}
                         if not batch.spec_algorithm.is_none():
-                            publish_kwargs = (
-                                {"single_req_index": single_req_index}
-                                if single_req_index is not None else {}
-                            )
                             fwd_kwargs["on_publish"] = partial(
-                                self.future_map.publish, future_indices, **publish_kwargs
+                                self.future_map.publish, future_indices
                             )
                             # Grammar-overlap-capable workers advance the grammar FSM
                             # inside verify() before building the bitmask; hand them the
@@ -3629,8 +3620,7 @@ class Scheduler(
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
-                            self._relay_forward_payload(future_indices, batch_result,
-                                                        single_req_index=single_req_index)
+                            self._relay_forward_payload(future_indices, batch_result)
                             if _is_hip:
                                 # Cross-stream sync costs more than the tiny D2H it
                                 # overlaps.
@@ -3777,8 +3767,7 @@ class Scheduler(
             model_runner._pending_elastic_scale_update = None
 
     def _relay_forward_payload(
-        self, future_indices: torch.Tensor, batch_result: GenerationBatchResult,
-        *, single_req_index=None,
+        self, future_indices: torch.Tensor, batch_result: GenerationBatchResult
     ) -> None:
         """Stash this iter's relay payload for next iter's resolve_forward_inputs.
         ngram is skipped: it relays its draft via batch.spec_info, not the FutureMap."""
@@ -3790,10 +3779,7 @@ class Scheduler(
             payload = RelayPayload(bonus_tokens=batch_result.next_token_ids)
         else:
             return
-        if single_req_index is None:
-            self.future_map.stash(future_indices, payload)
-        else:
-            self.future_map.stash(future_indices, payload, single_req_index=single_req_index)
+        self.future_map.stash(future_indices, payload)
 
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult, cur_batch: ScheduleBatch
