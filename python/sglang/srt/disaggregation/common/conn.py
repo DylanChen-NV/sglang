@@ -1732,7 +1732,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 prefill_http_port=self.prefill_http_port,
                 q35rt_quiescence_version=self.q35rt_quiescence_version or 0,
             )
-            return web.json_response(dataclasses.asdict(info), status=200)
+            payload = dataclasses.asdict(info)
+            if not info.q35rt_quiescence_version:
+                # Preserve the previous fork's disabled-feature HTTP schema.
+                payload.pop("q35rt_quiescence_version")
+            return web.json_response(payload, status=200)
 
         if not self._is_ready():
             return web.Response(

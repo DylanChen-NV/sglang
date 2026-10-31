@@ -3396,7 +3396,8 @@ class NixlKVReceiver(CommonKVReceiver):
                             packed_kv_layer_ids,
                             str(self.kv_mgr.dcp_size).encode("ascii"),
                             str(self.kv_mgr.dcp_rank).encode("ascii"),
-                            str(self.kv_mgr.q35rt_quiescence_version).encode("ascii"),
+                            *([str(self.kv_mgr.q35rt_quiescence_version).encode("ascii")]
+                              if self.kv_mgr.q35rt_quiescence_version else []),
                         ]
                     )
             except zmq.ZMQError:
