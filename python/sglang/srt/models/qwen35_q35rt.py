@@ -130,6 +130,10 @@ class Q35rtHybridKVPool(HybridLinearKVPool):
         self._conv_receive = None
         self._direct_pd_slab = False
         self._ssm_layout = recurrent_state_layout()
+        minimal = os.environ.get("SGLANG_Q35RT_PREBUILT_MINIMAL", "0")
+        if minimal not in ("0", "1"):
+            raise ValueError("SGLANG_Q35RT_PREBUILT_MINIMAL must be 0 or 1")
+        self.q35rt_prebuilt_minimal = pd_staging and minimal == "1"
         if pd_staging:
             conv = self.mamba_pool.mamba_cache.conv[0]
             self._conv_receive = torch.zeros(

@@ -77,9 +77,20 @@ class ScheduleBatchDisaggregationDecodeMixin:
             pre_lens.append(pre_len)
 
         # Set fields
-        self.input_ids = torch.tensor(
-            sum(input_ids, array("q")), dtype=torch.int32, device=self.device
+        minimal_q35rt = (
+            len(reqs) == 1
+            and self.spec_algorithm.is_dflash()
+            and getattr(self.token_to_kv_pool_allocator.get_kvcache(), "q35rt_prebuilt_minimal", False)
         )
+        if minimal_q35rt:
+            # PREBUILT runs no model forward. Native DFlash seeds the next step
+            # from last_tokens_tensor and seq_lens; penalties/cache keep using
+            # the complete CPU Req history. Avoid copying the unused prompt.
+            self.input_ids = torch.empty(0, dtype=torch.int32, device=self.device)
+        else:
+            self.input_ids = torch.tensor(
+                sum(input_ids, array("q")), dtype=torch.int32, device=self.device
+            )
         self.req_pool_indices = torch.tensor(
             req_pool_indices, dtype=torch.int64, device=self.device
         )
