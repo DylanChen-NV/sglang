@@ -757,9 +757,14 @@ def model_forward(model, input_ids, positions, batch, input_embeds=None):
     )
     residual, aux = None, []
     handoff_progress = getattr(model, "q35rt_cp_handoff_progress", None)
+    if handoff_progress is not None:
+        # Native COW and initialize()'s full prefix-state gathers precede this
+        # event. Each layer then consumes the owned seeds in ctx.
+        reads_ready = torch.cuda.Event()
+        reads_ready.record()
     for layer_index, layer in enumerate(model.layers):
         if handoff_progress is not None and layer_index % 4 == 0:
-            handoff_progress()
+            handoff_progress(reads_ready)
         hidden, residual = layer(
             positions,
             hidden,

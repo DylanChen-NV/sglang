@@ -66,6 +66,12 @@ def _completed_cp_handoff_stream(*, transfer_poll=False):
             if stream is None:
                 stream = self._q35rt_cp_completion_stream = torch.cuda.Stream()
             with torch.cuda.stream(stream):
+                reads_ready = getattr(self, "_q35rt_cp_reads_ready", None)
+                if reads_ready is not None:
+                    # CP gathers all prefix SSM/conv seeds into owned tensors
+                    # before its layer loop. Finish those reads before an
+                    # older cache operation can release a COW source slot.
+                    stream.wait_event(reads_ready)
                 result = function(self, *args, **kwargs)
                 done = torch.cuda.Event()
                 done.record()
@@ -645,13 +651,15 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
+                self._q35rt_cp_reads_ready = None
                 if cp_handoff_poll and self.disagg_prefill_inflight_queue:
                     # Progress completed, pinned older rows while Python queues
                     # this request's CP layers. Otherwise even asynchronous
                     # GPU submission can delay their HTTP completion by the
                     # full CPU submission interval.
                     body = self.tp_worker.model_runner.model.model
-                    def progress_completed_handoffs():
+                    def progress_completed_handoffs(reads_ready):
+                        self._q35rt_cp_reads_ready = reads_ready
                         if self.disagg_prefill_inflight_queue:
                             self.process_disagg_prefill_inflight_queue()
                     body.q35rt_cp_handoff_progress = progress_completed_handoffs
@@ -680,6 +688,7 @@ class SchedulerDisaggregationPrefillMixin:
                         if status[0] == KVPoll.Success:
                             break
                 self.process_batch_result(batch, result)
+                self._q35rt_cp_reads_ready = None
             else:
                 self.on_idle()
 
