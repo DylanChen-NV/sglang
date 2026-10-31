@@ -3313,6 +3313,9 @@ class NixlKVReceiver(CommonKVReceiver):
         if self._q35rt_quiet is not None:
             self.kv_mgr._q35rt_receivers.pop(self.bootstrap_room, None)
             self.kv_mgr.transfer_statuses.pop(self.bootstrap_room, None)
+            self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(self.bootstrap_room)
+            if self.kv_mgr.enable_staging:
+                self.kv_mgr._chunk_writer_counts.pop(self.bootstrap_room, None)
 
     def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:
