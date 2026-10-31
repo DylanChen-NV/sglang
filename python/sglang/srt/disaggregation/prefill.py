@@ -32,53 +32,45 @@ import numpy as np
 import torch
 
 
-def _completed_cp_handoff_stream(*, transfer_poll=False):
+def _completed_cp_handoff_stream(function):
     """Process completed BS1 CP rows without waiting for another Req's forward.
 
     Result processing first synchronizes its native copy_done event, and the
     transport keeps the Req's pool rows pinned until transfer completion.
     Join metadata/cache writes back to the scheduler before later allocation.
     """
-    def decorate(function):
-        @wraps(function)
-        def wrapped(self, *args, **kwargs):
-            enabled = getattr(self, "_q35rt_cp_handoff_enabled", None)
-            if enabled is None:
-                value = os.environ.get("SGLANG_QWEN35_CP_HANDOFF_STREAM", "0")
-                if value not in ("0", "1"):
-                    raise ValueError("SGLANG_QWEN35_CP_HANDOFF_STREAM must be 0 or 1")
-                enabled = (
-                    value == "1"
-                    and self.server_args.enable_qwen35_cp_prefill
-                    and self.server_args.prefill_max_requests == 1
-                    and self.server_args.chunked_prefill_size == -1
-                )
-                self._q35rt_cp_handoff_enabled = enabled
-            # Without native CPU overlap, current result processing still
-            # waits on its producing default stream. Only *older*, completed
-            # transfer rows can use this private stream in that case.
-            if (
-                not enabled or (not self.enable_overlap and not transfer_poll)
-                or (transfer_poll and not self.disagg_prefill_inflight_queue)
-            ):
-                return function(self, *args, **kwargs)
-            stream = getattr(self, "_q35rt_cp_completion_stream", None)
-            if stream is None:
-                stream = self._q35rt_cp_completion_stream = torch.cuda.Stream()
-            with torch.cuda.stream(stream):
-                reads_ready = getattr(self, "_q35rt_cp_reads_ready", None)
-                if reads_ready is not None:
-                    # CP gathers all prefix SSM/conv seeds into owned tensors
-                    # before its layer loop. Finish those reads before an
-                    # older cache operation can release a COW source slot.
-                    stream.wait_event(reads_ready)
-                result = function(self, *args, **kwargs)
-                done = torch.cuda.Event()
-                done.record()
-            self.schedule_stream.wait_event(done)
-            return result
-        return wrapped
-    return decorate
+    @wraps(function)
+    def wrapped(self, *args, **kwargs):
+        enabled = getattr(self, "_q35rt_cp_handoff_enabled", None)
+        if enabled is None:
+            value = os.environ.get("SGLANG_QWEN35_CP_HANDOFF_STREAM", "0")
+            if value not in ("0", "1"):
+                raise ValueError("SGLANG_QWEN35_CP_HANDOFF_STREAM must be 0 or 1")
+            enabled = (
+                value == "1" and not self.enable_overlap
+                and self.server_args.enable_qwen35_cp_prefill
+                and self.server_args.prefill_max_requests == 1
+                and self.server_args.chunked_prefill_size == -1
+            )
+            self._q35rt_cp_handoff_enabled = enabled
+        if not enabled or not self.disagg_prefill_inflight_queue:
+            return function(self, *args, **kwargs)
+        stream = getattr(self, "_q35rt_cp_completion_stream", None)
+        if stream is None:
+            stream = self._q35rt_cp_completion_stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            reads_ready = getattr(self, "_q35rt_cp_reads_ready", None)
+            if reads_ready is not None:
+                # CP gathers all prefix SSM/conv seeds into owned tensors
+                # before its layer loop. Finish those reads before an
+                # older cache operation can release a COW source slot.
+                stream.wait_event(reads_ready)
+            result = function(self, *args, **kwargs)
+            done = torch.cuda.Event()
+            done.record()
+        self.schedule_stream.wait_event(done)
+        return result
+    return wrapped
 
 
 class _CPForwardCompletionPoller:
@@ -700,10 +692,6 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
-        cp_handoff_poll = (
-            self.server_args.enable_qwen35_cp_prefill
-            and os.environ.get("SGLANG_QWEN35_CP_HANDOFF_STREAM", "0") == "1"
-        )
 
         while True:
             # Receive requests
@@ -714,14 +702,6 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
-
-            # A completed earlier request can finish its transfer while the
-            # next BS1 forward runs. Poll it before blocking on that forward's
-            # result; native consensus keeps CP ranks on the same branch.
-            if cp_handoff_poll and self.disagg_prefill_inflight_queue:
-                self.process_disagg_prefill_inflight_queue()
-                if self.disagg_prefill_inflight_queue:
-                    continue
 
             # Get the next batch to run
             plan = self.get_next_disagg_prefill_batch_to_run(
@@ -761,7 +741,6 @@ class SchedulerDisaggregationPrefillMixin:
             # Update last_batch
             self.last_batch = batch
 
-    @_completed_cp_handoff_stream()
     def process_batch_result_disagg_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -933,7 +912,7 @@ class SchedulerDisaggregationPrefillMixin:
             dp_cooperation_info=batch.dp_cooperation_info,
         )
 
-    @_completed_cp_handoff_stream(transfer_poll=True)
+    @_completed_cp_handoff_stream
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
     ) -> List[Req]:

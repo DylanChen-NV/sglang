@@ -5130,20 +5130,10 @@ class ServerArgs:
             self.enable_qwen35_cp_prefill
             and self.disaggregation_mode == "prefill"
             and self.prefill_max_requests == 1
-        )
-        cp_overlap = os.environ.get("SGLANG_QWEN35_CP_OVERLAP", "0")
-        if cp_overlap not in ("0", "1"):
-            raise ValueError("SGLANG_QWEN35_CP_OVERLAP must be 0 or 1")
-        # CPU scheduling may overlap while all BS1 compute stays ordered on
-        # one native forward stream. Multi-stream execution cannot share this
-        # workspace without separate backing.
-        stream_serialized_cp = (
-            serialized_cp_prefill and cp_overlap == "1"
-            and not self.enable_two_batch_overlap
-            and not getattr(self, "enable_pdmux", False)
+            and self.disable_overlap_schedule
         )
         if self.qwen35_cp_fp32_optimization in ("workspace", "u-output") and (
-                (not self.disable_overlap_schedule and not stream_serialized_cp)
+                not self.disable_overlap_schedule
                 or (self.max_running_requests != 1 and not serialized_cp_prefill)):
             raise ValueError("FP32 CP workspace requires serialized BS1 prefill and disabled overlap scheduling")
         if self.enable_qwen35_cp_prefill:
