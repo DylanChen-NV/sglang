@@ -305,7 +305,7 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
-from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
+from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method, operations_nvtx_range, NVTX_SCHEDULER_ENABLED
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -3665,9 +3665,22 @@ class Scheduler(
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
                 if batch_result.new_seq_lens is not None:
+                    # CP prefill returns the same unmodified input lengths.
+                    # Their authoritative CPU mirror is already prepared;
+                    # copying them back would wait for the entire GPU forward
+                    # before the P loop can progress an older Req's handoff.
+                    cp_lengths_unchanged = (
+                        self.server_args.enable_qwen35_cp_prefill
+                        and self.disaggregation_mode == DisaggregationMode.PREFILL
+                        and batch.forward_mode.is_extend()
+                        and batch_result.new_seq_lens is batch.seq_lens
+                    )
+                    if NVTX_SCHEDULER_ENABLED and self.server_args.enable_qwen35_cp_prefill:
+                        logger.info("CP unchanged host lengths: %s", cp_lengths_unchanged)
                     batch.seq_lens = batch_result.new_seq_lens
-                    if batch.seq_lens_cpu is not None:
-                        batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
+                    if batch.seq_lens_cpu is not None and not cp_lengths_unchanged:
+                        with operations_nvtx_range("scheduler.updated_lengths_d2h"):
+                            batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
                         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                 batch.input_ids = None  # rebuilt next iter from draft_token
                 self.update_cache_from_scheduler(batch, batch_result)

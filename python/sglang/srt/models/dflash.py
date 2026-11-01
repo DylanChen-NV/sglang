@@ -341,6 +341,10 @@ class DFlashDraftModel(nn.Module):
         super().__init__()
         self.config = config
 
+        from sglang.srt.models.qwen35_cp import CPDraftWeights, enabled
+        if enabled():
+            self.cp_context_weights = CPDraftWeights()
+
         hidden_size = int(config.hidden_size)
         num_layers = int(config.num_hidden_layers)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
@@ -462,6 +466,8 @@ class DFlashDraftModel(nn.Module):
             return None
 
         for name, loaded_weight in weights:
+            if hasattr(self, "cp_context_weights"):
+                self.cp_context_weights.load_tensor(name, loaded_weight)
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if f".{weight_name}." not in name:
                     continue

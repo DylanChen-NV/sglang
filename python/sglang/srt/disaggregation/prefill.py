@@ -21,13 +21,68 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 from array import array
 from collections import deque
+from functools import wraps
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import torch
+
+
+def _completed_cp_handoff_stream(function):
+    """Process completed BS1 CP rows without waiting for another Req's forward.
+
+    Result processing first synchronizes its native copy_done event, and the
+    transport keeps the Req's pool rows pinned until transfer completion.
+    Join metadata/cache writes back to the scheduler before later allocation.
+    """
+
+    @wraps(function)
+    def wrapped(self, *args, **kwargs):
+        enabled = getattr(self, "_q35rt_cp_handoff_enabled", None)
+        if enabled is None:
+            value = os.environ.get("SGLANG_QWEN35_CP_HANDOFF_STREAM", "0")
+            if value not in ("0", "1"):
+                raise ValueError("SGLANG_QWEN35_CP_HANDOFF_STREAM must be 0 or 1")
+            enabled = (
+                value == "1"
+                and not self.enable_overlap
+                and self.server_args.enable_qwen35_cp_prefill
+                and self.server_args.prefill_max_requests == 1
+                and self.server_args.chunked_prefill_size == -1
+            )
+            self._q35rt_cp_handoff_enabled = enabled
+        if not enabled or not self.disagg_prefill_inflight_queue:
+            return function(self, *args, **kwargs)
+        stream = getattr(self, "_q35rt_cp_completion_stream", None)
+        if stream is None:
+            stream = self._q35rt_cp_completion_stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            reads_ready = getattr(self, "_q35rt_cp_reads_ready", None)
+            if reads_ready is not None:
+                # CP gathers all prefix SSM/conv seeds into owned tensors
+                # before its layer loop. Finish those reads before an
+                # older cache operation can release a COW source slot.
+                stream.wait_event(reads_ready)
+            result = function(self, *args, **kwargs)
+            done = torch.cuda.Event()
+            done.record()
+        self.schedule_stream.wait_event(done)
+        return result
+
+    return wrapped
+
+
+class _CPForwardCompletionPoller:
+    def __init__(self, event):
+        self.event = event
+
+    def poll(self):
+        return KVPoll.Success if self.event.query() else KVPoll.Transferring
+
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
@@ -159,7 +214,12 @@ class PrefillBootstrapQueue:
             cps = server_args.chunked_prefill_size or 8192
             # Staging slices each send into a fixed page-aligned grid, so an
             # unbounded (-1) or non-page-aligned chunk size has no valid grid.
-            if cps <= 0 or cps % page_size != 0:
+            q35rt_full_prefill = (
+                envs.SGLANG_Q35RT_PD.get()
+                and server_args.enable_qwen35_cp_prefill
+                and server_args.chunked_prefill_size == -1
+            )
+            if (cps <= 0 or cps % page_size != 0) and not q35rt_full_prefill:
                 raise RuntimeError(
                     f"SGLANG_DISAGG_STAGING_BUFFER requires a positive "
                     f"chunked_prefill_size that is a multiple of page_size "
@@ -270,6 +330,11 @@ class PrefillBootstrapQueue:
             self.is_mla_backend,
         )
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
+        if envs.SGLANG_Q35RT_PD.get():
+            kv_manager.q35rt_mamba_cache = self.token_to_kv_pool.mamba_pool.mamba_cache
+            kv_manager.q35rt_bulk_state = getattr(
+                self.token_to_kv_pool, "_q35rt_bulk_state", None
+            )
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
             and hasattr(kv_manager, "set_kv_buffer_tensors")
@@ -556,6 +621,10 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
+        cp_handoff_poll = (
+            self.server_args.enable_qwen35_cp_prefill
+            and os.environ.get("SGLANG_QWEN35_CP_HANDOFF_STREAM", "0") == "1"
+        )
         while True:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -581,8 +650,46 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
-                result = self.run_batch(batch)
+                self._q35rt_cp_reads_ready = None
+                if cp_handoff_poll and self.disagg_prefill_inflight_queue:
+                    # Progress completed, pinned older rows while Python queues
+                    # this request's CP layers. Otherwise even asynchronous
+                    # GPU submission can delay their HTTP completion by the
+                    # full CPU submission interval.
+                    body = self.tp_worker.model_runner.model.model
+
+                    def progress_completed_handoffs(reads_ready):
+                        self._q35rt_cp_reads_ready = reads_ready
+                        if self.disagg_prefill_inflight_queue:
+                            self.process_disagg_prefill_inflight_queue()
+
+                    body.q35rt_cp_handoff_progress = progress_completed_handoffs
+                    try:
+                        result = self.run_batch(batch)
+                    finally:
+                        del body.q35rt_cp_handoff_progress
+                else:
+                    result = self.run_batch(batch)
+                if cp_handoff_poll and self.disagg_prefill_inflight_queue:
+                    # The current GPU forward is already queued. Finish older
+                    # requests' handoffs before the synchronous result wait
+                    # would otherwise delay their HTTP completion by a full
+                    # prefill. Stop once this forward is ready, so transport
+                    # backpressure cannot starve result processing or aborts.
+                    ready = torch.cuda.Event()
+                    ready.record()
+                    poller = _CPForwardCompletionPoller(ready)
+                    while self.disagg_prefill_inflight_queue:
+                        self.process_disagg_prefill_inflight_queue()
+                        if not self.disagg_prefill_inflight_queue:
+                            break
+                        status = poll_and_all_reduce_attn_cp_tp_group(
+                            [poller], self.attn_cp_cpu_group, self.attn_tp_cpu_group
+                        )
+                        if status[0] == KVPoll.Success:
+                            break
                 self.process_batch_result(batch, result)
+                self._q35rt_cp_reads_ready = None
             else:
                 self.on_idle()
 
@@ -666,6 +773,11 @@ class SchedulerDisaggregationPrefillMixin:
             result.copy_done,
         )
 
+        from sglang.srt.disaggregation.common.q35rt_early_token import (
+            publish_before_draft,
+        )
+
+        publish_before_draft(self, batch, result)
         if copy_done is not None:
             copy_done.synchronize()
         if result.routed_experts_output is not None:
@@ -806,6 +918,13 @@ class SchedulerDisaggregationPrefillMixin:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
+        from sglang.srt.disaggregation.common.q35rt_early_token import (
+            complete_prefill_http,
+        )
+
+        for req in batch.reqs:
+            complete_prefill_http(self, req)
+
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
             batch=batch,
@@ -814,6 +933,7 @@ class SchedulerDisaggregationPrefillMixin:
             dp_cooperation_info=batch.dp_cooperation_info,
         )
 
+    @_completed_cp_handoff_stream
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
     ) -> List[Req]:
@@ -1136,6 +1256,13 @@ class SchedulerDisaggregationPrefillMixin:
 
         state_indices: Optional[List] = None
         if last_chunk:
+            early_aux_done = getattr(req, "q35rt_pre_draft_aux_done", None)
+            if early_aux_done is not None:
+                if not early_aux_done.wait(30):
+                    req.disagg_kv_sender.kv_mgr._q35rt_fail_stop(
+                        "Early aux read did not complete"
+                    )
+                del req.q35rt_pre_draft_aux_done
             self.disagg_metadata_buffers.set_buf(req)
 
             # Most state payloads read token-pool rows and should match the KV

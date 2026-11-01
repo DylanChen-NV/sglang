@@ -54,6 +54,9 @@ class DFlashVerifyInput(SpecInput):
         self,
         batch: ScheduleBatch,
         target_worker: TpModelWorker,
+        *,
+        defer_metadata_init: bool = False,
+        mamba_track_window: int = 0,
     ) -> tuple[ForwardBatch, bool]:
         """Prepare a DFLASH verify forward batch for overlap scheduling.
 
@@ -69,6 +72,13 @@ class DFlashVerifyInput(SpecInput):
             if batch.forward_mode.is_idle()
             else ForwardMode.TARGET_VERIFY
         )
+        # Spec decode preparation and filter/merge can leave tracking metadata
+        # unset. Refresh native ping-pong slots before either graph or eager
+        # verify, as the other speculative workers do, so acceptance publishes
+        # the state that actually corresponds to a cached checkpoint length.
+        from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
+
+        prepare_mamba_track_for_verify(batch, max_draft_tokens=mamba_track_window)
         verify_forward_batch = ForwardBatch.init_new(
             batch,
             target_worker.model_runner,
@@ -82,7 +92,11 @@ class DFlashVerifyInput(SpecInput):
                 verify_forward_batch
             )
         )
-        if can_run_cuda_graph:
+        if defer_metadata_init:
+            # The immediate ModelRunner forward loads graph inputs once (or
+            # initializes eager metadata). Caller must not mark FB preplanned.
+            pass
+        elif can_run_cuda_graph:
             target_worker.model_runner.decode_cuda_graph_runner.load_batch(
                 verify_forward_batch
             )

@@ -237,7 +237,12 @@ class StagingAllocator:
 
             if not self.allocations:
                 self.watermark_round = self.round
-                self.watermark_tail = self.head
+                # The entire generation is now free, including its unused
+                # tail. Reusing that generation would make this watermark
+                # unsafe for a later wrap while fresh allocations are live.
+                self.watermark_tail = self.total_size
+                self.round += 1
+                self.head = 0
             elif self.alloc_order:
                 off, _, rnd = self.allocations[self.alloc_order[0]]
                 self.watermark_round = rnd

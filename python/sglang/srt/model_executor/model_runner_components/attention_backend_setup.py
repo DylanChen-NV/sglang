@@ -173,6 +173,14 @@ def _build_resolved_backend(
     resolved: ResolvedAttentionBackendStr,
     init_new_workspace: bool,
 ) -> AttentionBackend:
+    model_backend_builder = getattr(
+        model_runner.model, "q35rt_build_attention_backend", None
+    )
+    if model_backend_builder is not None:
+        model_backend = model_backend_builder()
+        if model_backend is not None:
+            logger.info("Using q35rt direct-pool attention metadata adapter")
+            return model_backend
     if resolved.is_draft_override:
         attn_backend = _build_backend_from_str(
             model_runner=model_runner,

@@ -844,6 +844,8 @@ class KVCacheConfigurator:
         is_dsv4_model: bool,
         req_to_token_pool: ReqToTokenPool,
     ) -> KVCache:
+        if hasattr(self.model, "q35rt_build_kv_pool"):
+            return self.model.q35rt_build_kv_pool(self, sizes, req_to_token_pool)
         # Page-granularity envelope layout for the MHA-shaped (full / SWA) pools,
         # selected by swapping in the PageMajorMHATokenToKVPool subclass. The
         # default keeps upstream's per-layer layout. The Mamba state pool is routed
@@ -1654,7 +1656,33 @@ class KVCacheConfigurator:
                 f"decoding, draft weights are now counted."
             )
 
-        return int(rest_memory * (1 << 30))  # return in bytes
+        padding_bytes = (
+            getattr(self.model, "q35rt_kv_bytes_per_token", 0) * self.pool_page_size
+        )
+        fixed_bytes = getattr(self.model, "q35rt_fixed_cache_bytes", 0)
+        stage_bytes = getattr(self.model, "q35rt_pd_stage_bytes_per_slot", 0)
+        if self.mambaish_config is not None and envs.SGLANG_Q35RT_PD.get():
+            from sglang.srt.disaggregation.common.q35rt_staging import (
+                bulk_state_enabled,
+            )
+
+            if bulk_state_enabled():
+                from q35rt.state_ops import state_packet_bytes
+
+                stage_bytes += state_packet_bytes(32 // get_parallel().attn_tp_size)
+        if stage_bytes:
+            extra = get_disagg().disaggregation_decode_extra_slots or 0
+            ping_pong = (
+                (2 if not get_schedule().disable_overlap_schedule else 1)
+                if self.server_args.enable_mamba_extra_buffer()
+                else 0
+            )
+            slots = max(
+                get_schedule().max_mamba_cache_size or 0,
+                (get_schedule().max_running_requests + extra) * (1 + ping_pong),
+            )
+            fixed_bytes += (slots + 1) * stage_bytes
+        return int(rest_memory * (1 << 30)) - padding_bytes - fixed_bytes
 
     def _calculate_mamba_ratio(self) -> int:
         if get_memory().disable_radix_cache:

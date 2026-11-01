@@ -12,7 +12,7 @@ class SchedulerFlushWrapper:
     def __init__(
         self,
         *,
-        flush_cache: Callable[[], bool],
+        flush_cache: Callable[..., bool],
         is_fully_idle: Callable[[], bool],
         ipc_channels: SchedulerIpcChannels,
     ) -> None:
@@ -20,6 +20,11 @@ class SchedulerFlushWrapper:
         self._is_fully_idle = is_fully_idle
         self._ipc_channels = ipc_channels
         self._pending: Optional[Tuple[FlushCacheReqInput, float]] = None
+
+    def _execute(self, req: FlushCacheReqInput) -> bool:
+        if req.empty_cache:
+            return self._flush_cache()
+        return self._flush_cache(empty_cache=False)
 
     def handle(self, recv_req: FlushCacheReqInput) -> Optional[FlushCacheReqOutput]:
         if self._pending is not None:
@@ -30,10 +35,10 @@ class SchedulerFlushWrapper:
 
         timeout_s = float(recv_req.timeout_s or 0.0)
         if timeout_s <= 0.0:
-            return FlushCacheReqOutput(success=self._flush_cache())
+            return FlushCacheReqOutput(success=self._execute(recv_req))
 
         if self._is_fully_idle():
-            return FlushCacheReqOutput(success=self._flush_cache())
+            return FlushCacheReqOutput(success=self._execute(recv_req))
 
         self._pending = (recv_req, time.monotonic() + timeout_s)
         return None
@@ -45,7 +50,7 @@ class SchedulerFlushWrapper:
         pending_req, deadline = self._pending
 
         if self._is_fully_idle():
-            success = self._flush_cache()
+            success = self._execute(pending_req)
             self._pending = None
             self._ipc_channels.send_to_tokenizer.send_output(
                 FlushCacheReqOutput(success=success), pending_req

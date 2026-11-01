@@ -29,6 +29,10 @@ class TransferKVChunk:
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
         default_factory=TraceNullContext
     )
+    # In-process producer/transfer-thread dependency; never sent on the wire.
+    producer_ready: Optional[object] = None
+    # Aux-only source task completion; never sent on the wire.
+    q35rt_aux_complete: Optional[object] = None
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:

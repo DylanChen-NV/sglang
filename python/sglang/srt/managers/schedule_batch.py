@@ -1806,9 +1806,6 @@ def set_mamba_track_indices_from_reqs(
     spec track plan, see mamba_lazy_spec_prepare).
     """
     req_to_token_pool = batch.req_to_token_pool
-    all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
-        batch.req_pool_indices
-    ]  # (bs, ping_pong_size), int64, on device
     if track_positions is None:
         # Guard: mamba_next_track_idx may be None for requests that haven't
         # gone through _alloc_ping_pong_buffer yet (e.g., spec v2 verify path).
@@ -1817,6 +1814,27 @@ def set_mamba_track_indices_from_reqs(
             req.mamba_next_track_idx if req.mamba_next_track_idx is not None else 0
             for req in batch.reqs
         ]
+    if len(batch.reqs) == 1 and len(track_positions) == 1:
+        req_index = getattr(batch.reqs[0], "req_pool_idx", None)
+        table = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
+        position = track_positions[0]
+        if (
+            isinstance(req_index, int)
+            and 0 <= req_index < table.shape[0]
+            and isinstance(position, int)
+            and 0 <= position < table.shape[1]
+        ):
+            # The native Req is authoritative for its pool row and ping-pong
+            # position. Snapshot the selected device value directly, avoiding
+            # two indexed kernels and a pinned H2D index tensor for BS1. Keep
+            # an owned copy: the scheduler may donate/replace this slot while
+            # the current verify remains in flight.
+            selected = table[req_index, position : position + 1]
+            batch.mamba_track_indices = selected.clone()
+            return
+    all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
+        batch.req_pool_indices
+    ]  # (bs, ping_pong_size), int64, on device
     idx = (
         torch.tensor(
             track_positions,

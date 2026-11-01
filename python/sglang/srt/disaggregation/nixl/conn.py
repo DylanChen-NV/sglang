@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
 import struct
 import threading
 import time
@@ -24,6 +25,12 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
     KVTransferError,
+)
+from sglang.srt.disaggregation.common.q35rt_quiescence import (
+    Q35RT_QUIESCENCE_V1,
+    DestinationQuiescence,
+    SourceQuiescence,
+    protocol_version,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
     STAGING_WATERMARK_WAIT_S,
@@ -233,6 +240,7 @@ class KVArgsRegisterInfo:
     dst_state_layer_ids: List[List[int]] = dataclasses.field(default_factory=list)
     dst_homogeneous_mem_kind: Optional[str] = None
     kv_xfer_segments: Optional[List[_KVXferPreparedSegment]] = None
+    q35rt_quiescence_version: int = 0
     # Keep last: optional, parsed from a variable-length tail of the ZMQ
     # frame in from_zmq() below, so positional construction stays stable.
     staging: Optional[StagingRegisterInfo] = None
@@ -300,6 +308,7 @@ class KVArgsRegisterInfo:
             dst_dcp_rank=(
                 int(msg[22].decode("ascii")) if len(msg) > 22 and msg[22] != b"" else 0
             ),
+            q35rt_quiescence_version=(int(msg[23]) if len(msg) > 23 else 0),
             dst_num_slots=dst_num_slots,
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
@@ -359,6 +368,8 @@ class TransferStatus:
     num_pp_ranks_expected: Optional[int] = None
     # Whether aux data has been received.
     received_aux: bool = False
+    # Output-only target token; never satisfies native aux completion.
+    received_early_aux: bool = False
     # PP ranks that have sent state data (state is layer-specific, each PP rank sends its portion).
     received_state_per_pp: Set[int] = dataclasses.field(default_factory=set)
     # Whether state data is expected (set based on state_type).
@@ -396,6 +407,13 @@ class NixlKVManager(CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.q35rt_quiescence_version = protocol_version()
+        self._q35rt_transfer_tls = threading.local()
+        self._q35rt_receivers = {}
+        self._q35rt_source_guard = None
+        self._q35rt_staging_lock = (
+            threading.RLock() if self.q35rt_quiescence_version else None
+        )
         self.transfer_source_rank = (
             self.kv_args.pp_rank * self.server_args.tp_size + self.kv_args.engine_rank
         )
@@ -449,6 +467,21 @@ class NixlKVManager(CommonKVManager):
             elif backend == "UCCL":
                 backend_params.setdefault("num_cpus", str(num_threads))
         self.agent.create_backend(backend, backend_params)
+        if (
+            self.q35rt_quiescence_version
+            and disaggregation_mode == DisaggregationMode.PREFILL
+        ):
+            if (
+                not server_args.enable_qwen35_cp_prefill
+                or self.attn_tp_size != 2
+                or self.pp_size != 1
+            ):
+                raise ValueError("Q35rt quiescence requires CP2 prefill, PP1")
+            self._q35rt_source_guard = SourceQuiescence(
+                lambda room: room in self.transfer_infos,
+                self._q35rt_fence,
+                self._q35rt_notify_quiet,
+            )
 
         available_plugins = self.agent.get_plugin_list()
         if backend not in available_plugins:
@@ -539,7 +572,11 @@ class NixlKVManager(CommonKVManager):
             lambda ptr, size: self._register_staging_memory(ptr, size, gpu_id),
             self.kv_args,
             count,
-            get_schedule().chunked_prefill_size,
+            (
+                self.server_args.context_length
+                if envs.SGLANG_Q35RT_PD.get()
+                else get_schedule().chunked_prefill_size
+            ),
         )
 
     def _init_staging_allocator(self):
@@ -604,6 +641,13 @@ class NixlKVManager(CommonKVManager):
         threading.Thread(target=decode_staging_thread, daemon=True).start()
 
     def _handle_staging_req(self, msg):
+        lock = self._q35rt_staging_lock
+        if lock is None:
+            return self._handle_staging_req_unlocked(msg)
+        with lock:
+            return self._handle_staging_req_unlocked(msg)
+
+    def _handle_staging_req_unlocked(self, msg):
         from sglang.srt.disaggregation.common.staging_handler import (
             handle_staging_req,
         )
@@ -621,7 +665,16 @@ class NixlKVManager(CommonKVManager):
                 room,
             )
             return
-        prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
+        receiver = decode_req.kv_receiver
+        if receiver is None or (
+            self.q35rt_quiescence_version
+            and self._q35rt_receivers.get(room) is not receiver
+        ):
+            return
+        quiet = getattr(receiver, "_q35rt_quiet", None)
+        if quiet is not None and quiet.pending:
+            return
+        prefill_tp = receiver.prefill_info.attn_tp_size
         handle_staging_req(
             msg,
             self._staging_ctx.allocator,
@@ -1096,12 +1149,96 @@ class NixlKVManager(CommonKVManager):
                     "NIXL heterogeneous-TP direct-to-host KV transfer is not "
                     "implemented safely yet"
                 )
+            if envs.SGLANG_Q35RT_PD.get():
+                if (
+                    not self.enable_staging
+                    or self.attn_tp_size != 2
+                    or peer_info.decode_tp_size != 1
+                ):
+                    raise ValueError("q35rt native PD requires CP2 -> TP1 bulk staging")
+                if (
+                    len(self.kv_args.kv_item_lens) != 32
+                    or len(peer_info.dst_kv_item_lens) != 32
+                    or any(
+                        dst != 2 * src
+                        for src, dst in zip(
+                            self.kv_args.kv_item_lens, peer_info.dst_kv_item_lens
+                        )
+                    )
+                ):
+                    raise ValueError("q35rt target/draft PD region geometry differs")
+                return
             self._init_hetero_tp_prep_handle(
                 peer_info.agent_name,
                 peer_info,
                 src_mem_kind=src_mem_kind,
                 dst_mem_kind=dst_mem_kind,
             )
+
+    def _q35rt_fail_stop(self, reason):
+        logger.critical(
+            "Q35rt PD lifetime could not be certified; stopping worker: %s", reason
+        )
+        os._exit(1)
+
+    def _q35rt_fence(self):
+        import torch
+
+        torch.cuda.synchronize(self.kv_args.gpu_id)
+
+    def _q35rt_notify_quiet(self, room, peer, failed):
+        tag = "failv1" if failed else "quietv1"
+        self.agent.send_notif(
+            peer, f"{room}_{tag}_{self.transfer_source_rank}".encode("ascii")
+        )
+        logger.info(
+            "Q35RT_QUIET_ACK room=%s rank=%s failed=%s ns=%s",
+            room,
+            self.transfer_source_rank,
+            int(failed),
+            time.monotonic_ns(),
+        )
+
+    def _q35rt_initialize_xfer(self, *args, **kwargs):
+        handle = self.agent.initialize_xfer(*args, **kwargs)
+        tracked = getattr(self._q35rt_transfer_tls, "handles", None)
+        if handle and tracked is not None:
+            # Keep the handle even when postXferReq or its caller raises.
+            tracked.append(handle)
+        return handle
+
+    def _q35rt_drain(self, handles):
+        deadline = time.monotonic() + 30
+        for handle in handles:
+            while True:
+                state = self.agent.check_xfer_state(handle)
+                if state == "DONE":
+                    break
+                if state != "PROC" or time.monotonic() >= deadline:
+                    raise RuntimeError(f"Uncertain NIXL write state: {state}")
+                time.sleep(0)
+
+    def q35rt_send_early_aux(self, room, aux_index):
+        if self._q35rt_source_guard is None:
+            raise RuntimeError("Early aux task requires source quiescence")
+        completed = threading.Event()
+        peers = self.transfer_infos.get(room, {})
+        shard = sum(info.dst_port for info in peers.values()) % len(
+            self.transfer_queues
+        )
+        self.transfer_queues[shard].put(
+            TransferKVChunk(
+                room=room,
+                prefill_kv_indices=np.empty(0, dtype=np.int32),
+                index_slice=slice(0, 0),
+                is_last_chunk=False,
+                prefill_aux_index=aux_index,
+                state_indices=None,
+                chunk_id=-1,
+                q35rt_aux_complete=completed,
+            )
+        )
+        return completed
 
     def transfer_worker(self, queue: FastQueue, staging_buffer=None):
         # Per-worker staging strategy: lazy-created on first chunk so we
@@ -1113,10 +1250,17 @@ class NixlKVManager(CommonKVManager):
             kv_chunk: TransferKVChunk = queue.get()
             room = kv_chunk.room
             handles: List[Any] = []
+            guard = self._q35rt_source_guard
+            admitted = False
             try:
                 if self.check_status(room) == KVPoll.Failed:
                     continue
-
+                if guard is not None:
+                    peers = tuple(self.transfer_infos.get(room, {}))
+                    admitted = guard.begin(room, peers)
+                    if not admitted:
+                        continue
+                    self._q35rt_transfer_tls.handles = []
                 assert room in self.transfer_infos
 
                 # Lazily build a per-worker staging strategy bound to this
@@ -1146,6 +1290,49 @@ class NixlKVManager(CommonKVManager):
                     assert req.agent_name in self.decode_kv_args_table
                     dst_info = self.decode_kv_args_table[req.agent_name]
                     decode_tp_size = dst_info.decode_tp_size
+
+                    if kv_chunk.q35rt_aux_complete is not None:
+                        handles.append(
+                            self.send_aux(
+                                req.agent_name,
+                                kv_chunk.prefill_aux_index,
+                                dst_info.dst_aux_ptrs,
+                                req.dst_aux_index,
+                                f"{req.room}_tokenv1",
+                            )
+                        )
+                        continue
+
+                    from sglang.srt.disaggregation.common.q35rt_early_token import (
+                        enabled as early_token_enabled,
+                    )
+
+                    aux_posted_early = False
+
+                    def post_early_aux():
+                        nonlocal aux_posted_early
+                        if not kv_chunk.is_last_chunk or not early_token_enabled():
+                            return
+                        if kv_chunk.prefill_aux_index is None:
+                            raise RuntimeError("Missing aux index for last chunk")
+                        aux_notif = f"{req.room}_aux"
+                        if (
+                            len(kv_chunk.prefill_kv_indices) == 0
+                            or not self.kv_args.kv_data_ptrs
+                        ):
+                            aux_notif += (
+                                f"_nokv_{self.transfer_source_rank}_{kv_chunk.chunk_id}"
+                            )
+                        handles.append(
+                            self.send_aux(
+                                req.agent_name,
+                                kv_chunk.prefill_aux_index,
+                                dst_info.dst_aux_ptrs,
+                                req.dst_aux_index,
+                                aux_notif,
+                            )
+                        )
+                        aux_posted_early = True
 
                     # Skip KV RDMA transfer when there are no pages to send
                     # (e.g., decode-side radix cache matched the entire prefix).
@@ -1207,6 +1394,7 @@ class NixlKVManager(CommonKVManager):
                                 req,
                                 dst_info,
                                 queue,
+                                before_transfer=post_early_aux,
                             )
                             if deferred:
                                 # Chunk re-enqueued; stop processing remaining
@@ -1270,6 +1458,8 @@ class NixlKVManager(CommonKVManager):
 
                     if kv_chunk.is_last_chunk:
                         dst_info = self.decode_kv_args_table[req.agent_name]
+                        if not len(kv_chunk.prefill_kv_indices):
+                            post_early_aux()
                         if kv_chunk.state_indices:
                             state_xfer_handles = self.maybe_send_extra(
                                 req.agent_name,
@@ -1283,11 +1473,14 @@ class NixlKVManager(CommonKVManager):
                                 dst_state_item_lens=dst_info.dst_state_item_lens,
                                 dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
                                 dst_state_layer_ids=dst_info.dst_state_layer_ids,
+                                producer_ready=kv_chunk.producer_ready,
                             )
                             handles.extend(
                                 h for h in state_xfer_handles if h is not None
                             )
 
+                        if aux_posted_early:
+                            continue
                         if kv_chunk.prefill_aux_index is None:
                             raise RuntimeError("Missing aux index for last chunk")
                         # A no-KV notification still identifies its PP source.
@@ -1354,7 +1547,26 @@ class NixlKVManager(CommonKVManager):
                     )
                 self.exceptions[room] = e
                 self.record_failure(room, str(e))
+                if guard is not None:
+                    try:
+                        guard.cancel(room, failed=True)
+                    except Exception as fatal:
+                        self._q35rt_fail_stop(fatal)
                 self.update_status(room, KVPoll.Failed)
+            finally:
+                if admitted:
+                    try:
+                        if guard.cancelled(room):
+                            self._q35rt_drain(self._q35rt_transfer_tls.handles)
+                        guard.finish(room)
+                    except Exception as fatal:
+                        self._q35rt_fail_stop(fatal)
+                    finally:
+                        self._q35rt_transfer_tls.handles = None
+                if kv_chunk.q35rt_aux_complete is not None:
+                    # Includes rejected/aborted admission, which posted no reads.
+                    # An admitted error reaches here only after safe handle drain.
+                    kv_chunk.q35rt_aux_complete.set()
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -1406,6 +1618,22 @@ class NixlKVManager(CommonKVManager):
                 state_addrs.append(
                     (state_data_ptr, state_data_len, self.kv_args.gpu_id, "")
                 )
+        registration = getattr(self.kv_args, "q35rt_state_registration", None)
+        if registration is not None:
+            if self.kv_args.state_types != [StateType.MAMBA]:
+                raise ValueError(
+                    "q35rt state registration requires a single native Mamba component"
+                )
+            logical_count = len(state_addrs)
+            state_addrs = [
+                (pointer, size, self.kv_args.gpu_id, "")
+                for pointer, size in registration
+            ]
+            logger.info(
+                "q35rt state registration: logical_regions=%s registered_regions=%s",
+                logical_count,
+                len(state_addrs),
+            )
         if state_addrs:
             self.state_descs = self.agent.register_memory(state_addrs, "VRAM")
             logger.debug(
@@ -1415,6 +1643,8 @@ class NixlKVManager(CommonKVManager):
                 raise Exception("NIXL memory registration failed for state tensors")
 
     def _add_remote_peer(self, decode_kv_args: KVArgsRegisterInfo):
+        if decode_kv_args.q35rt_quiescence_version != self.q35rt_quiescence_version:
+            self._q35rt_fail_stop("Q35rt PD peer quiescence capability mismatch")
         agent_name = decode_kv_args.agent_name
         if agent_name in self.decode_kv_args_table:
             logger.info(f"Peer {agent_name} was already registered, ignoring.")
@@ -1724,6 +1954,10 @@ class NixlKVManager(CommonKVManager):
         dst_kv_indices: npt.NDArray[np.int32],
         notif: str,
     ):
+        if envs.SGLANG_Q35RT_PD.get():
+            raise RuntimeError(
+                "q35rt mixed KV requires bulk staging; refusing unsafe slice fallback"
+            )
         # Prepped path: src dlist is shared per decode_tp_size; dst is per peer.
         assert self.prep_handle_slice_src is not None
         assert peer_name in self.prep_handles_slice_dst
@@ -1775,8 +2009,21 @@ class NixlKVManager(CommonKVManager):
         dst_kv_item_len: int,
         notif: str,
         staging_buffer=None,
+        producer_ready=None,
     ):
         """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
+        if envs.SGLANG_Q35RT_PD.get():
+            return self._send_q35rt_kvcache_staged(
+                peer_name,
+                prefill_kv_indices,
+                dst_staging_ptr,
+                dst_staging_size,
+                dst_gpu_id,
+                dst_attn_tp_size,
+                notif,
+                staging_buffer,
+                producer_ready,
+            )
         from sglang.srt.disaggregation.common.staging_buffer import (
             compute_head_slice_params,
             compute_staging_layout,
@@ -1875,6 +2122,48 @@ class NixlKVManager(CommonKVManager):
             raise RuntimeError("[Staging] NIXL bulk transfer failed to post")
         return xfer_handle
 
+    def _send_q35rt_kvcache_staged(
+        self,
+        peer_name,
+        pages,
+        dst_ptr,
+        dst_size,
+        dst_gpu_id,
+        dst_tp_size,
+        notif,
+        staging_buffer,
+        producer_ready=None,
+    ):
+        from sglang.srt.disaggregation.common.q35rt_staging import pack
+
+        if dst_tp_size != 1 or staging_buffer is None:
+            raise ValueError("q35rt native PD requires TP1 decode and a staging buffer")
+        rank_bytes = len(pages) * sum(self.kv_args.kv_item_lens)
+        if dst_size < 2 * rank_bytes:
+            raise ValueError("q35rt decode staging pool is too small for this prefix")
+        if (
+            pack(self, pages, staging_buffer, notif, producer_ready=producer_ready)
+            != rank_bytes
+        ):
+            raise RuntimeError("q35rt packed KV byte count mismatch")
+        dst_write = dst_ptr + (self.kv_args.engine_rank % 2) * rank_bytes
+        source = self.agent.get_xfer_descs(
+            np.array(
+                [[staging_buffer.get_ptr(), rank_bytes, self.kv_args.gpu_id]],
+                dtype=np.int64,
+            ),
+            "VRAM",
+        )
+        destination = self.agent.get_xfer_descs(
+            np.array([[dst_write, rank_bytes, dst_gpu_id]], dtype=np.int64), "VRAM"
+        )
+        handle = self._q35rt_initialize_xfer(
+            "WRITE", source, destination, peer_name, notif.encode("ascii")
+        )
+        if not handle or self.agent.transfer(handle) == "ERR":
+            raise RuntimeError("q35rt native NIXL bulk transfer failed")
+        return handle
+
     def _try_create_staging_strategy(self, staging_buffer):
         """Create a per-worker PrefillStagingStrategy bound to ``staging_buffer``.
 
@@ -1899,6 +2188,7 @@ class NixlKVManager(CommonKVManager):
         req: TransferInfo,
         dst_info: KVArgsRegisterInfo,
         queue: FastQueue,
+        before_transfer=None,
     ):
         """Attempt staging transfer for one chunk. Returns (xfer_handle, deferred).
 
@@ -1917,6 +2207,13 @@ class NixlKVManager(CommonKVManager):
             instead of falling back to the slice path.
         """
         page_start = kv_chunk.index_slice.start
+        if envs.SGLANG_Q35RT_PD.get():
+            # Sender indices are relative to the delta; receiver req_to_token
+            # is indexed by the whole logical sequence, including its hit.
+            prefix = req.decode_prefix_len or 0
+            if prefix % self.kv_args.page_size:
+                raise ValueError("q35rt PD cached prefix must be page aligned")
+            page_start += prefix // self.kv_args.page_size
         num_pages = len(kv_chunk.prefill_kv_indices)
 
         ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
@@ -1947,6 +2244,8 @@ class NixlKVManager(CommonKVManager):
             f"_{self.transfer_source_rank}_{chunk_idx}"
             f"_{page_start}_{num_pages}_{req.agent_name}"
         )
+        if before_transfer is not None:
+            before_transfer()
         handle = self.send_kvcache_staged(
             req.agent_name,
             src_prefill_kv_indices,
@@ -1958,6 +2257,7 @@ class NixlKVManager(CommonKVManager):
             dst_info.dst_kv_item_len,
             notif_tag,
             staging_buffer=staging_strategy.staging_buffer,
+            producer_ready=kv_chunk.producer_ready,
         )
         if handle is None:
             # A silent slice fallback would leak this chunk's decode-side
@@ -1996,7 +2296,7 @@ class NixlKVManager(CommonKVManager):
         src_descs = self.agent.get_xfer_descs(src_addrs, "DRAM")
         dst_descs = self.agent.get_xfer_descs(dst_addrs, "DRAM")
         # Transfer data
-        xfer_handle = self.agent.initialize_xfer(
+        xfer_handle = self._q35rt_initialize_xfer(
             "WRITE",
             src_descs,
             dst_descs,
@@ -2025,6 +2325,11 @@ class NixlKVManager(CommonKVManager):
     ):
         """Transfer Mamba states via RDMA."""
         assert len(prefill_state_indices) == 1, "Mamba should have single state index"
+
+        if envs.SGLANG_Q35RT_PD.get():
+            from sglang.srt.disaggregation.common.q35rt_staging import capture_state
+
+            capture_state(self, prefill_state_indices[0], notif)
         assert len(dst_state_indices) == len(
             prefill_state_indices
         ), "State indices count mismatch between Prefill and Decode"
@@ -2052,7 +2357,7 @@ class NixlKVManager(CommonKVManager):
         src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
         dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
 
-        xfer_handle = self.agent.initialize_xfer(
+        xfer_handle = self._q35rt_initialize_xfer(
             "WRITE",
             src_descs,
             dst_descs,
@@ -2085,6 +2390,7 @@ class NixlKVManager(CommonKVManager):
         src_state_slice_outer_counts: list[int] = None,
         src_layer_ids: list[int] = None,
         dst_layer_ids: list[int] = None,
+        producer_ready=None,
     ):
         """Transfer Mamba states with TP slice support via RDMA.
 
@@ -2101,6 +2407,31 @@ class NixlKVManager(CommonKVManager):
             f"Decode attn_tp_size={decode_tp_size}."
         )
         assert len(prefill_state_indices) == 1, "Mamba should have single state index"
+
+        if envs.SGLANG_Q35RT_PD.get():
+            from sglang.srt.disaggregation.common.q35rt_staging import capture_state
+
+            capture_state(self, prefill_state_indices[0], notif)
+
+        if getattr(self, "q35rt_bulk_state", None) is not None:
+            from q35rt.state_ops import RANK_BYTES
+
+            from sglang.srt.disaggregation.common.q35rt_staging import pack_bulk_state
+
+            if (
+                self.attn_tp_size != 2
+                or decode_tp_size != 1
+                or len(src_state_data_ptrs) != 1
+                or len(dst_state_data_ptrs) != 1
+                or src_state_item_lens != [RANK_BYTES]
+                or dst_state_item_lens != [2 * RANK_BYTES]
+                or src_state_dim_per_tensor != [RANK_BYTES]
+                or dst_state_dim_per_tensor != [2 * RANK_BYTES]
+            ):
+                raise ValueError(
+                    "q35rt bulk state requires matching packet support on both peers"
+                )
+            pack_bulk_state(self, prefill_state_indices[0], producer_ready)
 
         if not src_state_dim_per_tensor or not dst_state_dim_per_tensor:
             return self._send_mamba_state(
@@ -2181,7 +2512,7 @@ class NixlKVManager(CommonKVManager):
         src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
         dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
 
-        xfer_handle = self.agent.initialize_xfer(
+        xfer_handle = self._q35rt_initialize_xfer(
             "WRITE",
             src_descs,
             dst_descs,
@@ -2208,6 +2539,7 @@ class NixlKVManager(CommonKVManager):
         dst_state_item_lens: List[List[int]] | None = None,
         dst_state_dim_per_tensor: List[List[int]] | None = None,
         dst_state_layer_ids: List[List[int]] | None = None,
+        producer_ready=None,
     ):
         """Send state per hybrid component, dispatching by state_type[i]."""
         state_types = getattr(self.kv_args, "state_types", []) or []
@@ -2279,6 +2611,7 @@ class NixlKVManager(CommonKVManager):
                         src_outer_counts,
                         src_layer_ids=src_lids,
                         dst_layer_ids=dst_lids,
+                        producer_ready=producer_ready,
                     )
                 else:
                     h = self._send_mamba_state(
@@ -2386,6 +2719,21 @@ class NixlKVManager(CommonKVManager):
             # Dummy rank or already cleared; nothing to enqueue.
             return None
 
+        producer_ready = None
+        if envs.SGLANG_Q35RT_PD.get():
+            import os
+
+            import torch
+
+            exact_producer = os.environ.get("SGLANG_Q35RT_PRODUCER_EVENT", "0")
+            if exact_producer not in ("0", "1"):
+                raise ValueError("SGLANG_Q35RT_PRODUCER_EVENT must be 0 or 1")
+            if exact_producer == "1":
+                # Snapshot readiness on the scheduler's producing stream,
+                # before a later request can enqueue unrelated prefill work.
+                producer_ready = torch.cuda.Event()
+                producer_ready.record(torch.cuda.current_stream(self.kv_args.gpu_id))
+
         # Shard by destination (mirror mooncake): same dst endpoint(s) -> same
         # worker, keeping a room's chunks on one private staging buffer.
         session_port_sum = sum(
@@ -2402,6 +2750,7 @@ class NixlKVManager(CommonKVManager):
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
+                producer_ready=producer_ready,
             )
         )
         return None
@@ -2424,7 +2773,26 @@ class NixlKVManager(CommonKVManager):
                 components = msg.decode("ascii").split("_", 8)
                 room = int(components[0])
                 tag = components[1]
-                if tag == "kv":
+                if self.q35rt_quiescence_version:
+                    receiver = self._q35rt_receivers.get(room)
+                    if receiver is None:
+                        # Never launch a late staging scatter into freed slots.
+                        continue
+                    if tag in ("failv1", "quietv1"):
+                        receiver._q35rt_quiet.acknowledge(int(components[2]))
+                        if tag == "failv1":
+                            receiver._q35rt_begin_abort(
+                                "Prefill transfer failed after draining writes"
+                            )
+                        continue
+                    if receiver._q35rt_quiet.pending:
+                        # Other receivers also drain this shared agent. Once
+                        # abort starts, no later poll may launch a new scatter
+                        # after this room's cancellation fence has completed.
+                        continue
+                if tag == "tokenv1":
+                    self.transfer_statuses[room].received_early_aux = True
+                elif tag == "kv":
                     chunk_id = int(components[2])
                     is_last_chunk = bool(int(components[3]))
                     pp_rank = int(components[4]) if len(components) > 4 else 0
@@ -2604,6 +2972,22 @@ class NixlKVManager(CommonKVManager):
             logger.debug(f"Ignoring malformed abort notification: {e}")
             return True
 
+        if self.q35rt_quiescence_version:
+            if len(msg) != 6 or msg[5] != b"q35rt-quiet-v1":
+                self._q35rt_fail_stop("Missing negotiated Q35rt abort capability")
+            logger.info(
+                "Q35RT_ABORT_RECV room=%s rank=%s ns=%s",
+                room_to_be_aborted,
+                self.transfer_source_rank,
+                time.monotonic_ns(),
+            )
+            try:
+                self._q35rt_source_guard.cancel(
+                    room_to_be_aborted, (msg[4].decode("ascii"),)
+                )
+            except Exception as fatal:
+                self._q35rt_fail_stop(fatal)
+
         if (
             room_to_be_aborted in self.request_status
             and self.check_status(room_to_be_aborted) != KVPoll.Success
@@ -2623,8 +3007,8 @@ class NixlKVManager(CommonKVManager):
                 f"ignoring (already completed or unknown)"
             )
 
-        # TODO: Define real ACK/deferred-release semantics if decode-side buffer
-        # release needs to wait for prefill-side NIXL transfer quiescence.
+        # The optional Q35rt protocol above ACKs only after posted writes and
+        # local producer work have drained. Other backends keep native semantics.
 
         return True
 
@@ -2759,9 +3143,24 @@ class NixlKVSender(CommonKVSender):
             self.has_sent = True
 
     def poll(self) -> KVPoll:
-        if self._send_failed:
-            return KVPoll.Failed  # type: ignore
         status = self.kv_mgr.check_status(self.bootstrap_room)
+        if self._send_failed:
+            status = KVPoll.Failed
+        guard = self.kv_mgr._q35rt_source_guard
+        if guard is not None:
+            if status == KVPoll.Failed:
+                try:
+                    guard.cancel(
+                        self.bootstrap_room,
+                        tuple(self.kv_mgr.transfer_infos.get(self.bootstrap_room, {})),
+                        failed=True,
+                    )
+                except Exception as fatal:
+                    self.kv_mgr._q35rt_fail_stop(fatal)
+            if status in (KVPoll.Success, KVPoll.Failed) and not guard.can_release(
+                self.bootstrap_room
+            ):
+                return KVPoll.Transferring
         if (
             status == KVPoll.Success
             and self._transfer_start_time is not None
@@ -2774,6 +3173,8 @@ class NixlKVSender(CommonKVSender):
 
     def clear(self) -> None:
         super().clear()
+        if self.kv_mgr._q35rt_source_guard is not None:
+            self.kv_mgr._q35rt_source_guard.release(self.bootstrap_room)
         if self.kv_mgr.enable_staging and self.kv_mgr._staging_ctx is not None:
             self.kv_mgr._staging_ctx.prefetched_rooms.discard(self.bootstrap_room)
             self.kv_mgr._staging_ctx.prefetch_requested = {
@@ -2781,6 +3182,19 @@ class NixlKVSender(CommonKVSender):
                 for key in self.kv_mgr._staging_ctx.prefetch_requested
                 if key[0] != self.bootstrap_room
             }
+
+    def abort(self):
+        guard = self.kv_mgr._q35rt_source_guard
+        if guard is not None:
+            try:
+                guard.cancel(
+                    self.bootstrap_room,
+                    tuple(self.kv_mgr.transfer_infos.get(self.bootstrap_room, {})),
+                    failed=True,
+                )
+            except Exception as fatal:
+                self.kv_mgr._q35rt_fail_stop(fatal)
+        super().abort()
 
     def failure_exception(self):
         exc = self.kv_mgr.exceptions.pop(self.bootstrap_room, None)
@@ -2812,7 +3226,15 @@ class NixlKVReceiver(CommonKVReceiver):
         bootstrap_room: Optional[int] = None,
     ):
         self.started_transfer = False
+        self._q35rt_remote_possible = False
+        self._q35rt_quiet = (
+            DestinationQuiescence((0, 1))
+            if mgr.q35rt_quiescence_version == Q35RT_QUIESCENCE_V1
+            else None
+        )
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
+        if self._q35rt_quiet is not None:
+            mgr._q35rt_receivers[self.bootstrap_room] = self
         self.init_time = None
 
     def send_metadata(
@@ -2857,6 +3279,8 @@ class NixlKVReceiver(CommonKVReceiver):
             )
             try:
                 with lock:
+                    # A partial multi-peer send can already enable writes.
+                    self._q35rt_remote_possible = True
                     sock.send_multipart(
                         [
                             GUARD,
@@ -2892,6 +3316,8 @@ class NixlKVReceiver(CommonKVReceiver):
         self.init_time = time.time()
 
     def poll(self) -> KVPoll:
+        if self._q35rt_quiet is not None and self._q35rt_remote_possible:
+            return self._q35rt_poll()
         if self.conclude_state is not None:
             return self.conclude_state
         status = self.kv_mgr.check_status(self.bootstrap_room)
@@ -2920,6 +3346,92 @@ class NixlKVReceiver(CommonKVReceiver):
             return timeout_result
 
         return KVPoll.WaitingForInput  # type: ignore
+
+    def _q35rt_begin_abort(self, reason):
+        if not self._q35rt_quiet.pending:
+            logger.info(
+                "Q35RT_QUIET_BEGIN room=%s ns=%s",
+                self.bootstrap_room,
+                time.monotonic_ns(),
+            )
+        self._q35rt_quiet.abort(time.monotonic())
+        self.conclude_state = None
+        self.kv_mgr.record_failure(self.bootstrap_room, reason)
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        if not self.abort_notified:
+            self._send_abort_notification()
+            self.abort_notified = True
+
+    def _q35rt_poll(self):
+        quiet = self._q35rt_quiet
+        # Progress also consumes error/ACK notifications. Pending abort always
+        # wins over data-complete notifications or a previous Success result.
+        self.kv_mgr.update_transfer_status()
+        if not quiet.pending and (
+            self.conclude_state == KVPoll.Failed
+            or self.kv_mgr.check_status(self.bootstrap_room) == KVPoll.Failed
+        ):
+            self._q35rt_begin_abort(
+                "Native PD failed while remote writes were possible"
+            )
+        if (
+            not quiet.pending
+            and self.init_time is not None
+            and (time.time() - self.init_time >= self.kv_mgr.waiting_timeout)
+        ):
+            self._q35rt_begin_abort("Native PD transfer waiting deadline expired")
+        if quiet.pending:
+            if quiet.ready():
+                try:
+                    # ACKs cover remote writes. This fence covers already
+                    # submitted local scatters before native failure cleanup.
+                    self.kv_mgr._q35rt_fence()
+                except Exception as fatal:
+                    self.kv_mgr._q35rt_fail_stop(fatal)
+                self.conclude_state = KVPoll.Failed
+                logger.info(
+                    "Q35RT_QUIET_DONE room=%s ns=%s",
+                    self.bootstrap_room,
+                    time.monotonic_ns(),
+                )
+                self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
+                    self.bootstrap_room
+                )
+                return KVPoll.Failed
+            if time.monotonic() - quiet.started_at > 15:
+                self.kv_mgr._q35rt_fail_stop(
+                    "Missing source quiescence ACK; destination slots retained"
+                )
+            return KVPoll.Transferring
+        if self.conclude_state == KVPoll.Success:
+            return KVPoll.Success
+        if self.kv_mgr.check_transfer_done(self.bootstrap_room):
+            self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
+                self.bootstrap_room
+            )
+            self.conclude_state = KVPoll.Success
+            self.kv_mgr.transfer_statuses.pop(self.bootstrap_room, None)
+            return KVPoll.Success
+        return KVPoll.WaitingForInput
+
+    def abort(self):
+        if self._q35rt_quiet is not None and self._q35rt_remote_possible:
+            self._q35rt_begin_abort(
+                "Aborted by AbortReq; waiting for source quiescence"
+            )
+        else:
+            super().abort()
+
+    def clear(self):
+        super().clear()
+        if self._q35rt_quiet is not None:
+            self.kv_mgr._q35rt_receivers.pop(self.bootstrap_room, None)
+            self.kv_mgr.transfer_statuses.pop(self.bootstrap_room, None)
+            self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
+                self.bootstrap_room
+            )
+            if self.kv_mgr.enable_staging:
+                self.kv_mgr._chunk_writer_counts.pop(self.bootstrap_room, None)
 
     def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:
@@ -3000,6 +3512,15 @@ class NixlKVReceiver(CommonKVReceiver):
                             packed_kv_layer_ids,
                             str(self.kv_mgr.dcp_size).encode("ascii"),
                             str(self.kv_mgr.dcp_rank).encode("ascii"),
+                            *(
+                                [
+                                    str(self.kv_mgr.q35rt_quiescence_version).encode(
+                                        "ascii"
+                                    )
+                                ]
+                                if self.kv_mgr.q35rt_quiescence_version
+                                else []
+                            ),
                         ]
                     )
             except zmq.ZMQError:

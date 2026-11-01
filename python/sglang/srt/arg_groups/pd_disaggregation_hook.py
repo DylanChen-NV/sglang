@@ -64,7 +64,17 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --disaggregation-transfer-backend fake"
                 )
-            if server_args.speculative_algorithm is not None:
+            # q35rt's DFLASH adapter uses one native allocator for target and
+            # draft KV, commits accepted recurrent/context state before radix
+            # publication, and imports only the received delta. Other spec
+            # backends retain the existing prohibition.
+            q35rt_dflash_cache = (
+                os.environ.get("SGLANG_Q35RT", "0") == "1"
+                and server_args.speculative_algorithm == "DFLASH"
+                and server_args.speculative_draft_window_size is None
+                and not server_args.enable_hierarchical_cache
+            )
+            if server_args.speculative_algorithm is not None and not q35rt_dflash_cache:
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with speculative decoding "

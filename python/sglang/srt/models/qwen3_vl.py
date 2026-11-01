@@ -1282,6 +1282,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                         quant_config=quant_config,
                         use_attn_tp_group=get_parallel().enable_dp_lm_head,
                         prefix=add_prefix("lm_head", prefix),
+                        enable_tp=not getattr(self.model, "_reference_cp", False),
                     )
             else:
                 self.lm_head = PPMissingLayer()
@@ -1400,6 +1401,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 otherwise it will be `(seq_len,).
                 (Use input_metadata.mrope_positions to replace it)
         """
+        if getattr(self.model, "_reference_cp", False):
+            from sglang.srt.models.qwen35_cp import logits_output
+            if get_embedding or forward_batch.contains_image_inputs():
+                raise ValueError("M2 Qwen3.5 CP supports text generation only")
+            return logits_output(self, input_ids, positions, forward_batch)
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 

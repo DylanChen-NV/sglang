@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
 # Bounded wait for a watermark advance before re-enqueueing a deferred staging
@@ -147,6 +149,13 @@ class DecodeStagingHandler:
         self._room_to_receiver[room] = decode_req.kv_receiver
 
     def unregister_decode_req(self, room: int) -> None:
+        lock = getattr(self.kv_manager, "_q35rt_staging_lock", None)
+        if lock is None:
+            return self._unregister_decode_req(room)
+        with lock:
+            return self._unregister_decode_req(room)
+
+    def _unregister_decode_req(self, room: int) -> None:
         # Pop before release_room so no new arrival can start consuming the slots.
         decode_req = self._room_to_decode_req.pop(room, None)
         receiver = self._room_to_receiver.pop(room, None)
@@ -378,6 +387,12 @@ class DecodeStagingHandler:
             else:
                 page_idx_tensor = kv_indices
 
+            if envs.SGLANG_Q35RT_PD.get():
+                from sglang.srt.disaggregation.common.q35rt_staging import scatter
+
+                scatter(self.kv_manager, staging_view, page_idx_tensor, prefill_tp)
+                return True
+
             scatter_staging_to_kv(
                 staging_view,
                 k_buffers,
@@ -546,7 +561,11 @@ class PrefillStagingStrategy:
         self.staging_buffer = staging_buffer
         page_size = kv_manager.kv_buffer_tensors["page_size"]
         cps = kv_manager.server_args.chunked_prefill_size or 8192
-        self.full_chunk_pages = max(1, cps // page_size)
+        self.full_chunk_pages = (
+            0
+            if envs.SGLANG_Q35RT_PD.get()
+            else max(1, cps // page_size) if cps > 0 else 0
+        )
 
     def check_ready(
         self,
@@ -768,6 +787,10 @@ def handle_staging_req(
             bytes_per_head_per_token,
             num_kv_layers,
         )
+        if envs.SGLANG_Q35RT_PD.get():
+            if prefill_attn_tp_size != 2 or attn_tp_size != 1:
+                raise ValueError("q35rt native PD requires CP2 -> TP1")
+            required = chunk_num_pages * sum(kv_item_lens)
         result = staging_allocator.assign(required)
         if result is None:
             logger.error(
@@ -835,7 +858,9 @@ def prefetch_staging_reqs(
 
     page_size = kv_buffer_tensors["page_size"]
     cps = chunked_prefill_size or 8192
-    full_chunk_pages = max(1, cps // page_size)
+    full_chunk_pages = (
+        0 if envs.SGLANG_Q35RT_PD.get() else max(1, cps // page_size) if cps > 0 else 0
+    )
 
     for session_id, tinfo in transfer_infos[room].items():
         # mooncake exposes is_dummy as a dataclass bool field, NIXL exposes it
@@ -849,7 +874,8 @@ def prefetch_staging_reqs(
         total_pages = len(tinfo.dst_kv_indices)
         if total_pages == 0:
             continue
-        num_chunks = (total_pages + full_chunk_pages - 1) // full_chunk_pages
+        chunk_pages_limit = full_chunk_pages or total_pages
+        num_chunks = (total_pages + chunk_pages_limit - 1) // chunk_pages_limit
 
         for chunk_idx in range(num_chunks):
             stg_key = (room, chunk_idx, session_id)
@@ -857,8 +883,8 @@ def prefetch_staging_reqs(
                 continue
             staging_requested.add(stg_key)
 
-            remaining = total_pages - chunk_idx * full_chunk_pages
-            chunk_pages = min(full_chunk_pages, remaining)
+            remaining = total_pages - chunk_idx * chunk_pages_limit
+            chunk_pages = min(chunk_pages_limit, remaining)
             try:
                 na = NetworkAddress(tinfo.endpoint, tinfo.dst_port)
                 ep = na.to_tcp()

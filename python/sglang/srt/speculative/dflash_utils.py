@@ -122,15 +122,18 @@ def apply_dflash_verify_logits_adjustments(
     next_token_logits: torch.Tensor,
     sampling_info: Any,
     draft_token_num: int,
-) -> None:
+) -> bool:
     """Apply sampling-time logit adjustments for DFlash verify in place.
 
     This keeps v1 and v2 verify semantics aligned while letting overlap scheduling
     use the cheaper precomputed `acc_linear_penalties` path instead of allocating a
     repeated `[bs * draft_token_num, vocab]` penalty tensor every step.
+
+    Return whether a logits transform ran. Raw model top1 can only be reused
+    when this is false and no later grammar transform is applied.
     """
     if sampling_info is None:
-        return
+        return False
     if next_token_logits.ndim != 2:
         raise ValueError(
             "next_token_logits must be 2D, "
@@ -146,7 +149,8 @@ def apply_dflash_verify_logits_adjustments(
             f"Expected {bs * draft_token_num}, got {next_token_logits.shape[0]}."
         )
 
-    if sampling_info.has_custom_logit_processor:
+    modified = sampling_info.has_custom_logit_processor
+    if modified:
         apply_custom_logit_processor(
             next_token_logits,
             sampling_info,
@@ -181,7 +185,7 @@ def apply_dflash_verify_logits_adjustments(
         get_logits_3d().add_(
             linear_penalty[:, None, :].to(dtype=next_token_logits.dtype)
         )
-        return
+        return True
 
     if acc_linear_penalties is not None:
         if (
@@ -193,6 +197,7 @@ def apply_dflash_verify_logits_adjustments(
                 dtype=next_token_logits.dtype,
             )
         get_logits_3d().add_(acc_linear_penalties[:, None, :])
+        modified = True
 
     if logit_bias is not None:
         if (
@@ -204,6 +209,31 @@ def apply_dflash_verify_logits_adjustments(
                 dtype=next_token_logits.dtype,
             )
         get_logits_3d().add_(logit_bias[:, None, :])
+        modified = True
+    return bool(modified)
+
+
+def can_use_q35rt_fused_cycle(sampling_info, *, has_grammar, return_sampling_mask=False):
+    if has_grammar or return_sampling_mask:
+        return False
+    if sampling_info is None:
+        return True
+    penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+    return bool(
+        sampling_info.is_all_greedy
+        and not sampling_info.has_custom_logit_processor
+        and getattr(sampling_info, "acc_linear_penalties", None) is None
+        and getattr(sampling_info, "logit_bias", None) is None
+        and getattr(sampling_info, "grammar_mask", None) is None
+        and not (penalizer is not None and penalizer.is_required)
+    )
+
+
+def get_dflash_greedy_target_top1(logits_output, *, logits_modified, grammar_mask):
+    cached = (logits_output.customized_info or {}).get("q35rt_target_top1")
+    if cached is not None and not logits_modified and grammar_mask is None:
+        return cached
+    return torch.argmax(logits_output.next_token_logits, dim=-1)
 
 
 def _get_or_create_chain_verify_buffers(

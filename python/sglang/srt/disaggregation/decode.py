@@ -495,6 +495,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+        if self.enable_staging and hasattr(
+            self.token_to_kv_pool, "q35rt_bind_pd_manager"
+        ):
+            self.token_to_kv_pool.q35rt_bind_pd_manager(kv_manager)
         # Staging buffer setup (only when heterogeneous TP staging is enabled)
         if self.enable_staging and not self.is_mla_backend:
             kv_pool_for_heads = self.token_to_kv_pool
@@ -691,6 +695,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self, rids_to_check: Optional[List[str]] = None
     ) -> List[Req]:
         # TODO refactor the scheduling part, reuse with the unified engine logic as much as possible
+        if not self.retracted_queue:
+            return []
 
         # allocate memory
         resumed_reqs = []
@@ -908,6 +914,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
         if is_pp_mode:
             rids_to_check = set(pp_good_rids) | set(pp_bad_rids)
+
+        # Handshake progression above may mutate the queue. With no remaining
+        # request, there is no admission decision needing pool/budget queries.
+        if not self.queue:
+            return [], []
 
         failed_reqs = []
         preallocated_reqs = []
@@ -1858,6 +1869,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         self._commit_hicache_local_restore_to_req(decode_req)
 
+        # Storage conversion runs only after native transfer completion and
+        # before admission to the decode queue. The receiver retains ownership
+        # and all existing abort/metadata validation paths above stay in force.
+        pool = self.scheduler.token_to_kv_pool_allocator.get_kvcache()
+        if hasattr(pool, "q35rt_import_received"):
+            pool.q35rt_import_received(decode_req.req, self.scheduler.req_to_token_pool)
+
         # Case 3: Success - commit the transfer
         # PD true-retraction rebootstrap: the prefill recomputed the prefix KV
         # under the current weights and sampled a fresh handoff token, but when
@@ -1877,7 +1895,22 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.req.pd_rebootstrap_forced_output_id = None
         else:
             committed_output_id = output_id[0].item()
-        decode_req.req.output_ids.append(committed_output_id)
+        early_token = getattr(decode_req.req, "q35rt_early_token", None)
+        if early_token is None:
+            decode_req.req.output_ids.append(committed_output_id)
+        elif early_token != committed_output_id or list(decode_req.req.output_ids) != [
+            early_token
+        ]:
+            prepare_abort(
+                decode_req.req,
+                "q35rt early token differs from native committed token",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+            return
+        else:
+            del decode_req.req.q35rt_early_token
         decode_req.req.cached_tokens = cached_tokens[0].item()
         # The prefill node already reported its prefix-cache hit in
         # cached_tokens[0]. Seed already_computed with it so that
@@ -2002,6 +2035,24 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 continue
 
             hicache_restore_status = decode_req.hicache_restore_status
+            if hicache_restore_status == HiCacheRestoreResult.FAILED and (
+                getattr(decode_req.kv_receiver, "_q35rt_quiet", None) is not None
+                and poll != KVPoll.Failed
+            ):
+                decode_req.kv_receiver.abort()
+                poll = decode_req.kv_receiver.poll()
+                if poll != KVPoll.Failed:
+                    continue
+            if (
+                poll != KVPoll.Failed
+                and hicache_restore_status != HiCacheRestoreResult.FAILED
+            ):
+                from sglang.srt.disaggregation.common.q35rt_early_token import (
+                    emit_decode_token,
+                )
+
+                if emit_decode_token(self, decode_req):
+                    logger.info("q35rt early token: rid=%s", decode_req.req.rid)
             if (
                 poll == KVPoll.Failed
                 or hicache_restore_status == HiCacheRestoreResult.FAILED

@@ -183,9 +183,9 @@ def build_kv_cache(
             "Transformers backend to avoid multimodal prefix-cache mismatches."
         )
 
-    # Decode radix cache is unsupported with hybrid SWA/SSM models —
-    # these use specialized memory pools incompatible with the
-    # prefix-match-and-lock allocation path.
+    # General hybrid backends do not yet support the PD prefix allocation
+    # contract. q35rt explicitly implements native Mamba COW/checkpoints and
+    # delta-only target/draft import; keep the exception capability-scoped.
     if (
         server_args.disaggregation_decode_enable_radix_cache
         and server_args.disaggregation_mode == "decode"
@@ -195,7 +195,9 @@ def build_kv_cache(
                 "--disaggregation-decode-enable-radix-cache is incompatible "
                 "with sliding window attention (SWA) models"
             )
-        if is_hybrid_ssm:
+        if is_hybrid_ssm and not getattr(
+            tp_worker.model_runner.model, "q35rt_pd_radix_cache", False
+        ):
             raise ValueError(
                 "--disaggregation-decode-enable-radix-cache is incompatible "
                 "with Mamba/SSM models"

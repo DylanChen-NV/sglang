@@ -1141,6 +1141,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
+        q35rt_deployment = (
+            os.environ.get("SGLANG_Q35RT", "0") == "1" or envs.SGLANG_Q35RT_PD.get()
+        )
+        if q35rt_deployment and isinstance(obj, GenerateReqInput):
+            if obj.return_logprob:
+                raise ValueError("q35rt/DFLASH does not support return_logprob yet")
+            if getattr(obj, "input_embeds", None) is not None:
+                raise ValueError(
+                    "q35rt currently accepts token IDs or text, not input_embeds"
+                )
         # FIXME: unify the length validation logic with the one in the scheduler.
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0
@@ -1300,13 +1310,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if isinstance(input_ids[0], list):
             # Batch of sequences
             for seq in input_ids:
-                if any(id >= vocab_size for id in seq):
+                if seq and max(seq) >= vocab_size:
                     raise ValueError(
                         f"The input_ids {seq} contains values greater than the vocab size ({vocab_size})."
                     )
         else:
             # Single sequence
-            if any(id >= vocab_size for id in input_ids):
+            if max(input_ids) >= vocab_size:
                 raise ValueError(
                     f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
                 )
